@@ -214,13 +214,12 @@ def _bf16_to_native_kernel(
     physical = tl.load(physical_indices_ptr + row).to(tl.int64)
     page = temp_loc // page_size
     offset = temp_loc % page_size
-    # FlashMLA MODEL1 stores one complete hybrid row contiguously:
-    # 448 FP8 NoPE bytes, eight E8M0 scale bytes, and 128 BF16 RoPE bytes.
-    # Pages retain the allocator's 576-byte alignment, so the row stride is
-    # the logical 584-byte record while the page stride is supplied by the
-    # workspace.
-    value_base = page * bytes_per_page + offset * 584
-    scale_base = value_base + NOPE_DIM
+    # FlashMLA's MODEL1 page ABI has 576-byte value rows followed by a
+    # separate per-row scale area.  The public tensor view is 584 bytes wide
+    # for the consumer's validation contract, but the decoder addresses the
+    # physical page using this split layout.
+    value_base = page * bytes_per_page + offset * 576
+    scale_base = page * bytes_per_page + page_size * 576 + offset * 8
 
     # Reuse packed NoPE bytes directly, scattering zeros into pruned lanes.
     word = offs // 64
@@ -238,13 +237,16 @@ def _bf16_to_native_kernel(
         other=0,
     )
     tl.store(raw_native_ptr + value_base + offs, code, mask=offs < NOPE_DIM)
-    for w in tl.static_range(0, BITMAP_WORDS):
+    for w in tl.static_range(0, BITMAP_WORDS - 1):
         scale = tl.load(
             scales_ptr + physical * BITMAP_WORDS + w,
             mask=physical >= 0,
             other=0,
         )
         tl.store(raw_native_ptr + scale_base + w, scale)
+    # MODEL1 has seven quantized NoPE tiles; the eighth byte is padding because
+    # the RoPE tail is stored as BF16 directly in the value row.
+    tl.store(raw_native_ptr + scale_base + 7, 0)
 
     # Tail is already BF16+RoPE in dense_ptr. Store its raw BF16 bytes via a
     # uint16 bitcast so the uint8 page ABI is preserved.
@@ -253,7 +255,7 @@ def _bf16_to_native_kernel(
     tail_hi = tl.load(dense_ptr + row * HEAD_DIM + NOPE_DIM + tail_pair * 2 + 1)
     pair0 = tail.to(tl.bfloat16).to(tl.uint16, bitcast=True)
     pair1 = tail_hi.to(tl.bfloat16).to(tl.uint16, bitcast=True)
-    byte_base = value_base + NOPE_DIM + BITMAP_WORDS + tail_pair * 4
+    byte_base = value_base + NOPE_DIM + tail_pair * 4
     tl.store(raw_native_ptr + byte_base, (pair0 & 0xFF).to(tl.uint8))
     tl.store(raw_native_ptr + byte_base + 1, (pair0 >> 8).to(tl.uint8))
     tl.store(raw_native_ptr + byte_base + 2, (pair1 & 0xFF).to(tl.uint8))
