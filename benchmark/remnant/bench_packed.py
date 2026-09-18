@@ -8,6 +8,7 @@ import time
 import torch
 
 from sglang.srt import remnant
+from sglang.srt.remnant import config
 from sglang.srt.remnant.packed import pack_rows, unpack_gather_bf16
 from sglang.srt.remnant.reference import topmag_keep_mask
 
@@ -48,7 +49,7 @@ def _packed_write(latent, keep_mask, norm_weight, buffers, locations, norm_eps):
         is_decode = False
 
         def __getitem__(self, index):
-            if index == 1:
+            if index == 2:
                 return self.plan_w
             raise IndexError(index)
 
@@ -56,10 +57,7 @@ def _packed_write(latent, keep_mask, norm_weight, buffers, locations, norm_eps):
     plan.plan_w = torch.zeros(
         (latent.shape[0], 8), dtype=torch.uint8, device=latent.device
     )
-    plan.plan_w[:, :4] = torch.tensor(
-        [4, 0, 0, 0], dtype=torch.uint8, device=latent.device
-    )
-    plan.plan_w[:, 4:8] = torch.arange(
+    plan.plan_w[:, :4] = torch.arange(
         latent.shape[0], dtype=torch.int32, device=latent.device
     ).view(torch.uint8).reshape(latent.shape[0], 4)
 
@@ -94,7 +92,7 @@ def main() -> None:
     keep_mask = topmag_keep_mask(latent, 0.5)
     norm_weight = torch.ones(remnant.HEAD_DIM, device=device)
     native_output = torch.empty(
-        (args.rows, remnant.NATIVE_RECORD_BYTES), dtype=torch.uint8, device=device
+        (args.rows, config.NATIVE_RECORD_BYTES), dtype=torch.uint8, device=device
     )
     locations = torch.arange(args.rows, dtype=torch.int32, device=device)
     packed_buffers = (
