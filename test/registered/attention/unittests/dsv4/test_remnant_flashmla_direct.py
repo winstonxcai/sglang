@@ -9,7 +9,6 @@ from sglang.srt import remnant
 from sglang.srt.remnant import NativeWorkspace
 from sglang.srt.remnant.packed import pack_rows, unpack_gather_native
 from sglang.srt.remnant.reference import topmag_keep_mask
-from sglang.test.test_utils import CustomTestCase
 
 
 pytestmark = pytest.mark.skipif(
@@ -44,7 +43,7 @@ def _frequencies(max_position: int, device: torch.device) -> torch.Tensor:
     return table.view(torch.complex64).reshape(-1).contiguous()
 
 
-class TestRemnantFlashMLADirect(CustomTestCase):
+class TestRemnantFlashMLADirect:
     @pytest.mark.parametrize("num_heads", [64, 128])
     @pytest.mark.parametrize("topk_length", [512, 317])
     def test_direct_matches_native_adapter(self, num_heads: int, topk_length: int):
@@ -137,7 +136,7 @@ class TestRemnantFlashMLADirect(CustomTestCase):
             None,
             512,
             direct_meta,
-            sm_scale=512 ** -0.5,
+            softmax_scale=512 ** -0.5,
             is_fp8_kvcache=True,
             indices=swa_indices,
             attn_sink=sink,
@@ -192,7 +191,7 @@ class TestRemnantFlashMLADirect(CustomTestCase):
                 None,
                 512,
                 meta,
-                sm_scale=512 ** -0.5,
+                softmax_scale=512 ** -0.5,
                 is_fp8_kvcache=True,
                 indices=swa_indices,
                 topk_length=swa_lengths,
