@@ -20,10 +20,10 @@ pytestmark = pytest.mark.skipif(
 def _prefill_plan(rows: int, device: torch.device) -> CompressorPrefillPlan:
     plan_c = torch.zeros((rows, 16), dtype=torch.uint8, device=device)
     plan_w = torch.zeros((rows, 8), dtype=torch.uint8, device=device)
-    plan_w[:, :4] = torch.tensor([4, 0, 0, 0], dtype=torch.uint8, device=device)
-    plan_w[:, 4:8] = torch.arange(rows, dtype=torch.int32, device=device).view(
+    plan_w[:, :4] = torch.arange(rows, dtype=torch.int32, device=device).view(
         torch.uint8
     ).reshape(rows, 4)
+    plan_w[:, 4:8] = torch.tensor([0, 0, 0, 0], dtype=torch.uint8, device=device)
     return CompressorPrefillPlan(4, plan_c, plan_w)
 
 
