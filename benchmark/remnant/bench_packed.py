@@ -103,7 +103,11 @@ def main() -> None:
     physical = locations.view(args.rows, 1)
     raw = locations.view(args.rows, 1)
     lengths = torch.ones(args.rows, dtype=torch.int32, device=device)
-    freqs = torch.ones(512, dtype=torch.complex64, device=device)
+    freqs = torch.ones(
+        args.rows * 4 * (config.ROPE_DIM // 2) + config.ROPE_DIM // 2,
+        dtype=torch.complex64,
+        device=device,
+    )
     reconstructed = torch.empty(
         (args.rows, 512), dtype=torch.bfloat16, device=device
     )
