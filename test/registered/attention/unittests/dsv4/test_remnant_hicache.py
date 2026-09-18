@@ -65,6 +65,9 @@ class TestRemnantHiCache(CustomTestCase):
             device_pool, host_indices, device_indices, "direct"
         )
         torch.cuda.synchronize()
+        self.assertTrue(torch.equal(host_pool.host_values[0][0], expected.cpu()))
+        self.assertTrue(torch.all(host_pool.host_bitmaps[0][0] == 0xAAAAAAAAAAAAAAAA))
+        self.assertTrue(torch.all(host_pool.host_scales[0][0] == 127))
         device_pool.packed_values[0][0].zero_()
         device_pool.packed_bitmaps[0][0].zero_()
         device_pool.packed_scales[0][0].zero_()

@@ -51,7 +51,10 @@ def test_remnant_triton_pack_matches_reference():
         buffers,
     )
     expected = pack_rows_ref(latent, mask, norm_weight, 1e-6)
-    assert torch.equal(buffers[0][0, :2], expected[0])
-    assert torch.equal(buffers[1][0, :2], expected[1])
-    assert torch.equal(buffers[2][0, :2], expected[2])
+    packed_values = buffers[0].reshape(-1, 256)[locations]
+    packed_bitmaps = buffers[1].reshape(-1, 8)[locations]
+    packed_scales = buffers[2].reshape(-1, 8)[locations]
+    assert torch.equal(packed_values, expected[0])
+    assert torch.equal(packed_bitmaps, expected[1])
+    assert torch.equal(packed_scales, expected[2])
     remnant.configure_cache_format("native")

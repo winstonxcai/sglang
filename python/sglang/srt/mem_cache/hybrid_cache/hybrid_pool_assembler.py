@@ -391,6 +391,39 @@ import psutil as _remnant_psutil  # noqa: E402
 import torch as _remnant_torch  # noqa: E402
 
 
+def _copy_remnant_rows(dst, src, dst_rows, src_rows) -> None:
+    """Copy selected rows across CPU/GPU without advanced-indexing temporaries.
+
+    ``tensor[index].copy_(...)`` copies into an advanced-indexing temporary,
+    so it silently leaves the original tensor unchanged.  Coalesce adjacent
+    rows into slices; this keeps the normal page-aligned transfer compact while
+    preserving the cross-device copy semantics of pinned host memory.
+    """
+    dst_row_list = dst_rows.detach().cpu().tolist()
+    src_row_list = src_rows.detach().cpu().tolist()
+    if len(dst_row_list) != len(src_row_list):
+        raise ValueError("packed host row count mismatch")
+    if not dst_row_list:
+        return
+
+    run_start = 0
+    for index in range(1, len(dst_row_list) + 1):
+        contiguous = (
+            index < len(dst_row_list)
+            and dst_row_list[index] == dst_row_list[index - 1] + 1
+            and src_row_list[index] == src_row_list[index - 1] + 1
+        )
+        if contiguous:
+            continue
+        dst_start = dst_row_list[run_start]
+        src_start = src_row_list[run_start]
+        run_end = index
+        dst[dst_start : dst_start + run_end - run_start].copy_(
+            src[src_start : src_start + run_end - run_start], non_blocking=True
+        )
+        run_start = index
+
+
 class RemnantPackedHostPool(DeepSeekV4PagedHostPool):
     """Host mirror for a packed DSV4 c4 pool.
 
@@ -525,17 +558,16 @@ class RemnantPackedHostPool(DeepSeekV4PagedHostPool):
         for layer in range(self.layer_num):
             vals, bms, scs = device_pool.get_packed_buffers(layer)
             self._check_rows(device_rows, vals.shape[0])
-            self.host_values[layer][host_rows].copy_(
-                vals[device_rows], non_blocking=True
-            )
+            _copy_remnant_rows(self.host_values[layer], vals, host_rows, device_rows)
             # uint64 advanced indexing has no CUDA kernel; gather through a
             # byte view (host side is CPU, both sides are dtype-clean u8).
-            self.host_bitmaps[layer].view(_remnant_torch.uint8)[host_rows].copy_(
-                bms.view(_remnant_torch.uint8)[device_rows], non_blocking=True
+            _copy_remnant_rows(
+                self.host_bitmaps[layer].view(_remnant_torch.uint8),
+                bms.view(_remnant_torch.uint8),
+                host_rows,
+                device_rows,
             )
-            self.host_scales[layer][host_rows].copy_(
-                scs[device_rows], non_blocking=True
-            )
+            _copy_remnant_rows(self.host_scales[layer], scs, host_rows, device_rows)
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -546,16 +578,14 @@ class RemnantPackedHostPool(DeepSeekV4PagedHostPool):
         host_rows, device_rows = rows
         vals, bms, scs = device_pool.get_packed_buffers(layer_id)
         self._check_rows(device_rows, vals.shape[0])
-        vals[device_rows].copy_(
-            self.host_values[layer_id][host_rows], non_blocking=True
+        _copy_remnant_rows(vals, self.host_values[layer_id], device_rows, host_rows)
+        _copy_remnant_rows(
+            bms.view(_remnant_torch.uint8),
+            self.host_bitmaps[layer_id].view(_remnant_torch.uint8),
+            device_rows,
+            host_rows,
         )
-        bms.view(_remnant_torch.uint8)[device_rows].copy_(
-            self.host_bitmaps[layer_id].view(_remnant_torch.uint8)[host_rows],
-            non_blocking=True,
-        )
-        scs[device_rows].copy_(
-            self.host_scales[layer_id][host_rows], non_blocking=True
-        )
+        _copy_remnant_rows(scs, self.host_scales[layer_id], device_rows, host_rows)
 
     # ---- the packed host layout is fragment mirrors, not the flat layout ----
     # Nothing on the sidecar path reads these (HostPoolGroup and the controller

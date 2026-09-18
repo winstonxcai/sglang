@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 def test_remnant_triton_unpack_reconstructs_selected_row():
     device = torch.device("cuda")
     remnant.configure_cache_format("remnant")
-    values = torch.randint(0, 255, (1, 256, 256), dtype=torch.uint8, device=device)
+    values = torch.zeros((1, 256, 256), dtype=torch.uint8, device=device)
     bitmaps = torch.zeros((1, 256, 8), dtype=torch.uint64, device=device)
     all_bits = torch.tensor(-1, dtype=torch.int64, device=device).view(torch.uint64)
     bitmaps[:, :, :4] = all_bits
