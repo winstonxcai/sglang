@@ -71,6 +71,42 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_remnant_sparse_decode_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length,
+    const at::Tensor& remnant_values,
+    const at::Tensor& remnant_bitmaps,
+    const at::Tensor& remnant_scales,
+    const at::Tensor& remnant_raw_indices,
+    const at::Tensor& remnant_freqs,
+    int64_t d_v,
+    double sm_scale) {
+  return sparse_attn_decode_remnant_interface(
+      q,
+      kv,
+      indices,
+      topk_length,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      extra_indices,
+      extra_topk_length,
+      remnant_values,
+      remnant_bitmaps,
+      remnant_scales,
+      remnant_raw_indices,
+      remnant_freqs,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale));
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
@@ -104,6 +140,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
+
+  m.def(
+      "remnant_sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
+      "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_indices, Tensor? extra_topk_length, "
+      "Tensor remnant_values, Tensor remnant_bitmaps, Tensor remnant_scales, Tensor remnant_raw_indices, "
+      "Tensor remnant_freqs, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("remnant_sparse_decode_fwd", torch::kCUDA, &sgl_remnant_sparse_decode_fwd);
 
   m.def(
       "dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

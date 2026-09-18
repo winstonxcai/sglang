@@ -1,9 +1,9 @@
 # flash_mla
-# sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
+# Remnant fork pinned to the reviewed SM90 direct packed-decode commit.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz
-    URL_HASH SHA256=ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b
+    URL      https://${GITHUB_ARTIFACTORY}/winstonxcai/FlashMLA/archive/40a1c73eabc932d690e81a3e0a2c28f980fbe2ef.tar.gz
+    URL_HASH SHA256=f039cd2790aaa934d8310cbba538cca1dfe510bfa0c84592a0f70054c416a105
 )
 FetchContent_Populate(repo-flashmla)
 
@@ -110,6 +110,8 @@ set(FlashMLA_SOURCES
     # sm90 sparse decode.
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_remnant_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_remnant_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
 

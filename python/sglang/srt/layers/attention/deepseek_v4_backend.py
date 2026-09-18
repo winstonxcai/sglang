@@ -72,7 +72,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+_is_sm90 = is_sm90_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -1735,7 +1736,16 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if compress_ratio == 4 and _sg_lr.packed_enabled():
+            direct_remnant_buffers = None
+            direct_remnant_raw_indices = None
+            direct_remnant_freqs = None
+            if compress_ratio == 4 and _sg_lr.packed_enabled() and _is_sm90:
+                direct_remnant_buffers = token_to_kv_pool.get_packed_buffers(layer_id)
+                direct_remnant_raw_indices = raw_indices
+                direct_remnant_freqs = torch.view_as_real(
+                    token_to_kv_pool.get_rope_freqs(layer_id)
+                )
+            elif compress_ratio == 4 and _sg_lr.packed_enabled():
                 ## REMNANT (decode/small-extend native reconstruction)
                 assert self.remnant_workspace is not None
                 packed_indices = (
@@ -1802,6 +1812,9 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
+                    remnant_buffers=direct_remnant_buffers,
+                    remnant_raw_indices=direct_remnant_raw_indices,
+                    remnant_freqs=direct_remnant_freqs,
                 )[0]
 
             o = o.squeeze(1)
