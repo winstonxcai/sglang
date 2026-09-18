@@ -51,9 +51,16 @@ def test_remnant_triton_pack_matches_reference():
         buffers,
     )
     expected = pack_rows_ref(latent, mask, norm_weight, 1e-6)
-    packed_values = buffers[0].reshape(-1, 256)[locations]
-    packed_bitmaps = buffers[1].reshape(-1, 8)[locations]
-    packed_scales = buffers[2].reshape(-1, 8)[locations]
+    selected_rows = locations.cpu().tolist()
+    packed_values = torch.stack(
+        [buffers[0].reshape(-1, 256)[i] for i in selected_rows]
+    )
+    packed_bitmaps = torch.stack(
+        [buffers[1].reshape(-1, 8)[i] for i in selected_rows]
+    )
+    packed_scales = torch.stack(
+        [buffers[2].reshape(-1, 8)[i] for i in selected_rows]
+    )
     assert torch.equal(packed_values, expected[0])
     assert torch.equal(packed_bitmaps, expected[1])
     assert torch.equal(packed_scales, expected[2])
