@@ -99,9 +99,14 @@ def main() -> None:
             def native():
                 meta = flash_mla.get_mla_metadata()[0]
                 return flash_mla.flash_mla_with_kvcache(
-                    q, swa_cache, None, None, 512, meta, None, 512 ** -0.5,
-                    False, True, swa_indices, None, baseline_cache,
-                    baseline_indices, swa_lengths, lengths,
+                    q, swa_cache, None, None, 512, meta,
+                    softmax_scale=512 ** -0.5,
+                    is_fp8_kvcache=True,
+                    indices=swa_indices,
+                    extra_k_cache=baseline_cache,
+                    extra_indices_in_kvcache=baseline_indices,
+                    topk_length=swa_lengths,
+                    extra_topk_length=lengths,
                 )
 
             def adapter():
@@ -112,17 +117,27 @@ def main() -> None:
                 native_cache = native_bytes[:, : 64 * 576].view(-1, 64, 1, 576)
                 meta = flash_mla.get_mla_metadata()[0]
                 return flash_mla.flash_mla_with_kvcache(
-                    q, swa_cache, None, None, 512, meta, None, 512 ** -0.5,
-                    False, True, swa_indices, None, native_cache,
-                    native_indices.unsqueeze(1), swa_lengths, lengths,
+                    q, swa_cache, None, None, 512, meta,
+                    softmax_scale=512 ** -0.5,
+                    is_fp8_kvcache=True,
+                    indices=swa_indices,
+                    extra_k_cache=native_cache,
+                    extra_indices_in_kvcache=native_indices.unsqueeze(1),
+                    topk_length=swa_lengths,
+                    extra_topk_length=lengths,
                 )
 
             def direct():
                 meta = flash_mla.get_mla_metadata()[0]
                 return flash_mla.flash_mla_with_kvcache(
-                    q, swa_cache, None, None, 512, meta, None, 512 ** -0.5,
-                    False, True, swa_indices, None, None, physical, swa_lengths,
-                    lengths, remnant_buffers=buffers, remnant_raw_indices=raw,
+                    q, swa_cache, None, None, 512, meta,
+                    softmax_scale=512 ** -0.5,
+                    is_fp8_kvcache=True,
+                    indices=swa_indices,
+                    extra_indices_in_kvcache=physical,
+                    topk_length=swa_lengths,
+                    extra_topk_length=lengths,
+                    remnant_buffers=buffers, remnant_raw_indices=raw,
                     remnant_freqs=torch.view_as_real(freqs),
                 )
 
