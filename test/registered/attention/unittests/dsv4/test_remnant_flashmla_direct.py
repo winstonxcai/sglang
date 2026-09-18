@@ -95,13 +95,14 @@ class TestRemnantFlashMLADirect:
             freqs,
             workspace,
         )
-        native_cache = native_bytes[:, : page_size * 576].view(
-            native_bytes.shape[0], page_size, 1, 576
+        native_cache = native_bytes.as_strided(
+            (native_bytes.shape[0], page_size, 1, 584),
+            (workspace.bytes_per_page, 584, 584, 1),
         )
         native_indices = native_indices.unsqueeze(1)
 
         q = torch.randn((1, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
-        swa_cache = torch.zeros((1, page_size, 1, 576), dtype=torch.uint8, device=device)
+        swa_cache = torch.zeros((1, page_size, 1, 584), dtype=torch.uint8, device=device)
         swa_indices = torch.arange(page_size, device=device, dtype=torch.int32).view(
             1, 1, page_size
         )
@@ -173,7 +174,7 @@ class TestRemnantFlashMLADirect:
             buffers,
         )
         q = torch.randn((1, 1, 64, 512), device=device, dtype=torch.bfloat16)
-        swa_cache = torch.zeros((1, 64, 1, 576), dtype=torch.uint8, device=device)
+        swa_cache = torch.zeros((1, 64, 1, 584), dtype=torch.uint8, device=device)
         swa_indices = torch.arange(64, device=device, dtype=torch.int32).view(1, 1, 64)
         swa_lengths = torch.full((1,), 64, dtype=torch.int32, device=device)
         physical = torch.arange(512, device=device, dtype=torch.int32).view(1, 512) % rows

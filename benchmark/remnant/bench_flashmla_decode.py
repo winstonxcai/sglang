@@ -70,7 +70,7 @@ def main() -> None:
         for batch in (int(value) for value in args.batches.split(",")):
             rows = 64
             q = torch.randn((batch, 1, heads, 512), device=device, dtype=torch.bfloat16)
-            swa_cache = torch.zeros((1, 64, 1, 576), dtype=torch.uint8, device=device)
+            swa_cache = torch.zeros((1, 64, 1, 584), dtype=torch.uint8, device=device)
             swa_indices = torch.arange(64, dtype=torch.int32, device=device).view(1, 1, 64).expand(batch, -1, -1).contiguous()
             swa_lengths = torch.full((batch,), 64, dtype=torch.int32, device=device)
             physical = torch.arange(512, dtype=torch.int32, device=device).view(1, 1, 512).remainder(rows).expand(batch, -1, -1).contiguous()
@@ -93,7 +93,10 @@ def main() -> None:
                 buffers, physical.flatten(0, 1), raw.flatten(0, 1), lengths,
                 freqs, workspace,
             )
-            baseline_cache = baseline_bytes[:, : 64 * 576].view(-1, 64, 1, 576)
+            baseline_cache = baseline_bytes.as_strided(
+                (baseline_bytes.shape[0], 64, 1, 584),
+                (workspace.bytes_per_page, 584, 584, 1),
+            )
             baseline_indices = baseline_indices.unsqueeze(1)
 
             def native():
@@ -114,7 +117,10 @@ def main() -> None:
                     buffers, physical.flatten(0, 1), raw.flatten(0, 1), lengths,
                     freqs, workspace,
                 )
-                native_cache = native_bytes[:, : 64 * 576].view(-1, 64, 1, 576)
+                native_cache = native_bytes.as_strided(
+                    (native_bytes.shape[0], 64, 1, 584),
+                    (workspace.bytes_per_page, 584, 584, 1),
+                )
                 meta = flash_mla.get_mla_metadata()[0]
                 return flash_mla.flash_mla_with_kvcache(
                     q, swa_cache, None, None, 512, meta,
