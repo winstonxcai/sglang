@@ -2,8 +2,8 @@
 
 No persistent state here. The pruning helpers are shared production primitives;
 the Torch pack/unpack functions are numerical references. Production storage and
-reconstruction wrappers live in packed.py. SGLang source edits live in patches/
-and are applied through patching.py.
+reconstruction wrappers live in packed.py; the runtime integration is in the
+normal SGLang cache, compressor, backend, and HiCache modules.
 
 The exact-global keep-mask (`topmag_keep_mask`) is the single source of truth.
 It MUST be computed once from the unmodified latent and passed explicitly to
