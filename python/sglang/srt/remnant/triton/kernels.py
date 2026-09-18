@@ -71,7 +71,12 @@ def _pack_fp8_kernel(
         # CompressPlan word 1 packs ragged_id (low 16 bits) and buffer_len.
         ragged_id = tl.load(plan_base + 1).to(tl.int32) & 0xFFFF
         location = tl.load(locations_ptr + ragged_id).to(tl.int64)
-    write_row = (row < n_rows) & (seq_len % 4 == 0) & (location >= 0)
+    # Decode plans include sequence length in word 0 and only write C4
+    # boundaries. Prefill WritePlan entries are already filtered to valid
+    # writes, so their word 0 is ragged_id rather than sequence length.
+    write_row = (row < n_rows) & (location >= 0)
+    if IS_DECODE:
+        write_row = write_row & (seq_len % 4 == 0)
     tl.store(
         values_ptr + location * KEEP_K + rank,
         raw_code,

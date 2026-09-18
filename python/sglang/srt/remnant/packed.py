@@ -87,7 +87,8 @@ def _as_buffers(packed_buffers, layer_id: int | None = None) -> PackedBuffers:
 
 
 def _plan_rows(compressor_plan: object) -> torch.Tensor:
-    return compressor_plan[1].view(torch.int32)
+    plan = compressor_plan[1] if compressor_plan.is_decode else compressor_plan[2]
+    return plan.view(torch.int32)
 
 
 def pack_rows(
