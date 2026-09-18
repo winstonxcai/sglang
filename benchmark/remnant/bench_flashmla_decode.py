@@ -58,6 +58,12 @@ def main() -> None:
     parser.add_argument("--batches", default="1,2,8")
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument(
+        "--path",
+        choices=("all", "native", "adapter", "direct"),
+        default="all",
+        help="Run one path only when isolating it under a GPU profiler.",
+    )
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         raise RuntimeError("This benchmark requires an H100")
@@ -147,16 +153,35 @@ def main() -> None:
                     remnant_freqs=torch.view_as_real(freqs),
                 )
 
-            native_ms = _measure(native, args.warmup, args.repeats)
-            adapter_ms = _measure(adapter, args.warmup, args.repeats)
-            direct_ms = _measure(direct, args.warmup, args.repeats)
-            native_kernel = _kernel_time(native)
-            adapter_kernel = _kernel_time(adapter)
-            direct_kernel = _kernel_time(direct)
+            native_ms = adapter_ms = direct_ms = float("nan")
+            native_kernel = adapter_kernel = direct_kernel = float("nan")
+            selected = {
+                "native": native,
+                "adapter": adapter,
+                "direct": direct,
+            }
+            paths = selected if args.path == "all" else {args.path: selected[args.path]}
+            measurements = {
+                name: _measure(fn, args.warmup, args.repeats)
+                for name, fn in paths.items()
+            }
+            if args.path == "all":
+                native_ms = measurements["native"]
+                adapter_ms = measurements["adapter"]
+                direct_ms = measurements["direct"]
+                native_kernel = _kernel_time(native)
+                adapter_kernel = _kernel_time(adapter)
+                direct_kernel = _kernel_time(direct)
+            elif args.path == "native":
+                native_ms = measurements["native"]
+            elif args.path == "adapter":
+                adapter_ms = measurements["adapter"]
+            else:
+                direct_ms = measurements["direct"]
             print(
                 f"{heads},{batch},512,{native_ms:.4f},{adapter_ms:.4f},{direct_ms:.4f},"
                 f"{native_kernel:.4f},{adapter_kernel:.4f},{direct_kernel:.4f},"
-                f"{100 * (direct_ms / native_ms - 1):.3f}"
+                f"{100 * (direct_ms / native_ms - 1) if args.path == 'all' else float('nan'):.3f}"
             )
     remnant.configure_cache_format("native")
 
