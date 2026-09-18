@@ -63,7 +63,7 @@ def _pack_fp8_kernel(
     raw_code = fp8.to(tl.uint8, bitcast=True)
     rank = tl.cumsum(bits.to(tl.int32), axis=0) - 1
 
-    plan_base = plan_ptr + row * 4
+    plan_base = plan_ptr + row * (4 if IS_DECODE else 2)
     if IS_DECODE:
         seq_len = tl.load(plan_base).to(tl.int32)
         location = tl.load(locations_ptr + row).to(tl.int64)
