@@ -2,8 +2,8 @@
 # Remnant fork pinned to the reviewed SM90 direct packed-decode commit.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/winstonxcai/FlashMLA/archive/aae93d9.tar.gz
-    URL_HASH SHA256=80a46d62db037c04be2ad6d7b185d1edba970a4b00c896be65020d42c9cad050
+    URL      https://${GITHUB_ARTIFACTORY}/winstonxcai/FlashMLA/archive/76ad012.tar.gz
+    URL_HASH SHA256=0e019751a7b222bb97d9dc07e3c372d89c08cd49633f1fd10526adc623fb3edb
 )
 FetchContent_Populate(repo-flashmla)
 
