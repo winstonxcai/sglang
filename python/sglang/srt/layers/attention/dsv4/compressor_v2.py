@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt import remnant as _sg_lr
+
 from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cast
 
 import torch
@@ -148,7 +150,7 @@ class CompressorBackendMixin:
         head_dim: int,
         norm: RMSNorm,
         freqs_cis_cache: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
         is_indexer: bool,
         rotate: bool,
         compress_ratio: int,
@@ -156,6 +158,8 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        packed_pool=None,
+        packed_layer_id: Optional[int] = None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -185,7 +189,32 @@ class CompressorBackendMixin:
             is_online=is_online,
         )
 
+        ## REMNANT (single-mask packed store)
+        if (
+            compress_ratio == 4
+            and not is_indexer
+            and _sg_lr.topmag_enabled()
+        ):
+            keep_mask = _sg_lr.topmag_keep_mask(
+                kv_compressed, _sg_lr.topmag_keep()
+            )
+            if _sg_lr.packed_enabled():
+                _sg_lr.validate_packed_static_config()
+                assert packed_pool is not None
+                assert packed_layer_id is not None
+                packed_pool.set_rope_freqs(
+                    packed_layer_id, freqs_cis_cache
+                )
+                _sg_lr.pack_rows(
+                    kv_compressed, keep_mask, norm.weight,
+                    norm.variance_epsilon, plan, out_loc,
+                    packed_pool, layer_id=packed_layer_id,
+                )
+                return
+            _sg_lr.topmag_zero_from_mask(kv_compressed, keep_mask)
+
         # Step 2: norm + rope + store
+        assert kv_cache is not None
         compress_norm_rope_store(
             kv_compressed,
             plan,
@@ -223,6 +252,8 @@ class CompressorBackendMixin:
             compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
         )
         bf16_store = False
+        packed_pool = None
+        packed_layer_id = None
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
@@ -235,9 +266,19 @@ class CompressorBackendMixin:
             )
             bf16_store = True
         else:
-            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            _, compress_layer_id, compress_kv_pool = (
+                token_to_kv_pool.layer_mapping[layer_id]
+            )
             assert compress_kv_pool is not None
-            kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            if (
+                _sg_lr.packed_enabled()
+                and compressor.ratio == 4
+            ):
+                kv_cache = None
+                packed_pool = compress_kv_pool
+                packed_layer_id = compress_layer_id
+            else:
+                kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                 out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
@@ -248,7 +289,10 @@ class CompressorBackendMixin:
             head_dim=compressor.head_dim,
             norm=compressor.norm,
             freqs_cis_cache=compressor.freqs_cis,
-            kv_cache=kv_cache.view(dtype=torch.uint8),
+            kv_cache=(
+                kv_cache.view(dtype=torch.uint8)
+                if kv_cache is not None else None
+            ),
             is_indexer=compressor.is_in_indexer,
             rotate=compressor.rotate,
             compress_ratio=compressor.ratio,
@@ -256,6 +300,8 @@ class CompressorBackendMixin:
             out_loc=out_loc,
             use_fp4_indexer=use_fp4_indexer,
             bf16_store=bf16_store,
+            packed_pool=packed_pool,
+            packed_layer_id=packed_layer_id,
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

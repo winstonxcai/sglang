@@ -677,6 +677,18 @@ class ServerArgs:
         ),
         NS("model"),
     ] = None
+    dsv4_c4_cache_format: A[
+        str,
+        Arg(
+            help=(
+                "DeepSeek V4 compressed C4 cache format. 'native' keeps the "
+                "stock SGLang layout; 'remnant' uses the persistent 328-byte "
+                "TopMag50 packed layout."
+            ),
+            choices=["native", "remnant"],
+        ),
+        NS("model"),
+    ] = "native"
     kv_cache_dtype: A[
         str,
         Arg(
@@ -3585,6 +3597,38 @@ class ServerArgs:
     def __post_init__(self):
         self._run_resolution_pipeline()
 
+    def _configure_dsv4_c4_cache_format(self) -> None:
+        from sglang.srt import remnant
+
+        remnant.configure_cache_format(self.dsv4_c4_cache_format)
+        if self.dsv4_c4_cache_format != "remnant":
+            return
+
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        if not is_deepseek_v4(self.get_model_config().hf_config):
+            raise ValueError(
+                "--dsv4-c4-cache-format remnant requires a DeepSeek V4 model"
+            )
+        incompatible = []
+        if self.enable_hisparse:
+            incompatible.append("--enable-hisparse")
+        if self.speculative_algorithm is not None:
+            incompatible.append("speculative decoding")
+        if self.cpu_offload_gb > 0:
+            incompatible.append("--cpu-offload-gb")
+        if self.disaggregation_decode_enable_offload_kvcache:
+            incompatible.append("decode KV offload")
+        if self.enable_prefill_context_parallel:
+            incompatible.append("--enable-prefill-context-parallel")
+        if self.enable_dsa_prefill_context_parallel:
+            incompatible.append("--enable-dsa-prefill-context-parallel")
+        if incompatible:
+            raise ValueError(
+                "--dsv4-c4-cache-format remnant is incompatible with "
+                + ", ".join(incompatible)
+            )
+
     def _run_resolution_pipeline(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3614,6 +3658,10 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
+
+        from sglang.srt import remnant
+
+        remnant.configure_cache_format(self.dsv4_c4_cache_format)
 
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
@@ -3678,6 +3726,7 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+        self._configure_dsv4_c4_cache_format()
 
         # Set kernel backends.
         self._handle_sampling_backend()

@@ -13,6 +13,8 @@ Two entry points, same core computation:
 
 from __future__ import annotations
 
+from sglang.srt import remnant as _sg_lr
+
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -868,7 +870,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
             self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
+            + c4_frac
+            * (_sg_lr.PACKED_RECORD_BYTES if _sg_lr.packed_enabled() else kv_bytes)
+            * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4

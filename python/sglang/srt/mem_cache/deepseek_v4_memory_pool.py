@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt import remnant as _sg_lr
+
 import logging
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple
@@ -172,6 +174,111 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Use get_key_buffer instead.")
+
+
+## REMNANT (packed-pool)
+class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
+    """Persistent 328-byte/page-row packed storage (no native shadow pool)."""
+
+    def _create_buffers(self):
+        num_pages = (self.size + self.page_size + 1) // self.page_size
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.packed_values = [
+                    torch.zeros(
+                        num_pages, self.page_size, 256,
+                        dtype=torch.uint8, device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.packed_bitmaps = [
+                    torch.zeros(
+                        num_pages, self.page_size, 8,
+                        dtype=torch.uint64, device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.packed_scales = [
+                    torch.zeros(
+                        num_pages, self.page_size, 8,
+                        dtype=torch.uint8, device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+        # Compatibility only: generic lifecycle code expects this attribute.
+        # It must never be treated as a native hybrid allocation.
+        self.kv_buffer = self.packed_values
+        self.kv_cache_total_dim = 328
+        self.bytes_per_page_padded = self.page_size * 328
+        self._remnant_rope_freqs = [None] * self.layer_num
+        logger.info(
+            "Remnant packed pool: layers=%d pages/layer=%d "
+            "page_size=%d logical_row_bytes=328 allocated_bytes=%d",
+            self.layer_num,
+            num_pages,
+            self.page_size,
+            self.get_kv_size_bytes(),
+        )
+
+    def get_bytes_per_token(self) -> int:
+        return 328
+
+    def get_packed_buffers(self, layer_id: int):
+        local = layer_id - self.start_layer
+        return (
+            self.packed_values[local],
+            self.packed_bitmaps[local],
+            self.packed_scales[local],
+        )
+
+    def set_rope_freqs(self, layer_id: int, freqs_cis) -> None:
+        local = layer_id - self.start_layer
+        if self._remnant_rope_freqs[local] is None:
+            if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
+                raise RuntimeError(
+                    "packed requires a contiguous complex RoPE table"
+                )
+            # Retain the compressor's existing table. Creating contiguous real
+            # and imaginary copies costs 256 MiB per rank at 135168 context and
+            # can OOM after KV-pool sizing has consumed the remaining HBM.
+            self._remnant_rope_freqs[local] = freqs_cis
+
+    def get_rope_freqs(self, layer_id: int):
+        local = layer_id - self.start_layer
+        value = self._remnant_rope_freqs[local]
+        if value is None:
+            raise RuntimeError("packed RoPE frequencies not initialized")
+        return value
+
+    def get_key_buffer(self, layer_id: int):
+        raise RuntimeError("packed has no native key buffer; unpack first")
+
+    def set_key_buffer(self, *args, **kwargs):
+        raise RuntimeError("packed must be written through pack_rows")
+
+    set_key_buffer_fused = set_key_buffer
+
+    def get_kv_size_bytes(self):
+        return sum(
+            t.nbytes
+            for group in (
+                self.packed_values, self.packed_bitmaps, self.packed_scales
+            )
+            for t in group
+        )
+
+    def get_buf_infos(self):
+        ptrs, lens, items = [], [], []
+        for layer in range(self.layer_num):
+            for buf in self.get_packed_buffers(layer):
+                ptrs.append(buf.data_ptr())
+                lens.append(buf.nbytes)
+                items.append(buf[0].nbytes)
+        return ptrs, lens, items
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
@@ -617,7 +724,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
 
             c4_kv_pool_type = DeepSeekV4SingleKVPool
-            if enable_hisparse:
+            if _sg_lr.packed_enabled():
+                _sg_lr.validate_packed_static_config()
+                if enable_hisparse:
+                    raise RuntimeError(
+                        'packed is incompatible with HiSparse'
+                    )
+                c4_kv_pool_type = RemnantPackedKVPool
+            elif enable_hisparse:
                 c4_kv_pool_type = HiSparseC4DevicePool
             self.c4_kv_pool = self._make_kv_pool(
                 size=c4_size,
@@ -712,11 +826,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
             return data_ptrs, data_lens, item_lens
 
-        buf_groups = [
-            self.c4_kv_pool.kv_buffer,
-            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            self.c128_kv_pool.kv_buffer,
-        ]
+        if _sg_lr.packed_enabled():
+            p, n, i = self.c4_kv_pool.get_buf_infos()
+            data_ptrs.extend(p)
+            data_lens.extend(n)
+            item_lens.extend(i)
+            buf_groups = [
+                self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+                self.c128_kv_pool.kv_buffer,
+            ]
+        else:
+            buf_groups = [
+                self.c4_kv_pool.kv_buffer,
+                self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+                self.c128_kv_pool.kv_buffer,
+            ]
 
         for bufs in buf_groups:
             for buf in bufs:
@@ -1081,6 +1205,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, _, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.page_size
+
+    ## REMNANT (packed accessors)
+    def get_packed_pool(self, layer_id: int):
+        ratio, _, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError('layer does not use packed')
+        self.wait_layer_transfer(layer_id)
+        return pool
+
+    def get_packed_buffers(self, layer_id: int):
+        ratio, local, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError('layer does not use packed')
+        self.wait_layer_transfer(layer_id)
+        return pool.get_packed_buffers(local)
+
+    def get_packed_freqs(self, layer_id: int):
+        ratio, local, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError('layer does not use packed')
+        return pool.get_rope_freqs(local)
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
         self.wait_layer_transfer(layer_id)

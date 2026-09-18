@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt import remnant as _sg_lr
+
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -799,7 +801,7 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if capture_enabled and not _sg_lr.packed_enabled():
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
@@ -826,7 +828,8 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get():
+            ## REMNANT (v2 raw-index auxiliary output)
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
@@ -834,6 +837,7 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+                raw_indices,
             )
         else:
             topk_transform_512(
