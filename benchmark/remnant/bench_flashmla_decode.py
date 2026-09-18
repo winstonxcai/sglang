@@ -1,0 +1,144 @@
+"""Model-free FlashMLA Native, adapter, and direct Remnant decode timing."""
+
+from __future__ import annotations
+
+import argparse
+
+import torch
+
+from sgl_kernel import flash_mla
+from sglang.srt import remnant
+from sglang.srt.remnant import NativeWorkspace
+from sglang.srt.remnant.packed import pack_rows, unpack_gather_native
+from sglang.srt.remnant.reference import topmag_keep_mask
+
+
+class _PackPlan:
+    is_decode = False
+
+    def __init__(self, rows: int, device: torch.device):
+        self.plan_w = torch.zeros((rows, 8), dtype=torch.uint8, device=device)
+        ids = torch.arange(rows, dtype=torch.int32, device=device)
+        self.plan_w[:, :4] = ids.view(torch.uint8).reshape(rows, 4)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        if index == 2:
+            return self.plan_w
+        raise IndexError(index)
+
+
+def _measure(fn, warmup: int, repeats: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(repeats):
+        fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / repeats
+
+
+def _kernel_time(fn) -> float:
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        fn()
+    torch.cuda.synchronize()
+    names = ("flash_fwd_splitkv_mla_fp8_sparse_kernel", "flash_fwd_mla_combine_kernel")
+    return sum(
+        event.device_time_total
+        for event in prof.key_averages()
+        if any(name in event.key for name in names)
+    ) / 1000.0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batches", default="1,2,8")
+    parser.add_argument("--repeats", type=int, default=50)
+    parser.add_argument("--warmup", type=int, default=10)
+    args = parser.parse_args()
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        raise RuntimeError("This benchmark requires an H100")
+
+    device = torch.device("cuda")
+    remnant.configure_cache_format("remnant")
+    print("heads,batch,topk,native_total_ms,adapter_total_ms,direct_total_ms,"
+          "native_kernel_ms,adapter_kernel_ms,direct_kernel_ms,direct_vs_native_pct")
+    for heads in (64, 128):
+        for batch in (int(value) for value in args.batches.split(",")):
+            rows = 64
+            q = torch.randn((batch, 1, heads, 512), device=device, dtype=torch.bfloat16)
+            swa_cache = torch.zeros((1, 64, 1, 576), dtype=torch.uint8, device=device)
+            swa_indices = torch.arange(64, dtype=torch.int32, device=device).view(1, 1, 64).expand(batch, -1, -1).contiguous()
+            swa_lengths = torch.full((batch,), 64, dtype=torch.int32, device=device)
+            physical = torch.arange(512, dtype=torch.int32, device=device).view(1, 1, 512).remainder(rows).expand(batch, -1, -1).contiguous()
+            raw = physical + 3
+            lengths = torch.full((batch,), 512, dtype=torch.int32, device=device)
+            latent = torch.randn((rows, 512), device=device)
+            mask = topmag_keep_mask(latent, 0.5)
+            buffers = (
+                torch.zeros((1, rows, 256), dtype=torch.uint8, device=device),
+                torch.zeros((1, rows, 8), dtype=torch.uint64, device=device),
+                torch.zeros((1, rows, 8), dtype=torch.uint8, device=device),
+            )
+            pack_rows(
+                latent, mask, torch.ones(512, device=device), 1.0e-6,
+                _PackPlan(rows, device), torch.arange(rows, dtype=torch.int32, device=device), buffers,
+            )
+            workspace = NativeWorkspace.allocate(batch, 512, 64, device, with_dense=True)
+            freqs = torch.ones((1, 128 * 128 + 32), dtype=torch.complex64, device=device)
+            baseline_bytes, baseline_indices = unpack_gather_native(
+                buffers, physical.flatten(0, 1), raw.flatten(0, 1), lengths,
+                freqs, workspace,
+            )
+            baseline_cache = baseline_bytes[:, : 64 * 576].view(-1, 64, 1, 576)
+            baseline_indices = baseline_indices.unsqueeze(1)
+
+            def native():
+                meta = flash_mla.get_mla_metadata()[0]
+                return flash_mla.flash_mla_with_kvcache(
+                    q, swa_cache, None, None, 512, meta, None, 512 ** -0.5,
+                    False, True, swa_indices, None, baseline_cache,
+                    baseline_indices, swa_lengths, lengths,
+                )
+
+            def adapter():
+                native_bytes, native_indices = unpack_gather_native(
+                    buffers, physical.flatten(0, 1), raw.flatten(0, 1), lengths,
+                    freqs, workspace,
+                )
+                native_cache = native_bytes[:, : 64 * 576].view(-1, 64, 1, 576)
+                meta = flash_mla.get_mla_metadata()[0]
+                return flash_mla.flash_mla_with_kvcache(
+                    q, swa_cache, None, None, 512, meta, None, 512 ** -0.5,
+                    False, True, swa_indices, None, native_cache,
+                    native_indices.unsqueeze(1), swa_lengths, lengths,
+                )
+
+            def direct():
+                meta = flash_mla.get_mla_metadata()[0]
+                return flash_mla.flash_mla_with_kvcache(
+                    q, swa_cache, None, None, 512, meta, None, 512 ** -0.5,
+                    False, True, swa_indices, None, None, physical, swa_lengths,
+                    lengths, remnant_buffers=buffers, remnant_raw_indices=raw,
+                    remnant_freqs=torch.view_as_real(freqs),
+                )
+
+            native_ms = _measure(native, args.warmup, args.repeats)
+            adapter_ms = _measure(adapter, args.warmup, args.repeats)
+            direct_ms = _measure(direct, args.warmup, args.repeats)
+            native_kernel = _kernel_time(native)
+            adapter_kernel = _kernel_time(adapter)
+            direct_kernel = _kernel_time(direct)
+            print(
+                f"{heads},{batch},512,{native_ms:.4f},{adapter_ms:.4f},{direct_ms:.4f},"
+                f"{native_kernel:.4f},{adapter_kernel:.4f},{direct_kernel:.4f},"
+                f"{100 * (direct_ms / native_ms - 1):.3f}"
+            )
+    remnant.configure_cache_format("native")
+
+
+if __name__ == "__main__":
+    main()
