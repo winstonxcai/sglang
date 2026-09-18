@@ -20,7 +20,8 @@ def test_remnant_triton_unpack_reconstructs_selected_row():
     remnant.configure_cache_format("remnant")
     values = torch.randint(0, 255, (1, 256, 256), dtype=torch.uint8, device=device)
     bitmaps = torch.zeros((1, 256, 8), dtype=torch.uint64, device=device)
-    bitmaps[:, :, :4] = torch.iinfo(torch.uint64).max
+    all_bits = torch.tensor(-1, dtype=torch.int64, device=device).view(torch.uint64)
+    bitmaps[:, :, :4] = all_bits
     scales = torch.full((1, 256, 8), 127, dtype=torch.uint8, device=device)
     physical = torch.zeros((1, 1), dtype=torch.int32, device=device)
     raw = torch.zeros((1, 1), dtype=torch.int32, device=device)

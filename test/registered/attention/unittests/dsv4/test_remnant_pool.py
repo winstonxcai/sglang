@@ -6,17 +6,18 @@ from unittest import mock
 from sglang.srt import remnant
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import RemnantPackedKVPool
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+from sglang.srt.remnant import config
 from sglang.test.test_utils import CustomTestCase
 
 
 class TestRemnantPool(CustomTestCase):
     def test_record_layout_is_328_bytes(self):
-        values = remnant.PACKED_KEPT_VALUES
-        bitmap = remnant.BITMAP_WORDS * 8
-        scales = remnant.BITMAP_WORDS
+        values = config.PACKED_KEPT_VALUES
+        bitmap = config.BITMAP_WORDS * 8
+        scales = config.BITMAP_WORDS
         self.assertEqual(values + bitmap + scales, 328)
         self.assertEqual(RemnantPackedKVPool.get_bytes_per_token(object()), 328)
-        self.assertEqual(remnant.NATIVE_RECORD_BYTES, 584)
+        self.assertEqual(config.NATIVE_RECORD_BYTES, 584)
 
     def test_pool_sizing_uses_packed_record_for_c4_only(self):
         configurator = object.__new__(DSV4PoolConfigurator)

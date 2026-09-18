@@ -61,7 +61,7 @@ def _packed_write(latent, keep_mask, norm_weight, buffers, locations, norm_eps):
     )
     plan.plan_w[:, 4:8] = torch.arange(
         latent.shape[0], dtype=torch.int32, device=latent.device
-    ).view(torch.uint8)
+    ).view(torch.uint8).reshape(latent.shape[0], 4)
 
     def run():
         pack_rows(

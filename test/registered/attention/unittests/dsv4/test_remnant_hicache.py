@@ -64,6 +64,7 @@ class TestRemnantHiCache(CustomTestCase):
         host_pool.backup_from_device_all_layer(
             device_pool, host_indices, device_indices, "direct"
         )
+        torch.cuda.synchronize()
         device_pool.packed_values[0][0].zero_()
         device_pool.packed_bitmaps[0][0].zero_()
         device_pool.packed_scales[0][0].zero_()

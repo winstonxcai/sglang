@@ -23,7 +23,7 @@ def _prefill_plan(rows: int, device: torch.device) -> CompressorPrefillPlan:
     plan_w[:, :4] = torch.tensor([4, 0, 0, 0], dtype=torch.uint8, device=device)
     plan_w[:, 4:8] = torch.arange(rows, dtype=torch.int32, device=device).view(
         torch.uint8
-    )
+    ).reshape(rows, 4)
     return CompressorPrefillPlan(4, plan_c, plan_w)
 
 
