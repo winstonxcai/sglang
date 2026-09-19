@@ -18,6 +18,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_cache_format():
+    yield
+    remnant.configure_cache_format("native")
+
+
 class _PackPlan:
     is_decode = False
 
@@ -45,12 +51,15 @@ def _frequencies(max_position: int, device: torch.device) -> torch.Tensor:
 
 class TestRemnantFlashMLADirect:
     @pytest.mark.parametrize("num_heads", [64, 128])
+    @pytest.mark.parametrize("batch", [8, 16])
     @pytest.mark.parametrize("topk_length", [512, 317])
-    def test_direct_matches_native_adapter(self, num_heads: int, topk_length: int):
+    def test_direct_matches_native_adapter(
+        self, num_heads: int, batch: int, topk_length: int
+    ):
         from sgl_kernel import flash_mla
 
         device = torch.device("cuda")
-        rows = 64
+        rows = batch * 64
         page_size = 64
         selected_k = 512
         remnant.configure_cache_format("remnant")
@@ -59,9 +68,9 @@ class TestRemnantFlashMLADirect:
         keep_mask = topmag_keep_mask(latent, 0.5)
         norm_weight = torch.ones(512, device=device)
         buffers = (
-            torch.zeros((1, page_size, 256), dtype=torch.uint8, device=device),
-            torch.zeros((1, page_size, 8), dtype=torch.uint64, device=device),
-            torch.zeros((1, page_size, 8), dtype=torch.uint8, device=device),
+            torch.zeros((batch, page_size, 256), dtype=torch.uint8, device=device),
+            torch.zeros((batch, page_size, 8), dtype=torch.uint64, device=device),
+            torch.zeros((batch, page_size, 8), dtype=torch.uint8, device=device),
         )
         locations = torch.arange(rows, dtype=torch.int32, device=device)
         pack_rows(
@@ -76,16 +85,21 @@ class TestRemnantFlashMLADirect:
 
         physical = torch.arange(selected_k, device=device, dtype=torch.int32).view(
             1, selected_k
-        ) % rows
+        ) % 64
+        physical = physical + torch.arange(batch, device=device, dtype=torch.int32).view(
+            batch, 1
+        ) * 64
         raw = physical + 3
         if topk_length < selected_k:
+            physical = physical.clone()
+            raw = raw.clone()
             physical[:, topk_length:] = 0
             raw[:, topk_length:] = -1
-        lengths = torch.full((1,), topk_length, dtype=torch.int32, device=device)
-        freqs = _frequencies(128, device)
+        lengths = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
+        freqs = _frequencies(int(raw.clamp_min(0).max().item()) + 2, device)
 
         workspace = NativeWorkspace.allocate(
-            1, selected_k, page_size, device, with_dense=True
+            batch, selected_k, page_size, device, with_dense=True
         )
         native_bytes, native_indices = unpack_gather_native(
             buffers,
@@ -101,12 +115,16 @@ class TestRemnantFlashMLADirect:
         )
         native_indices = native_indices.unsqueeze(1)
 
-        q = torch.randn((1, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
-        swa_cache = torch.zeros((1, page_size, 1, 584), dtype=torch.uint8, device=device)
+        q = torch.randn((batch, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
+        swa_cache = torch.zeros((batch, page_size, 1, 584), dtype=torch.uint8, device=device)
         swa_indices = torch.arange(page_size, device=device, dtype=torch.int32).view(
             1, 1, page_size
         )
-        swa_lengths = torch.full((1,), page_size, dtype=torch.int32, device=device)
+        swa_indices = swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(
+            batch, 1, 1
+        ) * page_size
+        swa_indices = swa_indices.contiguous()
+        swa_lengths = torch.full((batch,), page_size, dtype=torch.int32, device=device)
         sink = torch.linspace(-0.1, 0.1, num_heads, device=device)
 
         native_meta = flash_mla.get_mla_metadata()[0]
@@ -149,20 +167,21 @@ class TestRemnantFlashMLADirect:
 
         torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
         torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
-        remnant.configure_cache_format("native")
 
-    def test_direct_decode_cuda_graph_replay(self):
+    @pytest.mark.parametrize("num_heads", [64, 128])
+    @pytest.mark.parametrize("batch", [8, 16])
+    def test_direct_decode_cuda_graph_replay(self, num_heads: int, batch: int):
         from sgl_kernel import flash_mla
 
         device = torch.device("cuda")
-        rows = 64
+        rows = batch * 64
         remnant.configure_cache_format("remnant")
         latent = torch.randn((rows, 512), device=device)
         keep_mask = topmag_keep_mask(latent, 0.5)
         buffers = (
-            torch.zeros((1, rows, 256), dtype=torch.uint8, device=device),
-            torch.zeros((1, rows, 8), dtype=torch.uint64, device=device),
-            torch.zeros((1, rows, 8), dtype=torch.uint8, device=device),
+            torch.zeros((batch, 64, 256), dtype=torch.uint8, device=device),
+            torch.zeros((batch, 64, 8), dtype=torch.uint64, device=device),
+            torch.zeros((batch, 64, 8), dtype=torch.uint8, device=device),
         )
         pack_rows(
             latent,
@@ -173,14 +192,20 @@ class TestRemnantFlashMLADirect:
             torch.arange(rows, dtype=torch.int32, device=device),
             buffers,
         )
-        q = torch.randn((1, 1, 64, 512), device=device, dtype=torch.bfloat16)
-        swa_cache = torch.zeros((1, 64, 1, 584), dtype=torch.uint8, device=device)
+        q = torch.randn((batch, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
+        swa_cache = torch.zeros((batch, 64, 1, 584), dtype=torch.uint8, device=device)
         swa_indices = torch.arange(64, device=device, dtype=torch.int32).view(1, 1, 64)
-        swa_lengths = torch.full((1,), 64, dtype=torch.int32, device=device)
-        physical = torch.arange(512, device=device, dtype=torch.int32).view(1, 512) % rows
+        swa_indices = swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(
+            batch, 1, 1
+        ) * 64
+        swa_indices = swa_indices.contiguous()
+        swa_lengths = torch.full((batch,), 64, dtype=torch.int32, device=device)
+        physical = torch.arange(512, device=device, dtype=torch.int32).view(1, 512) % 64
+        physical = physical + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1) * 64
+        physical = physical.contiguous()
         raw = physical + 5
-        lengths = torch.full((1,), 512, dtype=torch.int32, device=device)
-        freqs = _frequencies(128, device)
+        lengths = torch.full((batch,), 512, dtype=torch.int32, device=device)
+        freqs = _frequencies(int(raw.max().item()) + 2, device)
 
         def run(meta):
             return flash_mla.flash_mla_with_kvcache(
@@ -211,12 +236,14 @@ class TestRemnantFlashMLADirect:
         graph.replay()
         torch.cuda.synchronize()
         first = tuple(x.clone() for x in captured)
+        q.normal_()
         graph.replay()
         torch.cuda.synchronize()
         second = tuple(x.clone() for x in captured)
-        torch.testing.assert_close(first[0], second[0], atol=0, rtol=0)
-        torch.testing.assert_close(first[1], second[1], atol=0, rtol=0)
-        remnant.configure_cache_format("native")
+        eager = run(meta)
+        torch.testing.assert_close(second[0], eager[0], atol=2.0e-2, rtol=2.0e-2)
+        torch.testing.assert_close(second[1], eager[1], atol=2.0e-2, rtol=2.0e-2)
+        assert not torch.equal(first[0], second[0])
 
 
 if __name__ == "__main__":

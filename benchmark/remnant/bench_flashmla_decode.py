@@ -55,7 +55,7 @@ def _kernel_time(fn) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batches", default="1,2,8")
+    parser.add_argument("--batches", default="8,16")
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument(
@@ -74,27 +74,29 @@ def main() -> None:
           "native_kernel_ms,adapter_kernel_ms,direct_kernel_ms,direct_vs_native_pct")
     for heads in (64, 128):
         for batch in (int(value) for value in args.batches.split(",")):
-            rows = 64
+            rows = batch * 64
             q = torch.randn((batch, 1, heads, 512), device=device, dtype=torch.bfloat16)
-            swa_cache = torch.zeros((1, 64, 1, 584), dtype=torch.uint8, device=device)
-            swa_indices = torch.arange(64, dtype=torch.int32, device=device).view(1, 1, 64).expand(batch, -1, -1).contiguous()
+            swa_cache = torch.zeros((batch, 64, 1, 584), dtype=torch.uint8, device=device)
+            swa_indices = torch.arange(64, dtype=torch.int32, device=device).view(1, 1, 64)
+            swa_indices = (swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1) * 64).contiguous()
             swa_lengths = torch.full((batch,), 64, dtype=torch.int32, device=device)
-            physical = torch.arange(512, dtype=torch.int32, device=device).view(1, 1, 512).remainder(rows).expand(batch, -1, -1).contiguous()
+            physical = torch.arange(512, dtype=torch.int32, device=device).view(1, 1, 512).remainder(64)
+            physical = (physical + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1) * 64).contiguous()
             raw = physical + 3
             lengths = torch.full((batch,), 512, dtype=torch.int32, device=device)
             latent = torch.randn((rows, 512), device=device)
             mask = topmag_keep_mask(latent, 0.5)
             buffers = (
-                torch.zeros((1, rows, 256), dtype=torch.uint8, device=device),
-                torch.zeros((1, rows, 8), dtype=torch.uint64, device=device),
-                torch.zeros((1, rows, 8), dtype=torch.uint8, device=device),
+                torch.zeros((batch, 64, 256), dtype=torch.uint8, device=device),
+                torch.zeros((batch, 64, 8), dtype=torch.uint64, device=device),
+                torch.zeros((batch, 64, 8), dtype=torch.uint8, device=device),
             )
             pack_rows(
                 latent, mask, torch.ones(512, device=device), 1.0e-6,
                 _PackPlan(rows, device), torch.arange(rows, dtype=torch.int32, device=device), buffers,
             )
             workspace = NativeWorkspace.allocate(batch, 512, 64, device, with_dense=True)
-            freqs = torch.ones((1, 128 * 128 + 32), dtype=torch.complex64, device=device)
+            freqs = torch.ones((max(128, int(raw.max().item()) + 2) * 128 + 32,), dtype=torch.complex64, device=device)
             baseline_bytes, baseline_indices = unpack_gather_native(
                 buffers, physical.flatten(0, 1), raw.flatten(0, 1), lengths,
                 freqs, workspace,
