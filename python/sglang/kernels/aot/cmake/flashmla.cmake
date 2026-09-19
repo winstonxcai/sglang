@@ -3,7 +3,7 @@
 FetchContent_Declare(
     repo-flashmla
     URL      https://${GITHUB_ARTIFACTORY}/winstonxcai/FlashMLA/archive/b74d3c7.tar.gz
-    URL_HASH SHA256=5f2a0e9919aa989372dc593c5fba452defd96ca94fba2dac0231c4897521d902
+    URL_HASH SHA256=4197f5c49fc8ce370f4545482d506a3ba364123f6537231416e93daaf2692282
 )
 FetchContent_Populate(repo-flashmla)
 
