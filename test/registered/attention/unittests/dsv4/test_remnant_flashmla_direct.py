@@ -89,7 +89,9 @@ class TestRemnantFlashMLADirect:
         physical = physical + torch.arange(batch, device=device, dtype=torch.int32).view(
             batch, 1
         ) * 64
-        raw = physical + 3
+        raw = physical + 3 + torch.arange(
+            selected_k, device=device, dtype=torch.int32
+        ).view(1, selected_k) % 11
         if topk_length < selected_k:
             physical = physical.clone()
             raw = raw.clone()
@@ -203,7 +205,9 @@ class TestRemnantFlashMLADirect:
         physical = torch.arange(512, device=device, dtype=torch.int32).view(1, 512) % 64
         physical = physical + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1) * 64
         physical = physical.contiguous()
-        raw = physical + 5
+        raw = physical + 5 + torch.arange(
+            512, device=device, dtype=torch.int32
+        ).view(1, 512) % 11
         lengths = torch.full((batch,), 512, dtype=torch.int32, device=device)
         freqs = _frequencies(int(raw.max().item()) + 2, device)
 

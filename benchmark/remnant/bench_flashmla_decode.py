@@ -58,6 +58,7 @@ def main() -> None:
     parser.add_argument("--batches", default="8,16")
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--max-regression-percent", type=float, default=2.0)
     parser.add_argument(
         "--path",
         choices=("all", "native", "adapter", "direct"),
@@ -71,7 +72,8 @@ def main() -> None:
     device = torch.device("cuda")
     remnant.configure_cache_format("remnant")
     print("heads,batch,topk,native_total_ms,adapter_total_ms,direct_total_ms,"
-          "native_kernel_ms,adapter_kernel_ms,direct_kernel_ms,direct_vs_native_pct")
+          "native_kernel_ms,adapter_kernel_ms,direct_kernel_ms,direct_vs_native_pct,status")
+    misses = []
     for heads in (64, 128):
         for batch in (int(value) for value in args.batches.split(",")):
             rows = batch * 64
@@ -180,11 +182,20 @@ def main() -> None:
                 adapter_ms = measurements["adapter"]
             else:
                 direct_ms = measurements["direct"]
+            delta = 100 * (direct_ms / native_ms - 1) if args.path == "all" else float("nan")
+            status = "PASS" if args.path != "all" or delta <= args.max_regression_percent else "MISS"
+            if status == "MISS":
+                misses.append((heads, batch, delta))
             print(
                 f"{heads},{batch},512,{native_ms:.4f},{adapter_ms:.4f},{direct_ms:.4f},"
                 f"{native_kernel:.4f},{adapter_kernel:.4f},{direct_kernel:.4f},"
-                f"{100 * (direct_ms / native_ms - 1) if args.path == 'all' else float('nan'):.3f}"
+                f"{delta:.3f},{status}"
             )
+    if misses:
+        details = ", ".join(f"H{heads}/B{batch}={delta:.2f}%" for heads, batch, delta in misses)
+        raise RuntimeError(
+            f"direct decode exceeds the {args.max_regression_percent:.2f}% target: {details}"
+        )
     remnant.configure_cache_format("native")
 
 
