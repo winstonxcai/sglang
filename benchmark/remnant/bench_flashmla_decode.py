@@ -93,6 +93,7 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--heads", default="64,128")
     parser.add_argument("--batches", default="8,16")
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
@@ -110,7 +111,7 @@ def main() -> None:
     remnant.configure_cache_format("remnant")
     print("heads,batch,topk,native_decode_ms,direct_decode_ms,adapter_total_ms,median_regression_pct,p95_regression_pct,status")
     misses = []
-    for heads in (64, 128):
+    for heads in (int(value) for value in args.heads.split(",")):
         for batch in (int(value) for value in args.batches.split(",")):
             selected_k = 512
             rows = batch * selected_k
