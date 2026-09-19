@@ -49,6 +49,21 @@ def _frequencies(max_position: int, device: torch.device) -> torch.Tensor:
     return table.view(torch.complex64).reshape(-1).contiguous()
 
 
+def _fill_swa(cache: torch.Tensor) -> None:
+    rows = cache.shape[0] * cache.shape[1]
+    flat = cache.reshape(rows, 584)
+    flat[:, :448].copy_(
+        (torch.arange(rows * 448, device=cache.device) % 113 + 1)
+        .to(torch.uint8)
+        .view(rows, 448)
+    )
+    tail = torch.linspace(-0.25, 0.25, rows * 64, device=cache.device)
+    flat[:, 448:576].copy_(
+        tail.to(torch.bfloat16).view(torch.uint8).reshape(rows, 128)
+    )
+    flat[:, 576:584].fill_(127)
+
+
 class TestRemnantFlashMLADirect:
     @pytest.mark.parametrize("num_heads", [64, 128])
     @pytest.mark.parametrize("batch", [8, 16])
@@ -92,12 +107,14 @@ class TestRemnantFlashMLADirect:
         raw = physical + 3 + torch.arange(
             selected_k, device=device, dtype=torch.int32
         ).view(1, selected_k) % 11
+        lengths = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
         if topk_length < selected_k:
             physical = physical.clone()
             raw = raw.clone()
-            physical[:, topk_length:] = 0
-            raw[:, topk_length:] = -1
-        lengths = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
+            lengths[1::2] = 64
+            for request, length in enumerate(lengths.tolist()):
+                physical[request, length:] = 0
+                raw[request, length:] = -1
         freqs = _frequencies(int(raw.clamp_min(0).max().item()) + 2, device)
 
         workspace = NativeWorkspace.allocate(
@@ -116,9 +133,13 @@ class TestRemnantFlashMLADirect:
             (workspace.bytes_per_page, 584, 584, 1),
         )
         native_indices = native_indices.unsqueeze(1)
+        if topk_length < selected_k:
+            for request, length in enumerate(lengths.tolist()):
+                physical[request, length:] = torch.iinfo(torch.int32).max
 
         q = torch.randn((batch, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
         swa_cache = torch.zeros((batch, page_size, 1, 584), dtype=torch.uint8, device=device)
+        _fill_swa(swa_cache)
         swa_indices = torch.arange(page_size, device=device, dtype=torch.int32).view(
             1, 1, page_size
         )
@@ -196,6 +217,7 @@ class TestRemnantFlashMLADirect:
         )
         q = torch.randn((batch, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
         swa_cache = torch.zeros((batch, 64, 1, 584), dtype=torch.uint8, device=device)
+        _fill_swa(swa_cache)
         swa_indices = torch.arange(64, device=device, dtype=torch.int32).view(1, 1, 64)
         swa_indices = swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(
             batch, 1, 1
@@ -241,6 +263,10 @@ class TestRemnantFlashMLADirect:
         torch.cuda.synchronize()
         first = tuple(x.clone() for x in captured)
         q.normal_()
+        buffers[2].add_(1)
+        physical.copy_(physical.roll(1, dims=-1))
+        raw.copy_(raw.roll(1, dims=-1))
+        lengths.sub_(13)
         graph.replay()
         torch.cuda.synchronize()
         second = tuple(x.clone() for x in captured)
