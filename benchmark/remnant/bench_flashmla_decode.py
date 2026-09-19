@@ -154,7 +154,7 @@ def main() -> None:
                     topk_length=swa_lengths,
                     extra_topk_length=lengths,
                     remnant_buffers=buffers, remnant_raw_indices=raw,
-                    remnant_freqs=torch.view_as_real(freqs),
+                    remnant_freqs=torch.view_as_real(freqs).unsqueeze(0),
                 )
 
             native_ms = adapter_ms = direct_ms = float("nan")
