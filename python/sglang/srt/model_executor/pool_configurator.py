@@ -1,5 +1,7 @@
 """Memory pool configurators for profiling and sizing KV cache pools.
 
+Author: Winston Cai.
+
 Each model architecture has its own configurator that computes pool sizes
 from available GPU memory using a unified coeff+bias model:
 

@@ -1,4 +1,7 @@
-"""Benchmark Native and Remnant C4 write/reconstruction primitives."""
+"""Benchmark Native and Remnant C4 write/reconstruction primitives.
+
+Author: Winston Cai.
+"""
 
 from __future__ import annotations
 

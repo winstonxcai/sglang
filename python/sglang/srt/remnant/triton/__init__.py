@@ -1,4 +1,7 @@
-"""Triton kernels for persistent packed storage and reconstruction."""
+"""Triton kernels for persistent packed storage and reconstruction.
+
+Author: Winston Cai.
+"""
 
 from .kernels import (
     _bf16_to_native_kernel,

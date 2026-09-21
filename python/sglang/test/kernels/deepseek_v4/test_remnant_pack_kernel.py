@@ -1,4 +1,7 @@
-"""Triton pack and unpack correctness for the Remnant C4 record."""
+"""Triton pack and unpack correctness for the Remnant C4 record.
+
+Author: Winston Cai.
+"""
 
 import importlib.util
 

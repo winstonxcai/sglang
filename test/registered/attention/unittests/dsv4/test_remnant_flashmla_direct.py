@@ -1,4 +1,7 @@
-"""Parity between the native adapter and direct Remnant FlashMLA decode."""
+"""Parity between the native adapter and direct Remnant FlashMLA decode.
+
+Author: Winston Cai.
+"""
 
 import importlib.util
 

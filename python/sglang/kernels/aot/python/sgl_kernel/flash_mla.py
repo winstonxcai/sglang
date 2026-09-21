@@ -1,3 +1,8 @@
+"""Python bindings and dispatch for the Remnant FlashMLA extension.
+
+Author: Winston Cai.
+"""
+
 import dataclasses
 from typing import Optional, Tuple
 

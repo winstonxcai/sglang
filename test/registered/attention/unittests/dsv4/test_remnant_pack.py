@@ -1,4 +1,7 @@
-"""Independent reference tests for the persistent packed row format."""
+"""Independent reference tests for the persistent packed row format.
+
+Author: Winston Cai.
+"""
 
 import unittest
 

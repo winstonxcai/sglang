@@ -1,3 +1,5 @@
+<!-- Authored by Winston Cai. -->
+
 # Remnant microbenchmarks
 
 This directory contains portable Native/Packed C4 microbenchmarks for the

@@ -1,4 +1,7 @@
-"""Persistent 328-byte TopMag50 layout and production wrappers."""
+"""Persistent 328-byte TopMag50 layout and production wrappers.
+
+Author: Winston Cai.
+"""
 
 from __future__ import annotations
 

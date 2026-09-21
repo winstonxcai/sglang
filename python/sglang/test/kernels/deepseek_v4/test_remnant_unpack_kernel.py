@@ -1,4 +1,7 @@
-"""Triton selected-row unpack correctness for the Remnant C4 record."""
+"""Triton selected-row unpack correctness for the Remnant C4 record.
+
+Author: Winston Cai.
+"""
 
 import importlib.util
 

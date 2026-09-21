@@ -1,5 +1,7 @@
 """TopMag pruning on the native compressed-latent store (Remnant).
 
+Author: Winston Cai.
+
 This is the small runtime surface used by the in-tree SGLang hooks.
 Geometry lives in config, runtime wrappers in packed, and reference math in
 reference. Heavy imports remain lazy.

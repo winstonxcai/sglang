@@ -1,5 +1,7 @@
 """Pure Torch TopMag pruning and packed row-format references.
 
+Author: Winston Cai.
+
 No persistent state here. The pruning helpers are shared production primitives;
 the Torch pack/unpack functions are numerical references. Production storage and
 reconstruction wrappers live in packed.py; the runtime integration is in the

@@ -1,4 +1,7 @@
-"""Backend metadata and selected-row reconstruction contracts."""
+"""Backend metadata and selected-row reconstruction contracts.
+
+Author: Winston Cai.
+"""
 
 import unittest
 from unittest import mock

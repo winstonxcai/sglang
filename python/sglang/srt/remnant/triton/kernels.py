@@ -1,4 +1,7 @@
-"""Triton kernels for persistent 328-byte FP8 records."""
+"""Triton kernels for persistent 328-byte FP8 records.
+
+Author: Winston Cai.
+"""
 
 import triton.language as tl
 

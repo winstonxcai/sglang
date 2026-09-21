@@ -1,3 +1,5 @@
+# Authored by Winston Cai.
+
 # flash_mla
 # Remnant fork pinned to the reviewed SM90 direct packed-decode commit.
 FetchContent_Declare(

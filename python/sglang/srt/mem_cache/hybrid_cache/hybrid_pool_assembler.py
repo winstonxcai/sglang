@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Hybrid cache assembly with Remnant packed HiCache support.
+
+Author: Winston Cai.
+"""
+
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional

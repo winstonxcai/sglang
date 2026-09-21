@@ -1,4 +1,7 @@
-"""Model-free steady-state FlashMLA Native, adapter, and Remnant timing."""
+"""Model-free steady-state FlashMLA Native, adapter, and Remnant timing.
+
+Author: Winston Cai.
+"""
 
 from __future__ import annotations
 

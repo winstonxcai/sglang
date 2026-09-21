@@ -1,3 +1,8 @@
+"""DeepSeek V4 attention backend with Remnant decode dispatch.
+
+Author: Winston Cai.
+"""
+
 from __future__ import annotations
 
 from sglang.srt import remnant as _sg_lr

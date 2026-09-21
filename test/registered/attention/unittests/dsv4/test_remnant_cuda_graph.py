@@ -1,4 +1,7 @@
-"""CUDA graph replay coverage for the fixed packed reconstruction path."""
+"""CUDA graph replay coverage for the fixed packed reconstruction path.
+
+Author: Winston Cai.
+"""
 
 import importlib.util
 import unittest

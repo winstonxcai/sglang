@@ -1,4 +1,7 @@
-"""Remnant-compatible MSB-first 512-bit bitmap helpers."""
+"""Remnant-compatible MSB-first 512-bit bitmap helpers.
+
+Author: Winston Cai.
+"""
 
 from __future__ import annotations
 

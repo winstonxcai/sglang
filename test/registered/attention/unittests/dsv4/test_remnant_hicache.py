@@ -1,4 +1,7 @@
-"""Packed HiCache host mirror round-trip coverage."""
+"""Packed HiCache host mirror round-trip coverage.
+
+Author: Winston Cai.
+"""
 
 import unittest
 

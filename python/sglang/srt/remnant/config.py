@@ -1,4 +1,7 @@
-"""Native and Remnant cache-format configuration for DeepSeek V4."""
+"""Native and Remnant cache-format configuration for DeepSeek V4.
+
+Author: Winston Cai.
+"""
 
 # --- compressed-latent geometry (fixed by DeepSeek-V4) ----------------------
 HEAD_DIM = 512  # full compressed-latent dimension

@@ -1,4 +1,7 @@
-"""Pool layout and capacity contracts for the Remnant C4 format."""
+"""Pool layout and capacity contracts for the Remnant C4 format.
+
+Author: Winston Cai.
+"""
 
 import unittest
 from unittest import mock

@@ -1,4 +1,7 @@
-"""Tests for the public DeepSeek V4 C4 cache-format switch."""
+"""Tests for the public DeepSeek V4 C4 cache-format switch.
+
+Author: Winston Cai.
+"""
 
 import argparse
 
