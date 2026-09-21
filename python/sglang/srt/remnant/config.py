@@ -52,15 +52,6 @@ def packed_enabled() -> bool:
     return _CACHE_FORMAT == "remnant"
 
 
-def fused_enabled() -> bool:
-    """Fused reconstruction is intentionally outside this phase."""
-    return False
-
-
-def optimized_fused_enabled() -> bool:
-    return False
-
-
 def sparse_enabled() -> bool:
     return False
 

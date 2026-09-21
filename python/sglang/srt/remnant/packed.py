@@ -24,7 +24,6 @@ class NativeWorkspace:
     """Reusable buffers used to preserve the existing FlashMLA consumer."""
 
     native_bytes: torch.Tensor
-    dense_bf16: torch.Tensor | None
     temporary_indices: torch.Tensor
     page_size: int
     bytes_per_page: int
@@ -45,24 +44,15 @@ class NativeWorkspace:
         selected_k: int,
         page_size: int,
         device: torch.device | str,
-        *,
-        with_dense: bool | None = None,
     ) -> "NativeWorkspace":
         rows = max_batch * selected_k
         pages = (rows + page_size - 1) // page_size
         bytes_per_page = ((config.NATIVE_RECORD_BYTES * page_size + 575) // 576) * 576
         raw = torch.zeros(pages, bytes_per_page, dtype=torch.uint8, device=device)
-        if with_dense is None:
-            with_dense = not config.fused_enabled()
-        dense = (
-            torch.empty(rows, config.HEAD_DIM, dtype=torch.bfloat16, device=device)
-            if with_dense
-            else None
-        )
         temporary_indices = torch.arange(
             rows, dtype=torch.int32, device=device
         ).reshape(max_batch, selected_k)
-        return cls(raw, dense, temporary_indices, page_size, bytes_per_page)
+        return cls(raw, temporary_indices, page_size, bytes_per_page)
 
 
 def _as_buffers(packed_buffers, layer_id: int | None = None) -> PackedBuffers:
@@ -208,7 +198,6 @@ def unpack_gather_native(
     native_workspace: NativeWorkspace,
     *,
     layer_id: int | None = None,
-    candidate: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Materialize native hybrid pages and return cache plus remapped indices."""
     buffers = _as_buffers(packed_buffers, layer_id)
@@ -224,90 +213,13 @@ def unpack_gather_native(
             "native workspace top-k capacity exceeded: "
             f"{selected_k} > {native_workspace.selected_k}"
         )
-    rows = n_queries * selected_k
     temp = native_workspace.temporary_indices[:n_queries, :selected_k]
-    if candidate is not None and not config.fused_enabled():
-        raise ValueError("a fused reconstruction candidate requires FUSED=1")
-    if config.fused_enabled():
-        config.validate_packed_static_config()
-        unpack_gather_native_fused(
-            buffers,
-            physical_indices,
-            raw_indices,
-            topk_lengths,
-            freqs_cis,
-            native_workspace,
-            candidate=candidate,
-        )
-        return native_workspace.native_bytes, temp
-    if native_workspace.dense_bf16 is None:
-        raise RuntimeError("Packed reconstruction requires a dense BF16 workspace")
-    dense = native_workspace.dense_bf16[:rows]
-    unpack_gather_bf16(
-        buffers,
-        physical_indices,
-        raw_indices,
-        topk_lengths,
-        freqs_cis,
-        dense,
-    )
-    if rows:
-        from .triton import _bf16_to_native_kernel
-
-        _bf16_to_native_kernel[(rows,)](
-            dense,
-            buffers.bitmaps,
-            buffers.values,
-            buffers.scales,
-            physical_indices,
-            native_workspace.native_bytes,
-            temp,
-            rows,
-            page_size=native_workspace.page_size,
-            bytes_per_page=native_workspace.bytes_per_page,
-            HEAD_DIM=config.HEAD_DIM,
-            NOPE_DIM=config.NOPE_DIM,
-            KEEP_K=config.PACKED_KEPT_VALUES,
-            BITMAP_WORDS=config.BITMAP_WORDS,
-            BLOCK_D=config.HEAD_DIM,
-            num_warps=8,
-        )
-    # The existing FlashMLA consumer reads only the prefix described by
-    # ``topk_lengths``. Returning the preallocated dense range directly avoids
-    # torch.arange/where allocations in decode and keeps graph replay static.
-    # Invalid padding slots are reconstructed as zeros but are outside that
-    # prefix and therefore never consumed.
-    return native_workspace.native_bytes, temp
-
-
-def unpack_gather_native_fused(
-    packed_buffers,
-    physical_indices: torch.Tensor,
-    raw_indices: torch.Tensor,
-    topk_lengths: torch.Tensor,
-    freqs_cis,
-    native_workspace: NativeWorkspace,
-    *,
-    layer_id: int | None = None,
-    optimized: bool | None = None,
-    candidate: str | None = None,
-) -> None:
-    """Run the allocation-free Fused packed-to-native CUDA adapter."""
-    if optimized is None:
-        optimized = config.optimized_fused_enabled()
-    buffers = _as_buffers(packed_buffers, layer_id)
+    config.validate_packed_static_config()
     if physical_indices.shape != raw_indices.shape:
         raise ValueError("physical_indices and raw_indices must have equal shape")
-    n_queries, selected_k = physical_indices.shape
-    if n_queries > native_workspace.max_queries:
-        raise ValueError("native workspace query capacity exceeded")
-    if selected_k > native_workspace.selected_k:
-        raise ValueError("native workspace top-k capacity exceeded")
     if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
         raise ValueError("freqs_cis must be a contiguous complex tensor")
-    from .fused import packed_to_native
-
-    packed_to_native(
+    torch.ops.sgl_kernel.remnant_packed_to_native.default(
         buffers.values,
         buffers.bitmaps,
         buffers.scales,
@@ -318,6 +230,5 @@ def unpack_gather_native_fused(
         native_workspace.native_bytes,
         native_workspace.page_size,
         native_workspace.bytes_per_page,
-        optimized=optimized,
-        candidate=candidate,
     )
+    return native_workspace.native_bytes, temp

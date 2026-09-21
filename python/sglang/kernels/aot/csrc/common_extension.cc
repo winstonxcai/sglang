@@ -12,6 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+// Remnant additions authored by Winston Cai.
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/all.h>
 #include <torch/library.h>
@@ -95,6 +96,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
   m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
+
+  // Remnant packed-C4 -> native FlashMLA adapter.
+  m.def(
+      "remnant_packed_to_native(Tensor values, Tensor bitmaps, Tensor scales, "
+      "Tensor physical_indices, Tensor raw_indices, Tensor topk_lengths, "
+      "Tensor freq_pairs, Tensor! native_out, int page_size, "
+      "int bytes_per_page) -> ()");
+  m.impl("remnant_packed_to_native", torch::kCUDA, &remnant_packed_to_native);
 
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);

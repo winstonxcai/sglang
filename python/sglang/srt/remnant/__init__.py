@@ -27,7 +27,6 @@ _LAZY_EXPORTS = {
     "unpack_gather_native": "packed",
     "unpack_gather_bf16": "packed",
     "NativeWorkspace": "packed",
-    "unpack_gather_native_fused": "packed",
 }
 
 

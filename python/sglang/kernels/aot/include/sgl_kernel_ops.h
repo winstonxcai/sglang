@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+// Remnant additions authored by Winston Cai.
+
 #pragma once
 
 #include <ATen/ATen.h>
@@ -156,6 +158,21 @@ void rotary_embedding(
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
+
+/*
+ * From csrc/remnant
+ */
+void remnant_packed_to_native(
+    const torch::Tensor& values,
+    const torch::Tensor& bitmaps,
+    const torch::Tensor& scales,
+    const torch::Tensor& physical_indices,
+    const torch::Tensor& raw_indices,
+    const torch::Tensor& topk_lengths,
+    const torch::Tensor& freq_pairs,
+    const torch::Tensor& native_out,
+    int64_t page_size,
+    int64_t bytes_per_page);
 
 void fast_topk_interface(
     const at::Tensor& score,

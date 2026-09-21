@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
+# Remnant additions authored by Winston Cai.
+
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 include(FetchContent)
@@ -298,6 +300,7 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
+    "csrc/remnant/packed_to_native.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"

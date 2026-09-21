@@ -1,4 +1,4 @@
-"""Parity between the native adapter and direct Remnant FlashMLA decode.
+"""Parity between the fused adapter and direct Remnant FlashMLA decode.
 
 Author: Winston Cai.
 """
@@ -71,7 +71,7 @@ class TestRemnantFlashMLADirect:
     @pytest.mark.parametrize("num_heads", [64, 128])
     @pytest.mark.parametrize("batch", [8, 16])
     @pytest.mark.parametrize("topk_length", [512, 317])
-    def test_direct_matches_native_adapter(
+    def test_direct_matches_fused_adapter(
         self, num_heads: int, batch: int, topk_length: int
     ):
         from sgl_kernel import flash_mla
@@ -121,7 +121,7 @@ class TestRemnantFlashMLADirect:
         freqs = _frequencies(int(raw.clamp_min(0).max().item()) + 2, device)
 
         workspace = NativeWorkspace.allocate(
-            batch, selected_k, page_size, device, with_dense=True
+            batch, selected_k, page_size, device
         )
         native_bytes, native_indices = unpack_gather_native(
             buffers,

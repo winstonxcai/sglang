@@ -1,4 +1,4 @@
-"""Model-free steady-state FlashMLA Native, adapter, and Remnant timing.
+"""Model-free steady-state FlashMLA Native, fused adapter, and Remnant timing.
 
 Author: Winston Cai.
 """
@@ -141,7 +141,7 @@ def main() -> None:
                 _PackPlan(rows, device), torch.arange(rows, dtype=torch.int32, device=device), buffers,
             )
             freqs = _frequencies(int(raw.max().item()) + 2, device)
-            workspace = NativeWorkspace.allocate(batch, selected_k, 64, device, with_dense=True)
+            workspace = NativeWorkspace.allocate(batch, selected_k, 64, device)
             native_bytes, native_indices = unpack_gather_native(
                 buffers, physical.flatten(0, 1), raw.flatten(0, 1), lengths, freqs, workspace
             )
@@ -195,22 +195,15 @@ def main() -> None:
             if args.path in ("all", "direct"):
                 graphs["direct"] = _capture(direct, args.warmup)
             if args.path in ("all", "adapter"):
-                for _ in range(args.warmup):
-                    adapter()
-                torch.cuda.synchronize()
+                graphs["adapter"] = _capture(adapter, args.warmup)
 
             samples = {name: [] for name in ("native", "direct", "adapter")}
             rng = random.Random(heads * 1000 + batch)
             for _ in range(args.rounds):
                 order = list(graphs)
-                if args.path in ("all", "adapter"):
-                    order.append("adapter")
                 rng.shuffle(order)
                 for name in order:
-                    if name == "adapter":
-                        samples[name].append(_measure_eager(adapter, args.repeats))
-                    else:
-                        samples[name].append(_measure_graph(graphs[name], args.repeats))
+                    samples[name].append(_measure_graph(graphs[name], args.repeats))
 
             native_ms = statistics.median(samples["native"]) if samples["native"] else float("nan")
             direct_ms = statistics.median(samples["direct"]) if samples["direct"] else float("nan")
