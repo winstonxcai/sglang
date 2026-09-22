@@ -112,6 +112,10 @@ def main() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         raise RuntimeError("This benchmark requires an H100")
 
+    run_native = args.path in ("all", "native")
+    run_adapter = args.path in ("all", "adapter")
+    run_direct = args.path in ("all", "direct")
+
     torch.manual_seed(20260919)
     device = torch.device("cuda")
     remnant.configure_cache_format("remnant")
@@ -144,17 +148,24 @@ def main() -> None:
             )
             freqs = _frequencies(int(raw.max().item()) + 2, device)
             workspace = NativeWorkspace.allocate(batch, selected_k, 64, device)
-            native_bytes, native_indices = unpack_gather_native(
-                buffers, physical.flatten(0, 1), raw.flatten(0, 1), lengths, freqs, workspace
-            )
-            native_cache = native_bytes.as_strided(
-                (native_bytes.shape[0], 64, 1, 584),
-                (workspace.bytes_per_page, 584, 584, 1),
-            )
-            native_indices = native_indices.unsqueeze(1)
-            native_meta = flash_mla.get_mla_metadata()[0]
-            adapter_meta = flash_mla.get_mla_metadata()[0]
-            direct_meta = flash_mla.get_mla_metadata()[0]
+            native_cache = native_indices = None
+            if run_native:
+                native_bytes, native_indices = unpack_gather_native(
+                    buffers,
+                    physical.flatten(0, 1),
+                    raw.flatten(0, 1),
+                    lengths,
+                    freqs,
+                    workspace,
+                )
+                native_cache = native_bytes.as_strided(
+                    (native_bytes.shape[0], 64, 1, 584),
+                    (workspace.bytes_per_page, 584, 584, 1),
+                )
+                native_indices = native_indices.unsqueeze(1)
+            native_meta = flash_mla.get_mla_metadata()[0] if run_native else None
+            adapter_meta = flash_mla.get_mla_metadata()[0] if run_adapter else None
+            direct_meta = flash_mla.get_mla_metadata()[0] if run_direct else None
 
             def native():
                 return flash_mla.flash_mla_with_kvcache(
@@ -191,17 +202,42 @@ def main() -> None:
                     remnant_freqs=torch.view_as_real(freqs),
                 )
 
-            native_out, native_lse = native()
-            direct_out, direct_lse = direct()
-            adapter_out, adapter_lse = adapter()
-            if not all(torch.isfinite(value).all() for value in
-                       (native_out, native_lse, direct_out, direct_lse,
-                        adapter_out, adapter_lse)):
+            native_out = native_lse = None
+            direct_out = direct_lse = None
+            adapter_out = adapter_lse = None
+            if run_native:
+                native_out, native_lse = native()
+            if run_direct:
+                direct_out, direct_lse = direct()
+            if run_adapter:
+                adapter_out, adapter_lse = adapter()
+            selected_outputs = tuple(
+                value
+                for value in (
+                    native_out,
+                    native_lse,
+                    direct_out,
+                    direct_lse,
+                    adapter_out,
+                    adapter_lse,
+                )
+                if value is not None
+            )
+            if not all(torch.isfinite(value).all() for value in selected_outputs):
                 raise RuntimeError(f"non-finite decode output at H{heads}/B{batch}")
-            torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
-            torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
-            torch.testing.assert_close(adapter_out, native_out, atol=2.0e-2, rtol=2.0e-2)
-            torch.testing.assert_close(adapter_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
+            if args.path == "all":
+                torch.testing.assert_close(
+                    direct_out, native_out, atol=2.0e-2, rtol=2.0e-2
+                )
+                torch.testing.assert_close(
+                    direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2
+                )
+                torch.testing.assert_close(
+                    adapter_out, native_out, atol=2.0e-2, rtol=2.0e-2
+                )
+                torch.testing.assert_close(
+                    adapter_lse, native_lse, atol=2.0e-2, rtol=2.0e-2
+                )
 
             graphs = {}
             if args.path in ("all", "native"):
