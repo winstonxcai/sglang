@@ -45,26 +45,34 @@ def _frequencies(max_position: int, device: torch.device) -> torch.Tensor:
     pair = torch.arange(32, device=device, dtype=torch.float32)
     position = torch.arange(max_position, device=device, dtype=torch.float32)[:, None]
     angle = (position + 1.0) * (pair + 1.0) * 0.0017
-    table = torch.zeros((1, max_position * 128 + 32, 2), device=device)
-    table[..., 0] = 1.0
-    table[0, : max_position * 128].view(max_position, 128, 2)[:, :32, 0] = torch.cos(angle)
-    table[0, : max_position * 128].view(max_position, 128, 2)[:, :32, 1] = torch.sin(angle)
-    return table.view(torch.complex64).reshape(-1).contiguous()
+    # The kernel uses four 32-pair rows per raw token position and addresses
+    # the first row with raw * 4 * 32.  Keep the same layout as the model's
+    # table so the adapter sees [positions * 4, 32, 2] and the direct path can
+    # consume the identical contiguous storage.
+    table = torch.zeros((max_position * 4, 32, 2), device=device)
+    table[::4, :, 0] = torch.cos(angle)
+    table[::4, :, 1] = torch.sin(angle)
+    return torch.view_as_complex(table).contiguous()
 
 
-def _fill_swa(cache: torch.Tensor) -> None:
-    rows = cache.shape[0] * cache.shape[1]
-    flat = cache.reshape(rows, 584)
-    flat[:, :448].copy_(
-        (torch.arange(rows * 448, device=cache.device) % 113 + 1)
+def _make_swa_cache(pages: int, page_size: int, device: torch.device) -> torch.Tensor:
+    bytes_per_page = ((page_size * 584 + 575) // 576) * 576
+    storage = torch.zeros((pages, bytes_per_page), dtype=torch.uint8, device=device)
+    values = storage[:, : page_size * 576].view(pages, page_size, 576)
+    rows = pages * page_size
+    values[:, :, :448].copy_(
+        (torch.arange(rows * 448, device=device) % 113 + 1)
         .to(torch.uint8)
-        .view(rows, 448)
+        .view(pages, page_size, 448)
     )
-    tail = torch.linspace(-0.25, 0.25, rows * 64, device=cache.device)
-    flat[:, 448:576].copy_(
-        tail.to(torch.bfloat16).view(torch.uint8).reshape(rows, 128)
+    tail = torch.linspace(-0.25, 0.25, rows * 64, device=device)
+    values[:, :, 448:576].copy_(
+        tail.to(torch.bfloat16).view(torch.uint8).reshape(pages, page_size, 128)
     )
-    flat[:, 576:584].fill_(127)
+    storage[:, page_size * 576 : page_size * 584].fill_(127)
+    return storage.as_strided(
+        (pages, page_size, 1, 584), (bytes_per_page, 584, 584, 1)
+    )
 
 
 class TestRemnantFlashMLADirect:
@@ -141,8 +149,7 @@ class TestRemnantFlashMLADirect:
                 physical[request, length:] = torch.iinfo(torch.int32).max
 
         q = torch.randn((batch, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
-        swa_cache = torch.zeros((batch, page_size, 1, 584), dtype=torch.uint8, device=device)
-        _fill_swa(swa_cache)
+        swa_cache = _make_swa_cache(batch, page_size, device)
         swa_indices = torch.arange(page_size, device=device, dtype=torch.int32).view(
             1, 1, page_size
         )
@@ -188,9 +195,15 @@ class TestRemnantFlashMLADirect:
             extra_topk_length=lengths,
             remnant_buffers=buffers,
             remnant_raw_indices=raw.unsqueeze(1),
-            remnant_freqs=torch.view_as_real(freqs).unsqueeze(0),
+            remnant_freqs=torch.view_as_real(freqs),
         )
 
+        packed_codes = buffers[0]
+        assert not torch.any((packed_codes & 0x7F) == 0x7F), "Packed cache contains FP8 NaN codes"
+        assert torch.isfinite(native_out).all(), "Native adapter output is non-finite"
+        assert torch.isfinite(native_lse).all(), "Native adapter LSE is non-finite"
+        assert torch.isfinite(direct_out).all(), "Direct output is non-finite"
+        assert torch.isfinite(direct_lse).all(), "Direct LSE is non-finite"
         torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
         torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
@@ -219,8 +232,7 @@ class TestRemnantFlashMLADirect:
             buffers,
         )
         q = torch.randn((batch, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
-        swa_cache = torch.zeros((batch, 64, 1, 584), dtype=torch.uint8, device=device)
-        _fill_swa(swa_cache)
+        swa_cache = _make_swa_cache(batch, 64, device)
         swa_indices = torch.arange(64, device=device, dtype=torch.int32).view(1, 1, 64)
         swa_indices = swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(
             batch, 1, 1
@@ -252,7 +264,7 @@ class TestRemnantFlashMLADirect:
                 extra_indices_in_kvcache=physical.unsqueeze(1),
                 remnant_buffers=buffers,
                 remnant_raw_indices=raw.unsqueeze(1),
-                remnant_freqs=torch.view_as_real(freqs).unsqueeze(0),
+                remnant_freqs=torch.view_as_real(freqs),
             )
 
         meta = flash_mla.get_mla_metadata()[0]
@@ -265,6 +277,8 @@ class TestRemnantFlashMLADirect:
         graph.replay()
         torch.cuda.synchronize()
         first = tuple(x.clone() for x in captured)
+        assert torch.isfinite(first[0]).all(), "Captured direct output is non-finite"
+        assert torch.isfinite(first[1]).all(), "Captured direct LSE is non-finite"
         q.normal_()
         buffers[2].add_(1)
         physical.copy_(physical.roll(1, dims=-1))
@@ -274,6 +288,8 @@ class TestRemnantFlashMLADirect:
         torch.cuda.synchronize()
         second = tuple(x.clone() for x in captured)
         eager = run(meta)
+        assert torch.isfinite(second[0]).all(), "Replayed direct output is non-finite"
+        assert torch.isfinite(eager[0]).all(), "Eager direct output is non-finite"
         torch.testing.assert_close(second[0], eager[0], atol=2.0e-2, rtol=2.0e-2)
         torch.testing.assert_close(second[1], eager[1], atol=2.0e-2, rtol=2.0e-2)
         assert not torch.equal(first[0], second[0])

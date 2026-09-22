@@ -3622,6 +3622,8 @@ class ServerArgs:
             incompatible.append("--cpu-offload-gb")
         if self.disaggregation_decode_enable_offload_kvcache:
             incompatible.append("decode KV offload")
+        if self.enable_hierarchical_cache:
+            incompatible.append("HiCache")
         if self.enable_prefill_context_parallel:
             incompatible.append("--enable-prefill-context-parallel")
         if self.enable_dsa_prefill_context_parallel:

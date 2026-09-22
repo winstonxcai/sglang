@@ -326,6 +326,23 @@ set(INCLUDES
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
+# ============================ Remnant Adapter ============================== #
+# Keep the fused Packed -> Native adapter independently buildable.  The full
+# common_ops targets also contain this source for normal SGLang packaging, but
+# model-free validation images should not rebuild every unrelated kernel.
+set(REMNANT_SOURCES
+    "csrc/remnant/packed_to_native.cu"
+    "csrc/remnant_extension.cc"
+)
+Python_add_library(remnant_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${REMNANT_SOURCES})
+target_compile_options(remnant_ops PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+)
+target_include_directories(remnant_ops PRIVATE ${INCLUDES})
+target_link_libraries(remnant_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+install(TARGETS remnant_ops LIBRARY DESTINATION "sgl_kernel")
+
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
 Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})

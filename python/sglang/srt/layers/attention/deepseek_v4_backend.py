@@ -611,12 +611,9 @@ class DeepseekV4AttnBackend(
             if (
                 args.cpu_offload_gb > 0
                 or args.disaggregation_decode_enable_offload_kvcache
+                or args.enable_hierarchical_cache
             ):
-                # NOTE: enable_hierarchical_cache is intentionally NOT blocked here -- the
-                # remnant patch to hybrid_pool_assembler.py installs a packed-aware c4
-                # host mirror for packed+HiCache (patches/hicache.py). CPU/disaggregation
-                # offload still route through the native c4 ABI and stay incompatible.
-                raise RuntimeError('packed is incompatible with offload')
+                raise RuntimeError('packed is incompatible with offload or HiCache')
             if (
                 args.enable_prefill_context_parallel
                 or args.enable_dsa_prefill_context_parallel
@@ -1704,6 +1701,15 @@ class DeepseekV4AttnBackend(
                 swa_page_indices = swa_page_indices.unsqueeze(1)
             if extra_indices is not None and extra_indices.ndim == 2:
                 extra_indices = extra_indices.unsqueeze(1)
+            if (
+                compress_ratio == 4
+                and _sg_lr.packed_enabled()
+                and raw_indices is not None
+                and raw_indices.ndim == 2
+            ):
+                # FlashMLA's direct Remnant entry point uses the same
+                # [batch, query, top-k] shape as extra_indices.
+                raw_indices = raw_indices.unsqueeze(1)
 
             assert attn_sink is not None
 

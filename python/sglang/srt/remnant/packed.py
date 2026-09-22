@@ -219,6 +219,17 @@ def unpack_gather_native(
         raise ValueError("physical_indices and raw_indices must have equal shape")
     if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
         raise ValueError("freqs_cis must be a contiguous complex tensor")
+    # Model-free validation images overlay the split Remnant extension on top
+    # of the stock SGLang common_ops library.  Production builds already load
+    # this operator from common_ops, so import the optional module only when
+    # the operator is not registered yet.
+    if not hasattr(torch.ops.sgl_kernel, "remnant_packed_to_native"):
+        try:
+            from sgl_kernel import remnant_ops  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "remnant_packed_to_native is unavailable; build the Remnant adapter extension"
+            ) from exc
     torch.ops.sgl_kernel.remnant_packed_to_native.default(
         buffers.values,
         buffers.bitmaps,

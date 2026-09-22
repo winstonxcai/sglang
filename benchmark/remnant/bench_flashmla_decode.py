@@ -36,23 +36,26 @@ def _frequencies(max_position: int, device: torch.device) -> torch.Tensor:
     pair = torch.arange(32, device=device, dtype=torch.float32)
     position = torch.arange(max_position, device=device, dtype=torch.float32)[:, None]
     angle = (position + 1.0) * (pair + 1.0) * 0.0017
-    table = torch.zeros((1, max_position * 128 + 32, 2), device=device)
-    table[..., 0] = 1.0
-    shaped = table[0, : max_position * 128].view(max_position, 128, 2)
-    shaped[:, :32, 0] = torch.cos(angle)
-    shaped[:, :32, 1] = torch.sin(angle)
-    return table.view(torch.complex64).reshape(-1).contiguous()
+    table = torch.zeros((max_position * 4, 32, 2), device=device)
+    table[::4, :, 0] = torch.cos(angle)
+    table[::4, :, 1] = torch.sin(angle)
+    return torch.view_as_complex(table).contiguous()
 
 
-def _fill_swa(cache: torch.Tensor) -> None:
-    """Populate valid, non-zero MODEL1 records without affecting comparisons."""
-    rows = cache.shape[0] * cache.shape[1]
-    flat = cache.reshape(rows, 584)
-    values = (torch.arange(rows * 448, device=cache.device) % 113 + 1).to(torch.uint8)
-    flat[:, :448].copy_(values.view(rows, 448))
-    tail = torch.linspace(-0.25, 0.25, rows * 64, device=cache.device).to(torch.bfloat16)
-    flat[:, 448:576].copy_(tail.view(torch.uint8).reshape(rows, 128))
-    flat[:, 576:584].fill_(127)
+def _make_swa_cache(pages: int, page_size: int, device: torch.device) -> torch.Tensor:
+    """Populate valid MODEL1 pages with values followed by page scale bytes."""
+    bytes_per_page = ((page_size * 584 + 575) // 576) * 576
+    storage = torch.zeros((pages, bytes_per_page), dtype=torch.uint8, device=device)
+    values = storage[:, : page_size * 576].view(pages, page_size, 576)
+    rows = pages * page_size
+    codes = (torch.arange(rows * 448, device=device) % 113 + 1).to(torch.uint8)
+    values[:, :, :448].copy_(codes.view(pages, page_size, 448))
+    tail = torch.linspace(-0.25, 0.25, rows * 64, device=device).to(torch.bfloat16)
+    values[:, :, 448:576].copy_(tail.view(torch.uint8).reshape(pages, page_size, 128))
+    storage[:, page_size * 576 : page_size * 584].fill_(127)
+    return storage.as_strided(
+        (pages, page_size, 1, 584), (bytes_per_page, 584, 584, 1)
+    )
 
 
 def _capture(fn, warmup: int) -> torch.cuda.CUDAGraph:
@@ -119,8 +122,7 @@ def main() -> None:
             selected_k = 512
             rows = batch * selected_k
             q = torch.randn((batch, 1, heads, 512), device=device, dtype=torch.bfloat16)
-            swa_cache = torch.zeros((batch, 64, 1, 584), dtype=torch.uint8, device=device)
-            _fill_swa(swa_cache)
+            swa_cache = _make_swa_cache(batch, 64, device)
             swa_indices = torch.arange(64, dtype=torch.int32, device=device).view(1, 1, 64)
             swa_indices = (swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1) * 64).contiguous()
             swa_lengths = torch.full((batch,), 64, dtype=torch.int32, device=device)
@@ -186,8 +188,20 @@ def main() -> None:
                     indices=swa_indices, extra_indices_in_kvcache=physical,
                     topk_length=swa_lengths, extra_topk_length=lengths,
                     remnant_buffers=buffers, remnant_raw_indices=raw,
-                    remnant_freqs=torch.view_as_real(freqs).unsqueeze(0),
+                    remnant_freqs=torch.view_as_real(freqs),
                 )
+
+            native_out, native_lse = native()
+            direct_out, direct_lse = direct()
+            adapter_out, adapter_lse = adapter()
+            if not all(torch.isfinite(value).all() for value in
+                       (native_out, native_lse, direct_out, direct_lse,
+                        adapter_out, adapter_lse)):
+                raise RuntimeError(f"non-finite decode output at H{heads}/B{batch}")
+            torch.testing.assert_close(direct_out, native_out, atol=2.0e-2, rtol=2.0e-2)
+            torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
+            torch.testing.assert_close(adapter_out, native_out, atol=2.0e-2, rtol=2.0e-2)
+            torch.testing.assert_close(adapter_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
             graphs = {}
             if args.path in ("all", "native"):

@@ -1,22 +1,25 @@
 # Authored by Winston Cai.
 
 # flash_mla
-# Remnant fork pinned to the reviewed SM90 direct packed-decode commit.
+# Use the checked-out Remnant FlashMLA source supplied by the parent repository.
+# Keeping the source local makes the SGLang build consume exactly the submodule
+# contents used by the surrounding tests and Modal image.
+set(REMNANT_FLASHMLA_SOURCE_DIR "$ENV{REMNANT_FLASHMLA_SOURCE_DIR}" CACHE PATH
+    "Local Remnant FlashMLA source tree")
+if(NOT EXISTS "${REMNANT_FLASHMLA_SOURCE_DIR}/csrc/python_api.cpp")
+    message(FATAL_ERROR
+        "REMNANT_FLASHMLA_SOURCE_DIR must point to the checked-out third_party/flashmla tree")
+endif()
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/winstonxcai/FlashMLA/archive/9005f7a.tar.gz
-    URL_HASH SHA256=e154f5f9b7e8471f7fc6fba4a05706e7f42b27af0a8021a2cbe66d7fac39ea4c
+    SOURCE_DIR ${REMNANT_FLASHMLA_SOURCE_DIR}
 )
 FetchContent_Populate(repo-flashmla)
 
-# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
-FetchContent_Declare(
-    repo-flashmla-cutlass
-    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
-    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
-    SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
-)
-FetchContent_Populate(repo-flashmla-cutlass)
+if(NOT EXISTS "${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include/cutlass/bfloat16.h")
+    message(FATAL_ERROR
+        "Initialize third_party/flashmla/csrc/cutlass before building FlashMLA")
+endif()
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
@@ -45,7 +48,7 @@ if(${CUDA_VERSION} VERSION_GREATER 12.8 AND SGL_KERNEL_ENABLE_FLASHMLA_SM100)
     )
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+if(FLASHMLA_ENABLE_SM100 AND ${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
     # These patches are only needed (and only valid) with CUDA 13+.
 
