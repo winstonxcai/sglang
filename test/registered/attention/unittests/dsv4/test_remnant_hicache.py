@@ -77,12 +77,14 @@ class TestRemnantHiCache(CustomTestCase):
         self.device_pool = self.DevicePool(self.device)
 
     def _make_host_pool(self, num_host_pages=2):
-        return RemnantPackedHostPool(
+        host_pool = RemnantPackedHostPool(
             pool_name="test-c4",
             device_pool=self.device_pool,
             num_host_pages=num_host_pages,
             slot_page_size=self.slot_page_size,
         )
+        self.addCleanup(host_pool.destroy)
+        return host_pool
 
     def _fill_page(self, layer, page, tag):
         values, bitmaps, scales = self.device_pool.get_packed_buffers(layer)
@@ -113,13 +115,16 @@ class TestRemnantHiCache(CustomTestCase):
                     layer, page, tag=1 + layer * 2 + page_index
                 )
 
-        host_indices = torch.arange(2 * self.slot_page_size, dtype=torch.int32)
+        # The CUDA transfer kernels require both page-index tensors on device.
+        host_indices = torch.arange(
+            2 * self.slot_page_size, dtype=torch.int64, device=self.device
+        )
         device_indices = torch.cat(
             [
                 torch.arange(
                     page * self.slot_page_size,
                     (page + 1) * self.slot_page_size,
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 )
                 for page in source_pages
@@ -152,7 +157,7 @@ class TestRemnantHiCache(CustomTestCase):
                 torch.arange(
                     page * self.slot_page_size,
                     (page + 1) * self.slot_page_size,
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 )
                 for page in destination_pages
@@ -178,9 +183,9 @@ class TestRemnantHiCache(CustomTestCase):
 
     def test_reusing_host_page_replaces_every_plane(self):
         host_pool = self._make_host_pool(num_host_pages=1)
-        host_indices = torch.arange(self.slot_page_size, dtype=torch.int32)
+        host_indices = torch.arange(self.slot_page_size, dtype=torch.int64)
         first_device_indices = torch.arange(
-            self.slot_page_size, dtype=torch.int32, device=self.device
+            self.slot_page_size, dtype=torch.int64, device=self.device
         )
         second_device_indices = first_device_indices + self.slot_page_size
         destination_indices = first_device_indices + 2 * self.slot_page_size
@@ -216,9 +221,11 @@ class TestRemnantHiCache(CustomTestCase):
 
     def test_partial_page_transfer_is_rejected(self):
         host_pool = self._make_host_pool()
-        partial_host_indices = torch.arange(0, self.slot_page_size - 1)
+        partial_host_indices = torch.arange(
+            0, self.slot_page_size - 1, dtype=torch.int64
+        )
         partial_device_indices = torch.arange(
-            self.slot_page_size - 1, dtype=torch.int32, device=self.device
+            self.slot_page_size - 1, dtype=torch.int64, device=self.device
         )
 
         with self.assertRaisesRegex(RuntimeError, "whole-page"):

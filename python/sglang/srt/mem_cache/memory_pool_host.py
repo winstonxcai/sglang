@@ -627,7 +627,6 @@ class RemnantPackedHostPool(DeepSeekV4PagedHostPool):
         self.page_size = slot_page_size
         self.page_num = num_host_pages
         self.size = num_host_pages * slot_page_size
-        self.logical_size = self.size
         self.layout = layout
         self.start_layer = 0
         self.end_layer = self.layer_num
