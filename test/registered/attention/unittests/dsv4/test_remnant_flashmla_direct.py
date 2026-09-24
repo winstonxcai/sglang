@@ -55,6 +55,26 @@ def _frequencies(max_position: int, device: torch.device) -> torch.Tensor:
     return torch.view_as_complex(table).contiguous()
 
 
+def _bitmap_edge_keep_mask(rows: int, device: torch.device) -> torch.Tensor:
+    """Balanced masks for empty/full nibbles, alternating bits, and rank 255."""
+    coordinate = torch.arange(512, device=device)
+    within_byte = coordinate.remainder(8)
+    patterns = torch.stack(
+        (
+            within_byte < 4,
+            within_byte >= 4,
+            coordinate.remainder(2) == 0,
+            coordinate.remainder(2) == 1,
+            (within_byte == 0) | (within_byte == 1) | (within_byte == 6) | (within_byte == 7),
+            (within_byte == 0) | (within_byte == 2) | (within_byte == 5) | (within_byte == 7),
+            (coordinate < 255) | (coordinate == 511),
+        )
+    )
+    assert torch.all(patterns.sum(dim=-1) == 256), "Each bitmap pattern must retain 256 values"
+    row_pattern = torch.arange(rows, device=device) % patterns.shape[0]
+    return patterns.index_select(0, row_pattern)
+
+
 def _make_swa_cache(pages: int, page_size: int, device: torch.device) -> torch.Tensor:
     bytes_per_page = ((page_size * 584 + 575) // 576) * 576
     storage = torch.zeros((pages, bytes_per_page), dtype=torch.uint8, device=device)
@@ -76,11 +96,14 @@ def _make_swa_cache(pages: int, page_size: int, device: torch.device) -> torch.T
 
 
 class TestRemnantFlashMLADirect:
+    @pytest.mark.parametrize(
+        "bitmap_patterns", [False, True], ids=["topmag", "bitmap-edges"]
+    )
     @pytest.mark.parametrize("num_heads", [64, 128])
     @pytest.mark.parametrize("batch", [8, 16])
     @pytest.mark.parametrize("topk_length", [512, 317])
     def test_direct_matches_fused_adapter(
-        self, num_heads: int, batch: int, topk_length: int
+        self, num_heads: int, batch: int, topk_length: int, bitmap_patterns: bool
     ):
         from sgl_kernel import flash_mla
 
@@ -91,7 +114,11 @@ class TestRemnantFlashMLADirect:
         remnant.configure_cache_format("remnant")
 
         latent = torch.randn((rows, 512), device=device, dtype=torch.float32)
-        keep_mask = topmag_keep_mask(latent, 0.5)
+        keep_mask = (
+            _bitmap_edge_keep_mask(rows, device)
+            if bitmap_patterns
+            else topmag_keep_mask(latent, 0.5)
+        )
         norm_weight = torch.ones(512, device=device)
         buffers = (
             torch.zeros((batch, page_size, 256), dtype=torch.uint8, device=device),
