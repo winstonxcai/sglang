@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     LogicalHostPool,
     PoolEntry,
+    RemnantPackedHostPool,
 )
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -436,6 +437,22 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    from sglang.srt import remnant
+
+    is_remnant_packed = remnant.packed_enabled()
+    if is_remnant_packed and storage_backend is not None:
+        raise ValueError(
+            "Remnant HiCache currently supports L2 host memory only; "
+            "L3 storage backends are not supported"
+        )
+    if is_remnant_packed and server_args.hicache_mem_layout != "layer_first":
+        raise ValueError(
+            "Remnant HiCache currently requires layer_first layout, got "
+            f"{server_args.hicache_mem_layout!r}"
+        )
+    if is_remnant_packed and is_unified_kv:
+        raise ValueError("Remnant HiCache is incompatible with unified KV")
+
     mtp_swa_device_buffers = []
     if is_unified_kv:
         # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
@@ -534,16 +551,28 @@ def build_deepseek_v4_hicache_stack(
         )
 
     if c4_layer_mapping:
-        c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
-        c4_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C4),
-            device_buffers=c4_device_buffers,
-            item_bytes=c4_item_bytes,
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
-            layout=server_args.hicache_mem_layout,
-            allocator_type=_get_allocator_type(server_args),
-        )
+        if is_remnant_packed:
+            c4_host_pool = RemnantPackedHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4),
+                device_pool=kvcache.c4_kv_pool,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=_get_allocator_type(server_args),
+            )
+        else:
+            c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(
+                kvcache, 4
+            )
+            c4_host_pool = DeepSeekV4PagedHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4),
+                device_buffers=c4_device_buffers,
+                item_bytes=c4_item_bytes,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=server_args.hicache_mem_layout,
+                allocator_type=_get_allocator_type(server_args),
+            )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
             device_buffers=kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,

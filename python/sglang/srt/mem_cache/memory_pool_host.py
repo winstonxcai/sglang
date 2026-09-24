@@ -579,6 +579,374 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         )
 
 
+class RemnantPackedHostPool(DeepSeekV4PagedHostPool):
+    """L2 host mirror for all three planes of a packed Remnant C4 page.
+
+    The planes share one HiCache pool entry and are copied together, so a page
+    cannot become visible with only its values, bitmap, or scales restored.
+    This pool intentionally supports page-aligned L2 transfers only; its byte
+    planes do not have a native-format flat page representation for L3 storage.
+    """
+
+    def __init__(
+        self,
+        pool_name: str,
+        device_pool: Any,
+        num_host_pages: int,
+        slot_page_size: int,
+        layout: str = "layer_first",
+        device: str = "cpu",
+        pin_memory: bool = True,
+        allocator_type: str = "default",
+    ):
+        if layout != "layer_first":
+            raise ValueError(
+                "Remnant HiCache currently supports only layer_first layout, "
+                f"got {layout!r}"
+            )
+        if slot_page_size <= 0 or slot_page_size % 4:
+            raise ValueError(
+                "Remnant HiCache page size must be positive and divisible by 4, "
+                f"got {slot_page_size}"
+            )
+        if num_host_pages <= 0:
+            raise ValueError(
+                f"Remnant HiCache requires at least one host page, got {num_host_pages}"
+            )
+
+        self.pool_name = pool_name
+        self.device_pool = device_pool
+        self.layer_num = device_pool.layer_num
+        self.num_host_pages = num_host_pages
+        self.slot_page_size = slot_page_size
+        self.c4_rows_per_page = slot_page_size // 4
+        self.dtype = torch.uint8
+        self.device = device
+        self.pin_memory = pin_memory
+        self.allocator = get_allocator_from_storage(allocator_type)
+        self.page_size = slot_page_size
+        self.page_num = num_host_pages
+        self.size = num_host_pages * slot_page_size
+        self.logical_size = self.size
+        self.layout = layout
+        self.start_layer = 0
+        self.end_layer = self.layer_num
+        self.lock = threading.RLock()
+        self.gpu_device = device_pool.get_packed_buffers(0)[0].device
+
+        # Each full HiCache page contains P/4 compressed rows. Preserve the
+        # device ABI exactly, including the uint64 bitmap words.
+        self.plane_item_bytes = (
+            self.c4_rows_per_page * 256,
+            self.c4_rows_per_page * 8 * 8,
+            self.c4_rows_per_page * 8,
+        )
+        self.item_bytes = sum(self.plane_item_bytes)
+        self.size_per_token = self.item_bytes // slot_page_size
+
+        requested_bytes = self.layer_num * num_host_pages * self.item_bytes
+        available_bytes = (
+            psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        )
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for packed Remnant pool {pool_name}. "
+                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free."
+            )
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        self.host_values = [
+            alloc_func(
+                (num_host_pages, self.c4_rows_per_page, 256),
+                dtype=torch.uint8,
+                device=device,
+                pin_memory=pin_memory,
+                allocator=self.allocator,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.host_bitmaps = [
+            alloc_func(
+                (num_host_pages, self.c4_rows_per_page, 8),
+                dtype=torch.uint64,
+                device=device,
+                pin_memory=pin_memory,
+                allocator=self.allocator,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.host_scales = [
+            alloc_func(
+                (num_host_pages, self.c4_rows_per_page, 8),
+                dtype=torch.uint8,
+                device=device,
+                pin_memory=pin_memory,
+                allocator=self.allocator,
+            )
+            for _ in range(self.layer_num)
+        ]
+        self.device_plane_buffers = [
+            [
+                device_pool.get_packed_buffers(layer_id)[plane_id]
+                for layer_id in range(self.layer_num)
+            ]
+            for plane_id in range(3)
+        ]
+        expected_shapes = (
+            (self.c4_rows_per_page, 256),
+            (self.c4_rows_per_page, 8),
+            (self.c4_rows_per_page, 8),
+        )
+        expected_dtypes = (torch.uint8, torch.uint64, torch.uint8)
+        self.device_page_num = self.device_plane_buffers[0][0].shape[0]
+        for plane_id, buffers in enumerate(self.device_plane_buffers):
+            for layer_id, buffer in enumerate(buffers):
+                if (
+                    tuple(buffer.shape[1:]) != expected_shapes[plane_id]
+                    or buffer.dtype != expected_dtypes[plane_id]
+                    or buffer.shape[0] != self.device_page_num
+                ):
+                    raise ValueError(
+                        "Invalid Remnant packed plane for HiCache: "
+                        f"plane={plane_id}, layer={layer_id}, "
+                        f"shape={tuple(buffer.shape)}, dtype={buffer.dtype}"
+                    )
+        self.host_plane_buffers = [
+            self.host_values,
+            self.host_bitmaps,
+            self.host_scales,
+        ]
+        self.device_plane_ptrs = [
+            torch.tensor(
+                [buffer.data_ptr() for buffer in buffers],
+                dtype=torch.uint64,
+                device=self.gpu_device,
+            )
+            for buffers in self.device_plane_buffers
+        ]
+        self.host_plane_ptrs = [
+            torch.tensor(
+                [buffer.data_ptr() for buffer in buffers],
+                dtype=torch.uint64,
+                device=self.gpu_device,
+            )
+            for buffers in self.host_plane_buffers
+        ]
+        # HostKVCache.destroy unregisters every tensor in kv_buffer. Retain all
+        # three planes there even though this pool does not expose a flat page.
+        self.kv_buffer = [
+            *self.host_values,
+            *self.host_bitmaps,
+            *self.host_scales,
+        ]
+        self.data_refs = self.host_values
+        self.can_use_write_back_jit = False
+        self.clear()
+
+        logger.info(
+            "Allocating %.2f GB host memory for packed Remnant pool '%s' "
+            "(layers=%d, pages=%d, page_size=%d, bytes_per_page=%d).",
+            requested_bytes / 1e9,
+            self.pool_name,
+            self.layer_num,
+            num_host_pages,
+            slot_page_size,
+            self.item_bytes,
+        )
+
+    def _transfer_page_indices(self, host_indices, device_indices):
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return None, None
+        if (
+            host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            raise RuntimeError(
+                "Remnant HiCache supports whole-page transfers only; "
+                "partial-token C4 transfers are unsupported"
+            )
+        host_rows = self._to_page_indices(host_indices)
+        device_rows = self._to_page_indices(device_indices)
+        if host_rows.numel() != device_rows.numel():
+            raise ValueError(
+                f"{self.pool_name} page count mismatch: "
+                f"host={host_rows.numel()}, device={device_rows.numel()}"
+            )
+        return host_rows, device_rows
+
+    def _transfer_plane_all_layers(
+        self, plane_id: int, host_rows, device_rows, io_backend: str, backup: bool
+    ) -> None:
+        device_buffers = self.device_plane_buffers[plane_id]
+        host_buffers = self.host_plane_buffers[plane_id]
+        if io_backend == "direct":
+            src_layers, dst_layers = (
+                (device_buffers, host_buffers)
+                if backup
+                else (host_buffers, device_buffers)
+            )
+            src_indices, dst_indices = (
+                (device_rows, host_rows) if backup else (host_rows, device_rows)
+            )
+            transfer_kv_direct(
+                src_layers=src_layers,
+                dst_layers=dst_layers,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                page_size=1,
+            )
+            return
+        if io_backend == "kernel":
+            if backup:
+                src_ptrs = self.device_plane_ptrs[plane_id]
+                dst_ptrs = self.host_plane_ptrs[plane_id]
+                src_indices, dst_indices = device_rows, host_rows
+            else:
+                src_ptrs = self.host_plane_ptrs[plane_id]
+                dst_ptrs = self.device_plane_ptrs[plane_id]
+                src_indices, dst_indices = host_rows, device_rows
+            transfer_kv_all_layer_mla(
+                src_layers=src_ptrs,
+                dst_layers=dst_ptrs,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=self.plane_item_bytes[plane_id],
+                num_layers=self.layer_num,
+            )
+            return
+        raise ValueError(f"Unsupported Remnant HiCache IO backend: {io_backend}")
+
+    def _transfer_plane_per_layer(
+        self,
+        plane_id: int,
+        host_rows,
+        device_rows,
+        layer_id: int,
+        io_backend: str,
+        backup: bool,
+    ) -> None:
+        host_buffer = self.host_plane_buffers[plane_id][layer_id]
+        device_buffer = self.device_plane_buffers[plane_id][layer_id]
+        if io_backend == "direct":
+            src_layers, dst_layers = (
+                ([device_buffer], [host_buffer])
+                if backup
+                else ([host_buffer], [device_buffer])
+            )
+            src_indices, dst_indices = (
+                (device_rows, host_rows) if backup else (host_rows, device_rows)
+            )
+            transfer_kv_direct(
+                src_layers=src_layers,
+                dst_layers=dst_layers,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                page_size=1,
+            )
+            return
+        if io_backend == "kernel":
+            src, dst = (
+                (device_buffer, host_buffer) if backup else (host_buffer, device_buffer)
+            )
+            src_indices, dst_indices = (
+                (device_rows, host_rows) if backup else (host_rows, device_rows)
+            )
+            transfer_kv_per_layer_mla(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=self.plane_item_bytes[plane_id],
+            )
+            return
+        raise ValueError(f"Unsupported Remnant HiCache IO backend: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        host_rows, device_rows = self._transfer_page_indices(
+            host_indices, device_indices
+        )
+        if host_rows is None:
+            return
+        for plane_id in range(3):
+            self._transfer_plane_all_layers(
+                plane_id, host_rows, device_rows, io_backend, backup=True
+            )
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        del is_draft
+        host_rows, device_rows = self._transfer_page_indices(
+            host_indices, device_indices
+        )
+        if host_rows is None:
+            return
+        if not 0 <= layer_id < self.layer_num:
+            raise IndexError(
+                f"{self.pool_name} layer index {layer_id} is out of range "
+                f"for {self.layer_num} layers"
+            )
+        for plane_id in range(3):
+            self._transfer_plane_per_layer(
+                plane_id,
+                host_rows,
+                device_rows,
+                layer_id,
+                io_backend,
+                backup=False,
+            )
+
+    def get_size_per_token(self):
+        return self.size_per_token
+
+    def get_ksize_per_token(self):
+        return self.size_per_token
+
+    def get_hybrid_pool_buffer(self):
+        return self.kv_buffer
+
+    def init_kv_buffer(self):
+        return self.kv_buffer
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError("Remnant HiCache L3 transfer is not supported")
+
+    def get_data_page(self, index, flat=True):
+        raise NotImplementedError("Remnant HiCache L3 transfer is not supported")
+
+    def get_dummy_flat_data_page(self):
+        raise NotImplementedError("Remnant HiCache L3 transfer is not supported")
+
+    def set_from_flat_data_page(self, index, data_page):
+        raise NotImplementedError("Remnant HiCache L3 transfer is not supported")
+
+    def get_page_buffer_meta(self, indices):
+        raise NotImplementedError("Remnant HiCache L3 transfer is not supported")
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        return False
+
+    def destroy(self):
+        super().destroy()
+        self.host_values = None
+        self.host_bitmaps = None
+        self.host_scales = None
+        self.host_plane_buffers = None
+        self.host_plane_ptrs = None
+        self.device_plane_ptrs = None
+        self.data_refs = None
+
+
 class DeepSeekV4StateHostPool(HostKVCache):
     """Host pool for V4 CompressStatePool page rows."""
 

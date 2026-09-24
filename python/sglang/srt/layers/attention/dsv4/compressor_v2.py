@@ -245,6 +245,11 @@ class CompressorBackendMixin:
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
+        # A prefix can be restored from HiCache without running a packed
+        # compressor write first. Install the model's existing RoPE table
+        # before the attention backend reads packed rows during decode.
+        if _sg_lr.packed_enabled() and compressor.ratio == 4:
+            token_to_kv_pool.set_packed_rope_freqs(layer_id, compressor.freqs_cis)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)

@@ -611,9 +611,10 @@ class DeepseekV4AttnBackend(
             if (
                 args.cpu_offload_gb > 0
                 or args.disaggregation_decode_enable_offload_kvcache
-                or args.enable_hierarchical_cache
             ):
-                raise RuntimeError('packed is incompatible with offload or HiCache')
+                raise RuntimeError(
+                    'packed is incompatible with CPU or decode KV offload'
+                )
             if (
                 args.enable_prefill_context_parallel
                 or args.enable_dsa_prefill_context_parallel

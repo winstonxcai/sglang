@@ -1232,6 +1232,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             raise RuntimeError('layer does not use packed')
         return pool.get_rope_freqs(local)
 
+    def set_packed_rope_freqs(self, layer_id: int, freqs_cis) -> None:
+        ratio, local, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError('layer does not use packed')
+        pool.set_rope_freqs(local, freqs_cis)
+
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
         self.wait_layer_transfer(layer_id)
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]

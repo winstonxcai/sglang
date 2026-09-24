@@ -3622,8 +3622,19 @@ class ServerArgs:
             incompatible.append("--cpu-offload-gb")
         if self.disaggregation_decode_enable_offload_kvcache:
             incompatible.append("decode KV offload")
-        if self.enable_hierarchical_cache:
-            incompatible.append("HiCache")
+        if self.enable_hierarchical_cache and self.hicache_storage_backend is not None:
+            incompatible.append("HiCache L3 storage (--hicache-storage-backend)")
+        if (
+            self.enable_hierarchical_cache
+            and self.hicache_storage_backend is None
+            and self.hicache_mem_layout != "layer_first"
+        ):
+            logger.warning(
+                "Remnant HiCache L2 currently requires layer_first layout; "
+                "switching hicache_mem_layout from %s to layer_first.",
+                self.hicache_mem_layout,
+            )
+            self.hicache_mem_layout = "layer_first"
         if self.enable_prefill_context_parallel:
             incompatible.append("--enable-prefill-context-parallel")
         if self.enable_dsa_prefill_context_parallel:

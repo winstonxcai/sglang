@@ -8,6 +8,10 @@ import unittest
 import torch
 
 from sglang.srt import remnant
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    RemnantPackedKVPool,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     RemnantPackedHostPool,
 )
@@ -122,7 +126,7 @@ class TestRemnantHiCache(CustomTestCase):
             ]
         )
         host_pool.backup_from_device_all_layer(
-            self.device_pool, host_indices, device_indices, io_backend="direct"
+            self.device_pool, host_indices, device_indices, io_backend="kernel"
         )
         torch.cuda.synchronize()
 
@@ -160,7 +164,7 @@ class TestRemnantHiCache(CustomTestCase):
                 host_indices,
                 destination_indices,
                 layer,
-                io_backend="direct",
+                io_backend="kernel",
             )
         torch.cuda.synchronize()
 
@@ -224,6 +228,21 @@ class TestRemnantHiCache(CustomTestCase):
                 partial_device_indices,
                 io_backend="direct",
             )
+
+    def test_rope_table_can_be_installed_without_a_packed_write(self):
+        # HiCache can restore packed rows before any compressor write runs.
+        # Exercise the same pool accessors used by that cache-hit path without
+        # constructing or loading a model.
+        packed_pool = object.__new__(RemnantPackedKVPool)
+        packed_pool.start_layer = 0
+        packed_pool._remnant_rope_freqs = [None]
+        token_pool = object.__new__(DeepSeekV4TokenToKVPool)
+        token_pool.layer_mapping = [(4, 0, packed_pool)]
+        freqs_cis = torch.arange(16, dtype=torch.float32).to(torch.complex64)
+
+        token_pool.set_packed_rope_freqs(0, freqs_cis)
+
+        self.assertIs(token_pool.get_packed_freqs(0), freqs_cis)
 
 
 if __name__ == "__main__":
