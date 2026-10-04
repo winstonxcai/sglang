@@ -223,9 +223,9 @@ def _run_case(
         buffers,
     )
     freqs = _frequencies(int(raw.clamp_min(0).max().item()) + 2, device)
-    run_native = path in ("all", "native")
+    run_native = path in ("all", "native", "native-direct")
     run_adapter = path in ("all", "adapter")
-    run_direct = path in ("all", "direct")
+    run_direct = path in ("all", "direct", "native-direct")
     workspace = (
         NativeWorkspace.allocate(case.batch, selected_k, 64, device)
         if run_native or run_adapter
@@ -329,9 +329,10 @@ def _run_case(
     for name, (output, lse) in outputs.items():
         if not torch.isfinite(output).all() or not torch.isfinite(lse).all():
             raise RuntimeError(f"non-finite {name} output at {case.name}")
-    if path == "all":
+    if path in ("all", "native-direct"):
         torch.testing.assert_close(outputs["direct"][0], outputs["native"][0], atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(outputs["direct"][1], outputs["native"][1], atol=2e-2, rtol=2e-2)
+    if path == "all":
         torch.testing.assert_close(outputs["adapter"][0], outputs["native"][0], atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(outputs["adapter"][1], outputs["native"][1], atol=2e-2, rtol=2e-2)
 
@@ -354,7 +355,7 @@ def _run_case(
     summaries = {name: _summary(values) for name, values in samples.items()}
     comparison = None
     status = "N/A"
-    if path == "all":
+    if path in ("all", "native-direct"):
         paired = [
             100.0 * (direct_ms / native_ms - 1.0)
             for native_ms, direct_ms in zip(samples["native"], samples["direct"])
@@ -449,7 +450,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=30)
     parser.add_argument("--max-regression-percent", type=float, default=2.0)
-    parser.add_argument("--path", choices=("all", "native", "adapter", "direct"), default="all")
+    parser.add_argument(
+        "--path",
+        choices=("all", "native", "adapter", "direct", "native-direct"),
+        default="all",
+        help="native-direct times the matched comparison without Adapter",
+    )
     parser.add_argument("--output", help="Output basename or .json/.csv path")
     args = parser.parse_args()
     if args.repeats <= 0 or args.rounds < 2 or args.warmup < 0:

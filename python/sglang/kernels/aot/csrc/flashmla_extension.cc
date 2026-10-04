@@ -51,6 +51,37 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       static_cast<float>(sm_scale));
 }
 
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, at::Tensor>
+sgl_sparse_decode_fwd_with_wait_cycles(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    const std::optional<at::Tensor>& extra_kv,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length,
+    int64_t d_v,
+    double sm_scale) {
+  return sparse_attn_decode_wait_cycles_interface(
+      q,
+      kv,
+      indices,
+      topk_length,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      extra_kv,
+      extra_indices,
+      extra_topk_length,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale));
+}
+#endif
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
     at::Tensor q,
     const at::Tensor& kcache,
@@ -142,6 +173,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
+
+#ifdef FLASHMLA_ENABLE_READY_WAIT_CYCLES
+  m.def(
+      "sparse_decode_fwd_with_wait_cycles(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
+      "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
+      "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?, Tensor)");
+  m.impl("sparse_decode_fwd_with_wait_cycles", torch::kCUDA,
+         &sgl_sparse_decode_fwd_with_wait_cycles);
+#endif
 
   m.def(
       "remnant_sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
