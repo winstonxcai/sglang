@@ -80,7 +80,9 @@ def _as_buffers(packed_buffers, layer_id: int | None = None) -> PackedBuffers:
 
 
 def _plan_rows(compressor_plan: object) -> torch.Tensor:
-    plan = compressor_plan[1] if compressor_plan.is_decode else compressor_plan[2]
+    # Both DecodePlan and CompressPlan have four words per compressed row.
+    # plan[2] is prefill state-ring persistence, not compressed cache records.
+    plan = compressor_plan[1]
     return plan.view(torch.int32)
 
 
@@ -110,6 +112,77 @@ def pack_rows(
     _pack_fp8_kernel[(latent.shape[0],)](
         latent,
         keep_mask,
+        norm_weight,
+        plan_rows,
+        locations,
+        buffers.values,
+        buffers.bitmaps,
+        buffers.scales,
+        latent.shape[0],
+        norm_eps=norm_eps,
+        HEAD_DIM=config.HEAD_DIM,
+        KEEP_K=config.PACKED_KEPT_VALUES,
+        TILE_SIZE=config.TILE_SIZE,
+        BITMAP_WORDS=config.BITMAP_WORDS,
+        FP8_MAX=config.FP8_E4M3_MAX,
+        IS_DECODE=bool(compressor_plan.is_decode),
+        BLOCK_D=config.HEAD_DIM,
+        num_warps=8,
+    )
+
+
+def pack_rows_fused(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    compressor_plan: object,
+    locations: torch.Tensor,
+    packed_buffers,
+    *,
+    layer_id: int | None = None,
+) -> None:
+    """Select and pack finite FP32 C4 rows without an intermediate keep mask.
+
+    The optimized path is qualified on SM90. Other layouts/dtypes/devices use
+    the explicit-mask store; its selection still sees the original latent.
+    """
+    config.validate_packed_static_config()
+    if latent.ndim != 2 or latent.shape[1] != config.HEAD_DIM:
+        raise ValueError(f"packed expects [rows, 512], got {latent.shape}")
+    if latent.numel() == 0:
+        return
+    buffers = _as_buffers(packed_buffers, layer_id)
+    supported = (
+        latent.is_cuda
+        and not torch.version.hip
+        and latent.dtype == torch.float32
+        and norm_weight.dtype == torch.float32
+        and norm_weight.device == latent.device
+        and norm_weight.shape == (config.HEAD_DIM,)
+        and latent.is_contiguous()
+        and norm_weight.is_contiguous()
+        and locations.is_contiguous()
+        and torch.cuda.get_device_capability(latent.device) == (9, 0)
+    )
+    if not supported:
+        from .reference import topmag_keep_mask
+
+        mask = topmag_keep_mask(latent, config.PACKED_KEPT_VALUES / config.HEAD_DIM)
+        pack_rows(
+            latent.contiguous(),
+            mask.contiguous(),
+            norm_weight.contiguous(),
+            norm_eps,
+            compressor_plan,
+            locations.contiguous(),
+            buffers,
+        )
+        return
+    from .triton.fused_store import _pack_fused_fp32_kernel
+
+    plan_rows = _plan_rows(compressor_plan)
+    _pack_fused_fp32_kernel[(latent.shape[0],)](
+        latent,
         norm_weight,
         plan_rows,
         locations,

@@ -24,6 +24,7 @@ _LAZY_EXPORTS = {
     "topmag_keep_mask": "reference",
     "topmag_zero_from_mask": "reference",
     "pack_rows": "packed",
+    "pack_rows_fused": "packed",
     "unpack_gather_native": "packed",
     "unpack_gather_bf16": "packed",
     "NativeWorkspace": "packed",

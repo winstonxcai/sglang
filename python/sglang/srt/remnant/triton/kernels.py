@@ -66,21 +66,22 @@ def _pack_fp8_kernel(
     raw_code = fp8.to(tl.uint8, bitcast=True)
     rank = tl.cumsum(bits.to(tl.int32), axis=0) - 1
 
-    plan_base = plan_ptr + row * (4 if IS_DECODE else 2)
+    plan_base = plan_ptr + row * 4
     if IS_DECODE:
         seq_len = tl.load(plan_base).to(tl.int32)
         location = tl.load(locations_ptr + row).to(tl.int64)
     else:
-        # Prefill WritePlan word 0 stores ragged_id (low 16 bits); word 1 is
-        # the native write location and is not the packed C4 destination.
-        ragged_id = tl.load(plan_base).to(tl.int32) & 0xFFFF
-        location = tl.load(locations_ptr + ragged_id).to(tl.int64)
+        # CompressPlan word 0 is seq_len; word 1 contains ragged_id.
+        seq_len = tl.load(plan_base).to(tl.int32)
+        ragged_id = tl.load(plan_base + 1).to(tl.int32) & 0xFFFF
+        location = tl.load(locations_ptr + ragged_id, mask=seq_len >= 0, other=-1).to(tl.int64)
     # Decode plans include sequence length in word 0 and only write C4
-    # boundaries. Prefill WritePlan entries are already filtered to valid
-    # writes, so their word 0 is ragged_id rather than sequence length.
+    # boundaries. Padded prefill CompressPlan entries have seq_len == -1.
     write_row = (row < n_rows) & (location >= 0)
     if IS_DECODE:
         write_row = write_row & (seq_len % 4 == 0)
+    else:
+        write_row = write_row & (seq_len >= 0)
     tl.store(
         values_ptr + location * KEEP_K + rank,
         raw_code,

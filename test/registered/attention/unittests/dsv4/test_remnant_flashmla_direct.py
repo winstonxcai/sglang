@@ -10,13 +10,12 @@ import torch
 
 from sglang.srt import remnant
 from sglang.srt.remnant import NativeWorkspace
-from sglang.srt.remnant.packed import pack_rows, unpack_gather_native
+from sglang.srt.remnant.packed import pack_rows, pack_rows_fused, unpack_gather_native
 from sglang.srt.remnant.reference import topmag_keep_mask
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or importlib.util.find_spec("triton") is None,
+    not torch.cuda.is_available() or importlib.util.find_spec("triton") is None,
     reason="CUDA, Triton, and the compiled FlashMLA extension are required",
 )
 
@@ -31,13 +30,14 @@ class _PackPlan:
     is_decode = False
 
     def __init__(self, rows: int, device: torch.device):
-        self.plan_w = torch.zeros((rows, 8), dtype=torch.uint8, device=device)
+        self.plan_c = torch.zeros((rows, 16), dtype=torch.uint8, device=device)
         ids = torch.arange(rows, dtype=torch.int32, device=device)
-        self.plan_w[:, :4] = ids.view(torch.uint8).reshape(rows, 4)
+        self.plan_c[:, :4] = ((ids + 1) * 4).view(torch.uint8).reshape(rows, 4)
+        self.plan_c[:, 4:8] = ids.view(torch.uint8).reshape(rows, 4)
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        if index == 2:
-            return self.plan_w
+        if index == 1:
+            return self.plan_c
         raise IndexError(index)
 
 
@@ -65,12 +65,20 @@ def _bitmap_edge_keep_mask(rows: int, device: torch.device) -> torch.Tensor:
             within_byte >= 4,
             coordinate.remainder(2) == 0,
             coordinate.remainder(2) == 1,
-            (within_byte == 0) | (within_byte == 1) | (within_byte == 6) | (within_byte == 7),
-            (within_byte == 0) | (within_byte == 2) | (within_byte == 5) | (within_byte == 7),
+            (within_byte == 0)
+            | (within_byte == 1)
+            | (within_byte == 6)
+            | (within_byte == 7),
+            (within_byte == 0)
+            | (within_byte == 2)
+            | (within_byte == 5)
+            | (within_byte == 7),
             (coordinate < 255) | (coordinate == 511),
         )
     )
-    assert torch.all(patterns.sum(dim=-1) == 256), "Each bitmap pattern must retain 256 values"
+    assert torch.all(patterns.sum(dim=-1) == 256), (
+        "Each bitmap pattern must retain 256 values"
+    )
     row_pattern = torch.arange(rows, device=device) % patterns.shape[0]
     return patterns.index_select(0, row_pattern)
 
@@ -90,9 +98,7 @@ def _make_swa_cache(pages: int, page_size: int, device: torch.device) -> torch.T
         tail.to(torch.bfloat16).view(torch.uint8).reshape(pages, page_size, 128)
     )
     storage[:, page_size * 576 : page_size * 584].fill_(127)
-    return storage.as_strided(
-        (pages, page_size, 1, 584), (bytes_per_page, 584, 584, 1)
-    )
+    return storage.as_strided((pages, page_size, 1, 584), (bytes_per_page, 584, 584, 1))
 
 
 class TestRemnantFlashMLADirect:
@@ -100,7 +106,7 @@ class TestRemnantFlashMLADirect:
         "bitmap_patterns", [False, True], ids=["topmag", "bitmap-edges"]
     )
     @pytest.mark.parametrize("num_heads", [64, 128])
-    @pytest.mark.parametrize("batch", [8, 16])
+    @pytest.mark.parametrize("batch", [8, 16, 32])
     @pytest.mark.parametrize("topk_length", [512, 317])
     def test_direct_matches_fused_adapter(
         self, num_heads: int, batch: int, topk_length: int, bitmap_patterns: bool
@@ -126,25 +132,39 @@ class TestRemnantFlashMLADirect:
             torch.zeros((batch, page_size, 8), dtype=torch.uint8, device=device),
         )
         locations = torch.arange(rows, dtype=torch.int32, device=device)
-        pack_rows(
-            latent,
-            keep_mask,
-            norm_weight,
-            1.0e-6,
-            _PackPlan(rows, device),
-            locations,
-            buffers,
-        )
+        if bitmap_patterns:
+            pack_rows(
+                latent,
+                keep_mask,
+                norm_weight,
+                1.0e-6,
+                _PackPlan(rows, device),
+                locations,
+                buffers,
+            )
+        else:
+            pack_rows_fused(
+                latent, norm_weight, 1.0e-6, _PackPlan(rows, device), locations, buffers
+            )
 
-        physical = torch.arange(selected_k, device=device, dtype=torch.int32).view(
-            1, selected_k
-        ) % 64
-        physical = physical + torch.arange(batch, device=device, dtype=torch.int32).view(
-            batch, 1
-        ) * 64
-        raw = physical + 3 + torch.arange(
-            selected_k, device=device, dtype=torch.int32
-        ).view(1, selected_k) % 11
+        physical = (
+            torch.arange(selected_k, device=device, dtype=torch.int32).view(
+                1, selected_k
+            )
+            % 64
+        )
+        physical = (
+            physical
+            + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1) * 64
+        )
+        raw = (
+            physical
+            + 3
+            + torch.arange(selected_k, device=device, dtype=torch.int32).view(
+                1, selected_k
+            )
+            % 11
+        )
         lengths = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
         if topk_length < selected_k:
             physical = physical.clone()
@@ -155,9 +175,7 @@ class TestRemnantFlashMLADirect:
                 raw[request, length:] = -1
         freqs = _frequencies(int(raw.clamp_min(0).max().item()) + 2, device)
 
-        workspace = NativeWorkspace.allocate(
-            batch, selected_k, page_size, device
-        )
+        workspace = NativeWorkspace.allocate(batch, selected_k, page_size, device)
         native_bytes, native_indices = unpack_gather_native(
             buffers,
             physical,
@@ -180,9 +198,11 @@ class TestRemnantFlashMLADirect:
         swa_indices = torch.arange(page_size, device=device, dtype=torch.int32).view(
             1, 1, page_size
         )
-        swa_indices = swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(
-            batch, 1, 1
-        ) * page_size
+        swa_indices = (
+            swa_indices
+            + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1)
+            * page_size
+        )
         swa_indices = swa_indices.contiguous()
         swa_lengths = torch.full((batch,), page_size, dtype=torch.int32, device=device)
         sink = torch.linspace(-0.1, 0.1, num_heads, device=device)
@@ -195,7 +215,7 @@ class TestRemnantFlashMLADirect:
             None,
             512,
             native_meta,
-            softmax_scale=512 ** -0.5,
+            softmax_scale=512**-0.5,
             is_fp8_kvcache=True,
             indices=swa_indices,
             attn_sink=sink,
@@ -213,7 +233,7 @@ class TestRemnantFlashMLADirect:
             None,
             512,
             direct_meta,
-            softmax_scale=512 ** -0.5,
+            softmax_scale=512**-0.5,
             is_fp8_kvcache=True,
             indices=swa_indices,
             attn_sink=sink,
@@ -226,7 +246,9 @@ class TestRemnantFlashMLADirect:
         )
 
         packed_codes = buffers[0]
-        assert not torch.any((packed_codes & 0x7F) == 0x7F), "Packed cache contains FP8 NaN codes"
+        assert not torch.any((packed_codes & 0x7F) == 0x7F), (
+            "Packed cache contains FP8 NaN codes"
+        )
         assert torch.isfinite(native_out).all(), "Native adapter output is non-finite"
         assert torch.isfinite(native_lse).all(), "Native adapter LSE is non-finite"
         assert torch.isfinite(direct_out).all(), "Direct output is non-finite"
@@ -235,7 +257,7 @@ class TestRemnantFlashMLADirect:
         torch.testing.assert_close(direct_lse, native_lse, atol=2.0e-2, rtol=2.0e-2)
 
     @pytest.mark.parametrize("num_heads", [64, 128])
-    @pytest.mark.parametrize("batch", [8, 16])
+    @pytest.mark.parametrize("batch", [8, 16, 32])
     def test_direct_decode_cuda_graph_replay(self, num_heads: int, batch: int):
         from sgl_kernel import flash_mla
 
@@ -261,17 +283,24 @@ class TestRemnantFlashMLADirect:
         q = torch.randn((batch, 1, num_heads, 512), device=device, dtype=torch.bfloat16)
         swa_cache = _make_swa_cache(batch, 64, device)
         swa_indices = torch.arange(64, device=device, dtype=torch.int32).view(1, 1, 64)
-        swa_indices = swa_indices + torch.arange(batch, device=device, dtype=torch.int32).view(
-            batch, 1, 1
-        ) * 64
+        swa_indices = (
+            swa_indices
+            + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1, 1)
+            * 64
+        )
         swa_indices = swa_indices.contiguous()
         swa_lengths = torch.full((batch,), 64, dtype=torch.int32, device=device)
         physical = torch.arange(512, device=device, dtype=torch.int32).view(1, 512) % 64
-        physical = physical + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1) * 64
+        physical = (
+            physical
+            + torch.arange(batch, device=device, dtype=torch.int32).view(batch, 1) * 64
+        )
         physical = physical.contiguous()
-        raw = physical + 5 + torch.arange(
-            512, device=device, dtype=torch.int32
-        ).view(1, 512) % 11
+        raw = (
+            physical
+            + 5
+            + torch.arange(512, device=device, dtype=torch.int32).view(1, 512) % 11
+        )
         lengths = torch.full((batch,), 512, dtype=torch.int32, device=device)
         freqs = _frequencies(int(raw.max().item()) + 2, device)
 
@@ -283,7 +312,7 @@ class TestRemnantFlashMLADirect:
                 None,
                 512,
                 meta,
-                softmax_scale=512 ** -0.5,
+                softmax_scale=512**-0.5,
                 is_fp8_kvcache=True,
                 indices=swa_indices,
                 topk_length=swa_lengths,
