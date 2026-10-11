@@ -13,7 +13,6 @@ from sglang.srt.remnant import NativeWorkspace
 from sglang.srt.remnant.packed import pack_rows, pack_rows_fused, unpack_gather_native
 from sglang.srt.remnant.reference import topmag_keep_mask
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or importlib.util.find_spec("triton") is None,
     reason="CUDA, Triton, and the compiled FlashMLA extension are required",
@@ -76,9 +75,9 @@ def _bitmap_edge_keep_mask(rows: int, device: torch.device) -> torch.Tensor:
             (coordinate < 255) | (coordinate == 511),
         )
     )
-    assert torch.all(patterns.sum(dim=-1) == 256), (
-        "Each bitmap pattern must retain 256 values"
-    )
+    assert torch.all(
+        patterns.sum(dim=-1) == 256
+    ), "Each bitmap pattern must retain 256 values"
     row_pattern = torch.arange(rows, device=device) % patterns.shape[0]
     return patterns.index_select(0, row_pattern)
 
@@ -108,8 +107,14 @@ class TestRemnantFlashMLADirect:
     @pytest.mark.parametrize("num_heads", [64, 128])
     @pytest.mark.parametrize("batch", [8, 16, 32])
     @pytest.mark.parametrize("topk_length", [512, 317])
+    @pytest.mark.parametrize("implementation", ["kernel", "triton"])
     def test_direct_matches_fused_adapter(
-        self, num_heads: int, batch: int, topk_length: int, bitmap_patterns: bool
+        self,
+        num_heads: int,
+        batch: int,
+        topk_length: int,
+        bitmap_patterns: bool,
+        implementation: str,
     ):
         from sgl_kernel import flash_mla
 
@@ -117,7 +122,7 @@ class TestRemnantFlashMLADirect:
         rows = batch * 64
         page_size = 64
         selected_k = 512
-        remnant.configure_cache_format("remnant")
+        remnant.configure_cache_format("remnant", implementation)
 
         latent = torch.randn((rows, 512), device=device, dtype=torch.float32)
         keep_mask = (
@@ -132,7 +137,7 @@ class TestRemnantFlashMLADirect:
             torch.zeros((batch, page_size, 8), dtype=torch.uint8, device=device),
         )
         locations = torch.arange(rows, dtype=torch.int32, device=device)
-        if bitmap_patterns:
+        if bitmap_patterns or implementation == "triton":
             pack_rows(
                 latent,
                 keep_mask,
@@ -166,13 +171,18 @@ class TestRemnantFlashMLADirect:
             % 11
         )
         lengths = torch.full((batch,), topk_length, dtype=torch.int32, device=device)
-        if topk_length < selected_k:
-            physical = physical.clone()
-            raw = raw.clone()
+        physical = physical.clone()
+        raw = raw.clone()
+        if topk_length == selected_k:
+            mixed = torch.tensor(
+                [0, 1, 63, 64, 65, 317, 511, 512], dtype=torch.int32, device=device
+            )
+            lengths.copy_(mixed.repeat((batch + 7) // 8)[:batch])
+        else:
             lengths[1::2] = 64
-            for request, length in enumerate(lengths.tolist()):
-                physical[request, length:] = 0
-                raw[request, length:] = -1
+        for request, length in enumerate(lengths.tolist()):
+            physical[request, length:] = 0
+            raw[request, length:] = -1
         freqs = _frequencies(int(raw.clamp_min(0).max().item()) + 2, device)
 
         workspace = NativeWorkspace.allocate(batch, selected_k, page_size, device)
@@ -189,7 +199,7 @@ class TestRemnantFlashMLADirect:
             (workspace.bytes_per_page, 584, 584, 1),
         )
         native_indices = native_indices.unsqueeze(1)
-        if topk_length < selected_k:
+        if torch.any(lengths < selected_k):
             for request, length in enumerate(lengths.tolist()):
                 physical[request, length:] = torch.iinfo(torch.int32).max
 
@@ -246,9 +256,9 @@ class TestRemnantFlashMLADirect:
         )
 
         packed_codes = buffers[0]
-        assert not torch.any((packed_codes & 0x7F) == 0x7F), (
-            "Packed cache contains FP8 NaN codes"
-        )
+        assert not torch.any(
+            (packed_codes & 0x7F) == 0x7F
+        ), "Packed cache contains FP8 NaN codes"
         assert torch.isfinite(native_out).all(), "Native adapter output is non-finite"
         assert torch.isfinite(native_lse).all(), "Native adapter LSE is non-finite"
         assert torch.isfinite(direct_out).all(), "Direct output is non-finite"

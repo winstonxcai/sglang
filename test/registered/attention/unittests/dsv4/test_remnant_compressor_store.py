@@ -1,10 +1,14 @@
-"""Exercise the actual compressor hook without model weights."""
+"""Exercise the actual compressor hook without model weights.
+
+Author: Winston Cai.
+"""
 
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
@@ -15,7 +19,8 @@ from sglang.srt.layers.attention.dsv4 import compressor_v2 as module
 
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
 @pytest.mark.parametrize("mode", ["packed", "native", "c128", "indexer"])
-def test_compressor_routes_store(phase, mode):
+@pytest.mark.parametrize("implementation", ["triton", "kernel"])
+def test_compressor_routes_store(phase, mode, implementation):
     ratio = 128 if mode == "c128" else 4
     dim = 128 if mode == "indexer" else 512
     latent = torch.randn((2, dim), dtype=torch.float32)
@@ -31,7 +36,11 @@ def test_compressor_routes_store(phase, mode):
     )
     backend = SimpleNamespace(_get_paged_compress_metadata=lambda unused: plan)
     pool = mock.Mock()
-    remnant.configure_cache_format("native" if mode == "native" else "remnant")
+    remnant.configure_cache_format(
+        "native" if mode == "native" else "remnant", implementation
+    )
+    keep_mask = torch.zeros_like(latent, dtype=torch.bool)
+    keep_mask[:, :256] = True
     try:
         with (
             mock.patch.object(module, "compress_forward", return_value=latent),
@@ -39,11 +48,12 @@ def test_compressor_routes_store(phase, mode):
             mock.patch.object(module, "_use_online_compress", return_value=False),
             mock.patch.object(module, "compress_norm_rope_store") as native,
             mock.patch.object(remnant, "pack_rows_fused") as fused,
+            mock.patch.object(remnant, "pack_rows") as explicit,
             mock.patch.object(
                 remnant,
                 "topmag_keep_mask",
-                side_effect=AssertionError("unexpected Torch TopMag"),
-            ),
+                return_value=keep_mask,
+            ) as select,
         ):
             module.CompressorBackendMixin._forward_compress_all_in_one(
                 backend,
@@ -63,15 +73,28 @@ def test_compressor_routes_store(phase, mode):
                 packed_layer_id=0,
             )
             if mode == "packed":
-                fused.assert_called_once()
-                assert fused.call_args.args[0] is latent
-                assert fused.call_args.args[2] == 1e-5
-                assert fused.call_args.args[3] is plan
+                if implementation == "triton":
+                    select.assert_called_once_with(latent, 0.5)
+                    explicit.assert_called_once()
+                    assert explicit.call_args.args[0] is latent
+                    assert explicit.call_args.args[1] is keep_mask
+                    assert explicit.call_args.args[3] == 1e-5
+                    assert explicit.call_args.args[4] is plan
+                    fused.assert_not_called()
+                else:
+                    fused.assert_called_once()
+                    assert fused.call_args.args[0] is latent
+                    assert fused.call_args.args[2] == 1e-5
+                    assert fused.call_args.args[3] is plan
+                    select.assert_not_called()
+                    explicit.assert_not_called()
                 pool.set_rope_freqs.assert_called_once()
                 native.assert_not_called()
             else:
                 native.assert_called_once()
                 fused.assert_not_called()
+                explicit.assert_not_called()
+                select.assert_not_called()
                 pool.set_rope_freqs.assert_not_called()
     finally:
         remnant.configure_cache_format("native")

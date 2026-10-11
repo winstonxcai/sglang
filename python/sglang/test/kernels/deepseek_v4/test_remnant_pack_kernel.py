@@ -13,7 +13,6 @@ from sglang.srt import remnant
 from sglang.srt.remnant.packed import pack_rows
 from sglang.srt.remnant.reference import pack_rows_ref, topmag_keep_mask
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or importlib.util.find_spec("triton") is None,
     reason="CUDA and Triton are required",
@@ -22,10 +21,15 @@ pytestmark = pytest.mark.skipif(
 
 def _prefill_plan(rows: int, device: torch.device) -> CompressorPrefillPlan:
     plan_c = torch.zeros((rows, 16), dtype=torch.uint8, device=device)
+    words = plan_c.view(torch.int32)
+    words[:, 0] = 4
+    words[:, 1] = torch.arange(rows, dtype=torch.int32, device=device)
     plan_w = torch.zeros((rows, 8), dtype=torch.uint8, device=device)
-    plan_w[:, :4] = torch.arange(rows, dtype=torch.int32, device=device).view(
-        torch.uint8
-    ).reshape(rows, 4)
+    plan_w[:, :4] = (
+        torch.arange(rows, dtype=torch.int32, device=device)
+        .view(torch.uint8)
+        .reshape(rows, 4)
+    )
     plan_w[:, 4:8] = torch.tensor([0, 0, 0, 0], dtype=torch.uint8, device=device)
     return CompressorPrefillPlan(4, plan_c, plan_w)
 
@@ -55,15 +59,9 @@ def test_remnant_triton_pack_matches_reference():
     )
     expected = pack_rows_ref(latent, mask, norm_weight, 1e-6)
     selected_rows = locations.cpu().tolist()
-    packed_values = torch.stack(
-        [buffers[0].reshape(-1, 256)[i] for i in selected_rows]
-    )
-    packed_bitmaps = torch.stack(
-        [buffers[1].reshape(-1, 8)[i] for i in selected_rows]
-    )
-    packed_scales = torch.stack(
-        [buffers[2].reshape(-1, 8)[i] for i in selected_rows]
-    )
+    packed_values = torch.stack([buffers[0].reshape(-1, 256)[i] for i in selected_rows])
+    packed_bitmaps = torch.stack([buffers[1].reshape(-1, 8)[i] for i in selected_rows])
+    packed_scales = torch.stack([buffers[2].reshape(-1, 8)[i] for i in selected_rows])
     assert torch.equal(packed_values, expected[0])
     assert torch.equal(packed_bitmaps, expected[1])
     assert torch.equal(packed_scales, expected[2])

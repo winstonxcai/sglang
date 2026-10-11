@@ -207,11 +207,21 @@ class CompressorBackendMixin:
                 packed_pool.set_rope_freqs(
                     packed_layer_id, freqs_cis_cache
                 )
-                _sg_lr.pack_rows_fused(
-                    kv_compressed, norm.weight,
-                    norm.variance_epsilon, plan, out_loc,
-                    packed_pool, layer_id=packed_layer_id,
-                )
+                if _sg_lr.cache_implementation() == "triton":
+                    keep_mask = _sg_lr.topmag_keep_mask(
+                        kv_compressed, _sg_lr.topmag_keep()
+                    )
+                    _sg_lr.pack_rows(
+                        kv_compressed, keep_mask, norm.weight,
+                        norm.variance_epsilon, plan, out_loc,
+                        packed_pool, layer_id=packed_layer_id,
+                    )
+                else:
+                    _sg_lr.pack_rows_fused(
+                        kv_compressed, norm.weight,
+                        norm.variance_epsilon, plan, out_loc,
+                        packed_pool, layer_id=packed_layer_id,
+                    )
                 return
             keep_mask = _sg_lr.topmag_keep_mask(
                 kv_compressed, _sg_lr.topmag_keep()

@@ -21,12 +21,19 @@ class PackedBuffers(NamedTuple):
 
 @dataclass
 class NativeWorkspace:
-    """Reusable buffers used to preserve the existing FlashMLA consumer."""
+    """Backend-owned buffers allocated before CUDA graph capture.
+
+    ``native_bytes`` is uint8 [pages, bytes_per_page] in MODEL1's split layout;
+    ``temporary_indices`` is contiguous int32 [max_queries, selected_k]. Only
+    Triton mode owns ``dense_bf16``, contiguous BF16 [max_queries * selected_k,
+    512]. Reconstruction reuses these buffers on the caller's current stream.
+    """
 
     native_bytes: torch.Tensor
     temporary_indices: torch.Tensor
     page_size: int
     bytes_per_page: int
+    dense_bf16: torch.Tensor | None = None
 
     @property
     def max_queries(self) -> int:
@@ -44,7 +51,7 @@ class NativeWorkspace:
         selected_k: int,
         page_size: int,
         device: torch.device | str,
-    ) -> "NativeWorkspace":
+    ) -> NativeWorkspace:
         rows = max_batch * selected_k
         pages = (rows + page_size - 1) // page_size
         bytes_per_page = ((config.NATIVE_RECORD_BYTES * page_size + 575) // 576) * 576
@@ -52,7 +59,14 @@ class NativeWorkspace:
         temporary_indices = torch.arange(
             rows, dtype=torch.int32, device=device
         ).reshape(max_batch, selected_k)
-        return cls(raw, temporary_indices, page_size, bytes_per_page)
+        dense = None
+        if config.packed_enabled() and config.cache_implementation() == "triton":
+            # Owned by the backend, allocated before graph capture and reused
+            # by all three reconstruction launches on the current CUDA stream.
+            dense = torch.empty(
+                (rows, config.HEAD_DIM), dtype=torch.bfloat16, device=device
+            )
+        return cls(raw, temporary_indices, page_size, bytes_per_page, dense)
 
 
 def _as_buffers(packed_buffers, layer_id: int | None = None) -> PackedBuffers:
@@ -212,7 +226,13 @@ def unpack_gather_bf16(
     *,
     layer_id: int | None = None,
 ) -> torch.Tensor:
-    """Gather selected records, dequantize, zero-fill and apply tail RoPE."""
+    """Gather selected records, dequantize, zero-fill and apply tail RoPE.
+
+    Indices are int32 [queries, selected_k] views with independent strides;
+    physical entries address Packed rows, raw entries address logical C4 rows.
+    Lengths are int32 [queries]. The caller owns contiguous BF16 output and a
+    contiguous complex RoPE table. Invalid/padded selections produce zero rows.
+    """
     buffers = _as_buffers(packed_buffers, layer_id)
     if physical_indices.shape != raw_indices.shape:
         raise ValueError("physical_indices and raw_indices must have equal shape")
@@ -221,6 +241,12 @@ def unpack_gather_bf16(
     out2d = output.reshape(-1, config.HEAD_DIM)
     if out2d.shape[0] < flat_rows:
         raise ValueError("output workspace is too small")
+    if output.dtype != torch.bfloat16 or not output.is_contiguous():
+        raise ValueError("output must be a contiguous BF16 workspace")
+    if topk_lengths.shape != (n_queries,):
+        raise ValueError("topk_lengths must have one entry per query")
+    if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
+        raise ValueError("freqs_cis must be a contiguous complex tensor")
     if flat_rows == 0:
         return output
     from .triton import (
@@ -242,21 +268,36 @@ def unpack_gather_bf16(
         KEEP_K=config.PACKED_KEPT_VALUES,
         BITMAP_WORDS=config.BITMAP_WORDS,
         BLOCK_D=config.HEAD_DIM,
+        PHYSICAL_STRIDE_Q=physical_indices.stride(0),
+        PHYSICAL_STRIDE_K=physical_indices.stride(1),
+        RAW_STRIDE_Q=raw_indices.stride(0),
+        RAW_STRIDE_K=raw_indices.stride(1),
+        LENGTH_STRIDE=topk_lengths.stride(0),
+        PACKED_ROWS=buffers.values.numel() // config.PACKED_KEPT_VALUES,
+        FREQ_ROWS=freqs_cis.numel() // (config.ROPE_DIM // 2),
         num_warps=8,
     )
-    if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
-        raise ValueError("freqs_cis must be a contiguous complex tensor")
     # This is a view only; unlike .real.contiguous()/.imag.contiguous(), it
     # performs no CUDA allocation and can be retained by the packed pool.
     freq_pairs = torch.view_as_real(freqs_cis)
     _rope_tail_complex_inplace_kernel[(flat_rows,)](
         out2d,
+        physical_indices,
         raw_indices,
+        topk_lengths,
         freq_pairs,
         flat_rows,
+        selected_k,
         HEAD_DIM=config.HEAD_DIM,
         NOPE_DIM=config.NOPE_DIM,
         ROPE_PAIRS=config.ROPE_DIM // 2,
+        PHYSICAL_STRIDE_Q=physical_indices.stride(0),
+        PHYSICAL_STRIDE_K=physical_indices.stride(1),
+        RAW_STRIDE_Q=raw_indices.stride(0),
+        RAW_STRIDE_K=raw_indices.stride(1),
+        LENGTH_STRIDE=topk_lengths.stride(0),
+        PACKED_ROWS=buffers.values.numel() // config.PACKED_KEPT_VALUES,
+        FREQ_ROWS=freqs_cis.numel() // (config.ROPE_DIM // 2),
         num_warps=1,
     )
     return output
@@ -286,12 +327,58 @@ def unpack_gather_native(
             "native workspace top-k capacity exceeded: "
             f"{selected_k} > {native_workspace.selected_k}"
         )
-    temp = native_workspace.temporary_indices[:n_queries, :selected_k]
+    rows = n_queries * selected_k
+    # Materialization writes dense selected rows, even when selected_k is less
+    # than capacity. A rectangular slice would retain the capacity row stride
+    # and point the second query at unwritten records.
+    temp = native_workspace.temporary_indices.view(-1)[:rows].view(
+        n_queries, selected_k
+    )
     config.validate_packed_static_config()
     if physical_indices.shape != raw_indices.shape:
         raise ValueError("physical_indices and raw_indices must have equal shape")
     if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
         raise ValueError("freqs_cis must be a contiguous complex tensor")
+    if config.cache_implementation() == "triton":
+        if native_workspace.dense_bf16 is None:
+            raise RuntimeError(
+                "Triton reconstruction requires a workspace allocated in Triton mode"
+            )
+        dense = native_workspace.dense_bf16[:rows]
+        unpack_gather_bf16(
+            buffers, physical_indices, raw_indices, topk_lengths, freqs_cis, dense
+        )
+        if rows:
+            from .triton import _bf16_to_native_kernel
+
+            _bf16_to_native_kernel[(rows,)](
+                dense,
+                buffers.bitmaps,
+                buffers.values,
+                buffers.scales,
+                physical_indices,
+                raw_indices,
+                topk_lengths,
+                native_workspace.native_bytes,
+                rows,
+                selected_k,
+                page_size=native_workspace.page_size,
+                bytes_per_page=native_workspace.bytes_per_page,
+                HEAD_DIM=config.HEAD_DIM,
+                NOPE_DIM=config.NOPE_DIM,
+                KEEP_K=config.PACKED_KEPT_VALUES,
+                BITMAP_WORDS=config.BITMAP_WORDS,
+                BLOCK_D=config.HEAD_DIM,
+                PHYSICAL_STRIDE_Q=physical_indices.stride(0),
+                PHYSICAL_STRIDE_K=physical_indices.stride(1),
+                RAW_STRIDE_Q=raw_indices.stride(0),
+                RAW_STRIDE_K=raw_indices.stride(1),
+                LENGTH_STRIDE=topk_lengths.stride(0),
+                PACKED_ROWS=buffers.values.numel() // config.PACKED_KEPT_VALUES,
+                FREQ_ROWS=freqs_cis.numel() // (config.ROPE_DIM // 2),
+                num_warps=8,
+            )
+        return native_workspace.native_bytes, temp
     # Model-free validation images overlay the split Remnant extension on top
     # of the stock SGLang common_ops library.  Production builds already load
     # this operator from common_ops, so import the optional module only when

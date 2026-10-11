@@ -1,4 +1,4 @@
-"""Native and Remnant cache-format configuration for DeepSeek V4.
+"""Native and Packed cache configuration for DeepSeek V4.
 
 Author: Winston Cai.
 """
@@ -22,21 +22,32 @@ FP8_E4M3_MAX = 448.0
 # ServerArgs configures this once during startup, before any cache pool or
 # CUDA graph workspace is allocated. Native remains the safe default.
 _CACHE_FORMAT = "native"
+_CACHE_IMPLEMENTATION = "kernel"
 
 
-def configure_cache_format(cache_format: str) -> None:
-    """Set the process-wide DSV4 C4 cache format from ServerArgs."""
+def configure_cache_format(cache_format: str, implementation: str = "kernel") -> None:
+    """Set startup configuration; Native ignores the Packed implementation."""
     if cache_format not in {"native", "remnant"}:
         raise ValueError(
             "dsv4_c4_cache_format must be 'native' or 'remnant', "
             f"got {cache_format!r}"
         )
-    global _CACHE_FORMAT
+    if implementation not in {"triton", "kernel"}:
+        raise ValueError(
+            "dsv4_c4_cache_implementation must be 'triton' or 'kernel', "
+            f"got {implementation!r}"
+        )
+    global _CACHE_FORMAT, _CACHE_IMPLEMENTATION
     _CACHE_FORMAT = cache_format
+    _CACHE_IMPLEMENTATION = implementation
 
 
 def cache_format() -> str:
     return _CACHE_FORMAT
+
+
+def cache_implementation() -> str:
+    return _CACHE_IMPLEMENTATION
 
 
 def topmag_enabled() -> bool:

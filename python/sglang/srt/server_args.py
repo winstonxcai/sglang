@@ -692,6 +692,19 @@ class ServerArgs:
         ),
         NS("model"),
     ] = "native"
+    dsv4_c4_cache_implementation: A[
+        str,
+        Arg(
+            help=(
+                "Implementation for --dsv4-c4-cache-format remnant. 'triton' "
+                "uses explicit selection and Triton Native-page reconstruction; "
+                "'kernel' uses fused packing and optimized decode dispatch. "
+                "Ignored for the native cache format."
+            ),
+            choices=["triton", "kernel"],
+        ),
+        NS("model"),
+    ] = "kernel"
     kv_cache_dtype: A[
         str,
         Arg(
@@ -3603,7 +3616,9 @@ class ServerArgs:
     def _configure_dsv4_c4_cache_format(self) -> None:
         from sglang.srt import remnant
 
-        remnant.configure_cache_format(self.dsv4_c4_cache_format)
+        remnant.configure_cache_format(
+            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation
+        )
         if self.dsv4_c4_cache_format != "remnant":
             return
 
@@ -3677,7 +3692,9 @@ class ServerArgs:
 
         from sglang.srt import remnant
 
-        remnant.configure_cache_format(self.dsv4_c4_cache_format)
+        remnant.configure_cache_format(
+            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation
+        )
 
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()

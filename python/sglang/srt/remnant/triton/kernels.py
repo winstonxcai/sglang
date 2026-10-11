@@ -3,9 +3,8 @@
 Author: Winston Cai.
 """
 
-import triton.language as tl
-
 import triton
+import triton.language as tl
 
 
 @triton.jit
@@ -74,7 +73,9 @@ def _pack_fp8_kernel(
         # CompressPlan word 0 is seq_len; word 1 contains ragged_id.
         seq_len = tl.load(plan_base).to(tl.int32)
         ragged_id = tl.load(plan_base + 1).to(tl.int32) & 0xFFFF
-        location = tl.load(locations_ptr + ragged_id, mask=seq_len >= 0, other=-1).to(tl.int64)
+        location = tl.load(locations_ptr + ragged_id, mask=seq_len >= 0, other=-1).to(
+            tl.int64
+        )
     # Decode plans include sequence length in word 0 and only write C4
     # boundaries. Padded prefill CompressPlan entries have seq_len == -1.
     write_row = (row < n_rows) & (location >= 0)
@@ -125,6 +126,13 @@ def _unpack_gather_bf16_kernel(
     KEEP_K: tl.constexpr,
     BITMAP_WORDS: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    PHYSICAL_STRIDE_Q: tl.constexpr,
+    PHYSICAL_STRIDE_K: tl.constexpr,
+    RAW_STRIDE_Q: tl.constexpr,
+    RAW_STRIDE_K: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    PACKED_ROWS: tl.constexpr,
+    FREQ_ROWS: tl.constexpr,
 ):
     """Gather packed rows and reconstruct pre-RoPE BF16 rows."""
     selected_row = tl.program_id(0)
@@ -132,10 +140,21 @@ def _unpack_gather_bf16_kernel(
     k = selected_row % selected_k
     offs = tl.arange(0, BLOCK_D)
     in_bounds = offs < HEAD_DIM
-    physical = tl.load(physical_indices_ptr + selected_row).to(tl.int64)
-    raw = tl.load(raw_indices_ptr + selected_row).to(tl.int32)
-    topk_len = tl.load(topk_lengths_ptr + query).to(tl.int32)
-    valid = (query < n_queries) & (k < topk_len) & (physical >= 0) & (raw >= 0)
+    physical = tl.load(
+        physical_indices_ptr + query * PHYSICAL_STRIDE_Q + k * PHYSICAL_STRIDE_K
+    ).to(tl.int64)
+    raw = tl.load(raw_indices_ptr + query * RAW_STRIDE_Q + k * RAW_STRIDE_K).to(
+        tl.int64
+    )
+    topk_len = tl.load(topk_lengths_ptr + query * LENGTH_STRIDE).to(tl.int32)
+    valid = (
+        (query < n_queries)
+        & (k < topk_len)
+        & (physical >= 0)
+        & (physical < PACKED_ROWS)
+        & (raw >= 0)
+        & (raw * 4 < FREQ_ROWS)
+    )
     word = offs // 64
     lane = offs % 64
     bitmap = tl.load(
@@ -164,12 +183,22 @@ def _unpack_gather_bf16_kernel(
 @triton.jit
 def _rope_tail_complex_inplace_kernel(
     dense_ptr,
+    physical_indices_ptr,
     raw_indices_ptr,
+    topk_lengths_ptr,
     freq_ptr,
     n_rows,
+    selected_k,
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     ROPE_PAIRS: tl.constexpr,
+    PHYSICAL_STRIDE_Q: tl.constexpr,
+    PHYSICAL_STRIDE_K: tl.constexpr,
+    RAW_STRIDE_Q: tl.constexpr,
+    RAW_STRIDE_K: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    PACKED_ROWS: tl.constexpr,
+    FREQ_ROWS: tl.constexpr,
 ):
     """Apply RoPE from a contiguous complex64 table without real/imag copies.
 
@@ -179,8 +208,23 @@ def _rope_tail_complex_inplace_kernel(
     """
     row = tl.program_id(0)
     pair = tl.arange(0, ROPE_PAIRS)
-    raw = tl.load(raw_indices_ptr + row).to(tl.int64)
-    valid = (row < n_rows) & (raw >= 0)
+    query = row // selected_k
+    k = row % selected_k
+    physical = tl.load(
+        physical_indices_ptr + query * PHYSICAL_STRIDE_Q + k * PHYSICAL_STRIDE_K
+    ).to(tl.int64)
+    raw = tl.load(raw_indices_ptr + query * RAW_STRIDE_Q + k * RAW_STRIDE_K).to(
+        tl.int64
+    )
+    topk_len = tl.load(topk_lengths_ptr + query * LENGTH_STRIDE).to(tl.int32)
+    valid = (
+        (row < n_rows)
+        & (k < topk_len)
+        & (physical >= 0)
+        & (physical < PACKED_ROWS)
+        & (raw >= 0)
+        & (raw * 4 < FREQ_ROWS)
+    )
     position = raw * 4
     base = row * HEAD_DIM + NOPE_DIM + pair * 2
     x_real = tl.load(dense_ptr + base, mask=valid, other=0.0).to(tl.float32)
@@ -190,3 +234,97 @@ def _rope_tail_complex_inplace_kernel(
     s = tl.load(freq_ptr + freq_base * 2 + 1, mask=valid, other=0.0).to(tl.float32)
     tl.store(dense_ptr + base, x_real * c - x_imag * s, mask=valid)
     tl.store(dense_ptr + base + 1, x_real * s + x_imag * c, mask=valid)
+
+
+@triton.jit
+def _bf16_to_native_kernel(
+    dense_ptr,
+    bitmap_ptr,
+    values_ptr,
+    scales_ptr,
+    physical_indices_ptr,
+    raw_indices_ptr,
+    topk_lengths_ptr,
+    raw_native_ptr,
+    n_rows,
+    selected_k,
+    page_size: tl.constexpr,
+    bytes_per_page: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    KEEP_K: tl.constexpr,
+    BITMAP_WORDS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PHYSICAL_STRIDE_Q: tl.constexpr,
+    PHYSICAL_STRIDE_K: tl.constexpr,
+    RAW_STRIDE_Q: tl.constexpr,
+    RAW_STRIDE_K: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    PACKED_ROWS: tl.constexpr,
+    FREQ_ROWS: tl.constexpr,
+):
+    """Materialize gathered rows in FlashMLA's native hybrid page layout.
+
+    Restored from the Triton adapter preceding commit 84647d6284. NoPE uses
+    original FP8 bytes/scales; the dense BF16 workspace supplies the rotated
+    tail. Each program owns one destination row, including zeroed invalid rows.
+    """
+    row = tl.program_id(0)
+    query = row // selected_k
+    k = row % selected_k
+    offs = tl.arange(0, BLOCK_D)
+    physical = tl.load(
+        physical_indices_ptr + query * PHYSICAL_STRIDE_Q + k * PHYSICAL_STRIDE_K
+    ).to(tl.int64)
+    raw = tl.load(raw_indices_ptr + query * RAW_STRIDE_Q + k * RAW_STRIDE_K).to(
+        tl.int64
+    )
+    topk_len = tl.load(topk_lengths_ptr + query * LENGTH_STRIDE).to(tl.int32)
+    valid = (
+        (row < n_rows)
+        & (k < topk_len)
+        & (physical >= 0)
+        & (physical < PACKED_ROWS)
+        & (raw >= 0)
+        & (raw * 4 < FREQ_ROWS)
+    )
+    page = row // page_size
+    offset = row % page_size
+    # MODEL1 uses 448 FP8 NoPE bytes plus 128 BF16 tail bytes per value
+    # row, followed by a separate eight-byte-per-row scale region. The public
+    # cache view is 584 bytes wide but physical addressing uses this split ABI.
+    VALUE_BYTES: tl.constexpr = NOPE_DIM + (HEAD_DIM - NOPE_DIM) * 2
+    value_base = page * bytes_per_page + offset * VALUE_BYTES
+    scale_base = page * bytes_per_page + page_size * VALUE_BYTES + offset * BITMAP_WORDS
+
+    word = offs // 64
+    lane = offs % 64
+    bm = tl.load(
+        bitmap_ptr + physical * BITMAP_WORDS + word,
+        mask=valid & (offs < HEAD_DIM),
+        other=0,
+    )
+    kept = ((bm >> (63 - lane)) & 1).to(tl.int1)
+    rank = tl.cumsum(kept.to(tl.int32), axis=0) - 1
+    code = tl.load(
+        values_ptr + physical * KEEP_K + rank,
+        mask=valid & kept & (offs < NOPE_DIM),
+        other=0,
+    )
+    tl.store(raw_native_ptr + value_base + offs, code, mask=offs < NOPE_DIM)
+    for w in tl.static_range(0, BITMAP_WORDS - 1):
+        scale = tl.load(scales_ptr + physical * BITMAP_WORDS + w, mask=valid, other=0)
+        tl.store(raw_native_ptr + scale_base + w, scale)
+    # Only seven tiles are FP8; the final scale byte is padding for the BF16 tail.
+    tl.store(raw_native_ptr + scale_base + BITMAP_WORDS - 1, 0)
+
+    tail_pair = tl.arange(0, 32)
+    tail = tl.load(dense_ptr + row * HEAD_DIM + NOPE_DIM + tail_pair * 2)
+    tail_hi = tl.load(dense_ptr + row * HEAD_DIM + NOPE_DIM + tail_pair * 2 + 1)
+    pair0 = tail.to(tl.bfloat16).to(tl.uint16, bitcast=True)
+    pair1 = tail_hi.to(tl.bfloat16).to(tl.uint16, bitcast=True)
+    byte_base = value_base + NOPE_DIM + tail_pair * 4
+    tl.store(raw_native_ptr + byte_base, (pair0 & 0xFF).to(tl.uint8))
+    tl.store(raw_native_ptr + byte_base + 1, (pair0 >> 8).to(tl.uint8))
+    tl.store(raw_native_ptr + byte_base + 2, (pair1 & 0xFF).to(tl.uint8))
+    tl.store(raw_native_ptr + byte_base + 3, (pair1 >> 8).to(tl.uint8))

@@ -1751,11 +1751,16 @@ class DeepseekV4AttnBackend(
             direct_remnant_buffers = None
             direct_remnant_raw_indices = None
             direct_remnant_freqs = None
-            if compress_ratio == 4 and _sg_lr.packed_enabled() and _is_sm90:
+            if (
+                compress_ratio == 4
+                and _sg_lr.packed_enabled()
+                and _sg_lr.cache_implementation() == "kernel"
+                and _is_sm90
+            ):
                 direct_remnant_buffers = token_to_kv_pool.get_packed_buffers(layer_id)
                 direct_remnant_raw_indices = raw_indices
                 direct_remnant_freqs = torch.view_as_real(
-                    token_to_kv_pool.get_rope_freqs(layer_id)
+                    token_to_kv_pool.get_packed_freqs(layer_id)
                 )
             elif compress_ratio == 4 and _sg_lr.packed_enabled():
                 ## REMNANT (decode/small-extend native reconstruction)
