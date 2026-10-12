@@ -13,6 +13,8 @@
 # ==============================================================================
 """A single structured accessor for process-static runtime state.
 
+Author: Winston Cai.
+
 ``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / dcp / pp /
 moe / attn size and rank, plus the process-group handles — each delegate live to
 the canonical getter in ``distributed.parallel_state`` / ``layers.dp_attention``.
@@ -48,6 +50,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 import os
 import sys
@@ -1304,8 +1307,24 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    # Spawn unpickles resolved ServerArgs without running __post_init__. Restore
+    # process-local dispatch before ModelRunner sizes/creates KV pools or graphs.
+    # Partial test configs retain the public Native / Kernel defaults.
+    from sglang.srt import remnant
+
+    remnant.configure_cache_format(
+        getattr(server_args, "dsv4_c4_cache_format", "native"),
+        getattr(server_args, "dsv4_c4_cache_implementation", "kernel"),
+    )
     _CONTEXT.set_server_args(server_args)
     _CONTEXT._publish_role = role
+    if role == "scheduler":
+        logging.getLogger(__name__).info(
+            "C4 worker cache: pid=%d format=%s implementation=%s",
+            os.getpid(),
+            remnant.cache_format(),
+            remnant.cache_implementation(),
+        )
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
         # recording never ran (signal teardown skips atexit).
