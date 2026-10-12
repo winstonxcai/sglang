@@ -135,3 +135,93 @@ def test_triton_native_pages_match_independent_reference(strided, empty):
             torch.bfloat16
         )
         torch.testing.assert_close(actual_tail, expected_tail, atol=2e-2, rtol=2e-2)
+
+
+def test_prefill_widths_reuse_gather_kernels(monkeypatch):
+    """Growing contexts must not compile a new unpack/RoPE kernel per width."""
+    from collections import Counter
+
+    import triton
+
+    remnant.configure_cache_format("remnant", "triton")
+    torch.manual_seed(23)
+    latent = torch.randn((19, 512), dtype=torch.float32)
+    mask = topmag_keep_mask(latent, 0.5)
+    values, bitmaps, scales = pack_rows_ref(latent, mask, torch.ones(512), 1e-6)
+    decoded = unpack_rows_ref(values, bitmaps, scales)
+    dense_codes = torch.zeros_like(latent, dtype=torch.uint8)
+    dense_codes[mask] = values.reshape(-1)
+    workspace = NativeWorkspace.allocate(2, 768, 64, "cuda")
+    names = {
+        "_unpack_gather_bf16_kernel",
+        "_rope_tail_complex_inplace_kernel",
+        "_bf16_to_native_kernel",
+    }
+    compilations = Counter()
+
+    def record_compile(*args, **kwargs):
+        name = kwargs["fn"].name.rsplit(".", 1)[-1]
+        if name in names:
+            compilations[name] += 1
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", record_compile)
+    warm_counts = None
+    # Odd widths keep ordinary scalar alignment specialization unchanged.
+    # Row strides, Packed capacity and RoPE bounds all change independently.
+    for width, capacity, freq_rows in zip(
+        (513, 529, 547, 563), (7, 11, 15, 19), (32, 48, 64, 80)
+    ):
+        buffers = tuple(t[:capacity].cuda() for t in (values, bitmaps, scales))
+        physical = torch.arange(2 * width, dtype=torch.int32).reshape(2, width) % 7
+        raw = torch.arange(2 * width, dtype=torch.int32).reshape(2, width) % 21
+        physical[0, 0] = -1
+        physical[1, 0] = capacity
+        lengths = torch.tensor((width, width - 1), dtype=torch.int32)
+        angles = torch.arange(freq_rows * 32).reshape(freq_rows, 32) * 0.0017
+        freqs = torch.polar(torch.ones_like(angles), angles)
+        native, indices = unpack_gather_native(
+            buffers,
+            physical.cuda(),
+            raw.cuda(),
+            lengths.cuda(),
+            freqs.cuda(),
+            workspace,
+        )
+        torch.cuda.synchronize()
+        if warm_counts is None:
+            warm_counts = compilations.copy()
+        else:
+            assert compilations == warm_counts, (
+                f"prefill width={width}, capacity={capacity}, freq_rows={freq_rows} "
+                f"compiled additional gather kernels: {compilations - warm_counts}"
+            )
+
+        flat_physical, flat_raw = physical.flatten(), raw.flatten()
+        valid = (
+            (torch.arange(width)[None, :] < lengths[:, None]).flatten()
+            & (flat_physical >= 0)
+            & (flat_physical < capacity)
+            & (flat_raw * 4 < freq_rows)
+        )
+        expected = torch.zeros((2 * width, 512), dtype=torch.bfloat16)
+        expected[valid] = decoded[flat_physical[valid]]
+        tails = expected[valid, 448:].float().reshape(-1, 32, 2)
+        rotated = (
+            torch.view_as_complex(tails.contiguous()) * freqs[flat_raw[valid] * 4]
+        )
+        expected[valid, 448:] = (
+            torch.view_as_real(rotated).flatten(1).to(torch.bfloat16)
+        )
+        torch.testing.assert_close(
+            workspace.dense_bf16[: 2 * width].cpu(), expected, atol=2e-2, rtol=2e-2
+        )
+        assert torch.equal(indices.cpu().flatten(), torch.arange(2 * width))
+        native_cpu = native.cpu()
+        records = native_cpu[:, : 64 * 576].reshape(-1, 576)[: 2 * width]
+        expected_codes = torch.zeros((2 * width, 448), dtype=torch.uint8)
+        expected_codes[valid] = dense_codes[flat_physical[valid], :448]
+        assert torch.equal(records[:, :448], expected_codes)
+        actual_tail = records[:, 448:].contiguous().view(torch.bfloat16)
+        torch.testing.assert_close(
+            actual_tail, expected[:, 448:], atol=2e-2, rtol=2e-2
+        )

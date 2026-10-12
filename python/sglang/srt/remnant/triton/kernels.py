@@ -7,6 +7,18 @@ import triton
 import triton.language as tl
 
 
+# Prefill row pitches follow the live context length. Specializing these values
+# compiles new gather/RoPE kernels during replay; capacities can also differ
+# between otherwise equivalent server boots. Keep validation metadata runtime
+# while specializing fixed record geometry, element strides and launch settings.
+_GATHER_RUNTIME_PARAMETERS = (
+    "PHYSICAL_STRIDE_Q",
+    "RAW_STRIDE_Q",
+    "PACKED_ROWS",
+    "FREQ_ROWS",
+)
+
+
 @triton.jit
 def _pack_fp8_kernel(
     latent_ptr,
@@ -111,7 +123,7 @@ def _pack_fp8_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=_GATHER_RUNTIME_PARAMETERS)
 def _unpack_gather_bf16_kernel(
     values_ptr,
     bitmap_ptr,
@@ -126,13 +138,13 @@ def _unpack_gather_bf16_kernel(
     KEEP_K: tl.constexpr,
     BITMAP_WORDS: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    PHYSICAL_STRIDE_Q: tl.constexpr,
+    PHYSICAL_STRIDE_Q,
     PHYSICAL_STRIDE_K: tl.constexpr,
-    RAW_STRIDE_Q: tl.constexpr,
+    RAW_STRIDE_Q,
     RAW_STRIDE_K: tl.constexpr,
     LENGTH_STRIDE: tl.constexpr,
-    PACKED_ROWS: tl.constexpr,
-    FREQ_ROWS: tl.constexpr,
+    PACKED_ROWS,
+    FREQ_ROWS,
 ):
     """Gather packed rows and reconstruct pre-RoPE BF16 rows."""
     selected_row = tl.program_id(0)
@@ -180,7 +192,7 @@ def _unpack_gather_bf16_kernel(
     tl.store(output_ptr + selected_row * HEAD_DIM + offs, value, mask=in_bounds)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=_GATHER_RUNTIME_PARAMETERS)
 def _rope_tail_complex_inplace_kernel(
     dense_ptr,
     physical_indices_ptr,
@@ -192,13 +204,13 @@ def _rope_tail_complex_inplace_kernel(
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     ROPE_PAIRS: tl.constexpr,
-    PHYSICAL_STRIDE_Q: tl.constexpr,
+    PHYSICAL_STRIDE_Q,
     PHYSICAL_STRIDE_K: tl.constexpr,
-    RAW_STRIDE_Q: tl.constexpr,
+    RAW_STRIDE_Q,
     RAW_STRIDE_K: tl.constexpr,
     LENGTH_STRIDE: tl.constexpr,
-    PACKED_ROWS: tl.constexpr,
-    FREQ_ROWS: tl.constexpr,
+    PACKED_ROWS,
+    FREQ_ROWS,
 ):
     """Apply RoPE from a contiguous complex64 table without real/imag copies.
 
@@ -236,7 +248,7 @@ def _rope_tail_complex_inplace_kernel(
     tl.store(dense_ptr + base + 1, x_real * s + x_imag * c, mask=valid)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=_GATHER_RUNTIME_PARAMETERS)
 def _bf16_to_native_kernel(
     dense_ptr,
     bitmap_ptr,
@@ -255,13 +267,13 @@ def _bf16_to_native_kernel(
     KEEP_K: tl.constexpr,
     BITMAP_WORDS: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    PHYSICAL_STRIDE_Q: tl.constexpr,
+    PHYSICAL_STRIDE_Q,
     PHYSICAL_STRIDE_K: tl.constexpr,
-    RAW_STRIDE_Q: tl.constexpr,
+    RAW_STRIDE_Q,
     RAW_STRIDE_K: tl.constexpr,
     LENGTH_STRIDE: tl.constexpr,
-    PACKED_ROWS: tl.constexpr,
-    FREQ_ROWS: tl.constexpr,
+    PACKED_ROWS,
+    FREQ_ROWS,
 ):
     """Materialize gathered rows in FlashMLA's native hybrid page layout.
 
