@@ -141,6 +141,37 @@ class TestBatchAnnotations(unittest.TestCase):
                 run(scheduler, object())
         self.assertEqual(events, [{"step": 11, "rank": 2}, "closed"])
 
+    def test_builtin_nvtx_preserves_literal_json_and_pops_on_error(self):
+        label = 'scheduler.batch {"step":1,"requests":2}'
+        with (
+            patch.object(torch.cuda.nvtx, "range_push") as push,
+            patch.object(torch.cuda.nvtx, "range_pop") as pop,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forward failed"):
+                with helper._profile_range_impl(label, "red", False, True):
+                    raise RuntimeError("forward failed")
+        push.assert_called_once_with(label)
+        pop.assert_called_once_with()
+
+    def test_builtin_nvtx_probe(self):
+        with (
+            patch.object(helper, "NVTX_AVAILABLE", True),
+            patch.object(torch.cuda.nvtx, "range_push") as push,
+            patch.object(torch.cuda.nvtx, "range_pop") as pop,
+        ):
+            helper.validate_nvtx_backend()
+        push.assert_called_once_with("sglang.nvtx_preflight")
+        pop.assert_called_once_with()
+
+    def test_builtin_nvtx_probe_rejects_unsupported_build(self):
+        with (
+            patch.object(helper, "NVTX_AVAILABLE", False),
+            patch.object(torch.cuda.nvtx, "range_push") as push,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "CUDA-enabled PyTorch"):
+                helper.validate_nvtx_backend()
+        push.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
