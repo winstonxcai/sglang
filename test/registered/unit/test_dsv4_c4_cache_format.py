@@ -19,11 +19,12 @@ def _spawned_worker_modes(
 ) -> None:
     """Exercise the same publication hook used before ModelRunner pool sizing."""
 
-    def state() -> tuple[str, str, bool]:
+    def state() -> tuple[str, str, bool, str]:
         return (
             remnant.cache_format(),
             remnant.cache_implementation(),
             remnant.packed_enabled(),
+            remnant.cache_store_implementation(),
         )
 
     try:
@@ -94,7 +95,7 @@ class TestDSV4C4CacheFormat(CustomTestCase):
                 self.assertEqual(remnant.cache_implementation(), implementation)
                 self.assertTrue(remnant.packed_enabled())
 
-    def _worker_states(self, args: list[ServerArgs]) -> list[tuple[str, str, bool]]:
+    def _worker_states(self, args: list[ServerArgs]) -> list[tuple[str, str, bool, str]]:
         context = multiprocessing.get_context("spawn")
         receiver, sender = context.Pipe(duplex=False)
         worker = context.Process(target=_spawned_worker_modes, args=(args, sender))
@@ -139,10 +140,45 @@ class TestDSV4C4CacheFormat(CustomTestCase):
                 self.assertEqual(
                     self._worker_states([args]),
                     [
-                        ("native", "kernel", False),
-                        (cache_format, implementation, packed),
+                        ("native", "kernel", False, "kernel"),
+                        (cache_format, implementation, packed, implementation),
                     ],
                 )
+
+    def test_store_override_in_spawned_worker(self):
+        args = []
+        expected = [("native", "kernel", False, "kernel")]
+        for decode in ("triton", "kernel"):
+            for store in ("triton", "kernel"):
+                resolved = self._parse([
+                    "--dsv4-c4-cache-format", "remnant",
+                    "--dsv4-c4-cache-implementation", decode,
+                    "--dsv4-c4-cache-store-implementation", store,
+                ])
+                self.assertEqual(resolved.dsv4_c4_cache_store_implementation, store)
+                self.assertEqual(remnant.cache_implementation(), decode)
+                self.assertEqual(remnant.cache_store_implementation(), store)
+                args.append(resolved)
+                expected.append(("remnant", decode, True, store))
+        # Republishing without an override must clear the previous override.
+        args.append(self._parse([
+            "--dsv4-c4-cache-format", "remnant",
+            "--dsv4-c4-cache-implementation", "triton",
+        ]))
+        expected.append(("remnant", "triton", True, "triton"))
+        self.assertEqual(self._worker_states(args), expected)
+
+    def test_invalid_store_override_preserves_configuration(self):
+        remnant.configure_cache_format("remnant", "triton", "kernel")
+        with self.assertRaisesRegex(ValueError, "store_implementation"):
+            remnant.configure_cache_format("native", "kernel", "cuda")
+        self.assertEqual(remnant.cache_format(), "remnant")
+        self.assertEqual(remnant.cache_implementation(), "triton")
+        self.assertEqual(remnant.cache_store_implementation(), "kernel")
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args([
+                "--model", "dummy", "--dsv4-c4-cache-store-implementation", "cuda",
+            ])
 
     def test_worker_republication_replaces_previous_mode(self):
         modes = [("remnant", "triton"), ("remnant", "kernel"), ("native", "kernel")]
@@ -160,10 +196,10 @@ class TestDSV4C4CacheFormat(CustomTestCase):
         self.assertEqual(
             self._worker_states(args),
             [
-                ("native", "kernel", False),
-                ("remnant", "triton", True),
-                ("remnant", "kernel", True),
-                ("native", "kernel", False),
+                ("native", "kernel", False, "kernel"),
+                ("remnant", "triton", True, "triton"),
+                ("remnant", "kernel", True, "kernel"),
+                ("native", "kernel", False, "kernel"),
             ],
         )
 

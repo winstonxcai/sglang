@@ -1315,15 +1315,17 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     remnant.configure_cache_format(
         getattr(server_args, "dsv4_c4_cache_format", "native"),
         getattr(server_args, "dsv4_c4_cache_implementation", "kernel"),
+        getattr(server_args, "dsv4_c4_cache_store_implementation", None),
     )
     _CONTEXT.set_server_args(server_args)
     _CONTEXT._publish_role = role
     if role == "scheduler":
         logging.getLogger(__name__).info(
-            "C4 worker cache: pid=%d format=%s implementation=%s",
+            "C4 worker cache: pid=%d format=%s implementation=%s store=%s",
             os.getpid(),
             remnant.cache_format(),
             remnant.cache_implementation(),
+            remnant.cache_store_implementation(),
         )
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where

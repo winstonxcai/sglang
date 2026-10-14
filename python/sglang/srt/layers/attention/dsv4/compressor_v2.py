@@ -207,7 +207,7 @@ class CompressorBackendMixin:
                 packed_pool.set_rope_freqs(
                     packed_layer_id, freqs_cis_cache
                 )
-                if _sg_lr.cache_implementation() == "triton":
+                if _sg_lr.cache_store_implementation() == "triton":
                     keep_mask = _sg_lr.topmag_keep_mask(
                         kv_compressed, _sg_lr.topmag_keep()
                     )
