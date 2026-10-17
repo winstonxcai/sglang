@@ -1,4 +1,4 @@
-"""CUDA graph replay coverage for the fixed packed reconstruction path.
+"""CUDA graph replay coverage for startup-configured Packed reconstruction.
 
 Author: Winston Cai.
 """
@@ -17,7 +17,11 @@ from sglang.srt.remnant.packed import (
     unpack_gather_bf16,
     unpack_gather_native,
 )
-from sglang.srt.remnant.reference import pack_rows_ref, topmag_keep_mask
+from sglang.srt.remnant.reference import (
+    pack_rows_ref,
+    topmag_keep_mask,
+    unpack_rows_ref,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,12 +37,14 @@ class TestRemnantCudaGraph(CustomTestCase):
         remnant.configure_cache_format("native")
 
     def test_store_and_native_reconstruction_replays_changed_inputs(self):
-        for implementation in ("triton", "kernel"):
-            with self.subTest(implementation=implementation):
-                self._check_store_and_reconstruction_graph(implementation)
+        for implementation, keep_count in [("kernel", 256)] + [
+            ("triton", k) for k in (64, 128, 192, 256, 320, 384, 448)
+        ]:
+            with self.subTest(implementation=implementation, keep_count=keep_count):
+                self._check_store_and_reconstruction_graph(implementation, keep_count)
 
-    def _check_store_and_reconstruction_graph(self, implementation):
-        remnant.configure_cache_format("remnant", implementation)
+    def _check_store_and_reconstruction_graph(self, implementation, keep_count):
+        remnant.configure_cache_format("remnant", implementation, keep_count=keep_count)
         latent = torch.randn((4, 512), device="cuda", dtype=torch.float32)
         weight = torch.ones(512, device="cuda", dtype=torch.float32)
         words = torch.zeros((4, 4), device="cuda", dtype=torch.int32)
@@ -46,7 +52,7 @@ class TestRemnantCudaGraph(CustomTestCase):
         plan = CompressorDecodePlan(4, words.view(torch.uint8))
         locations = torch.arange(4, device="cuda", dtype=torch.int32)
         buffers = (
-            torch.zeros((4, 256), dtype=torch.uint8, device="cuda"),
+            torch.zeros((4, keep_count), dtype=torch.uint8, device="cuda"),
             torch.zeros((4, 8), dtype=torch.uint64, device="cuda"),
             torch.zeros((4, 8), dtype=torch.uint8, device="cuda"),
         )
@@ -65,7 +71,7 @@ class TestRemnantCudaGraph(CustomTestCase):
             if implementation == "triton":
                 pack_rows(
                     latent,
-                    topmag_keep_mask(latent, 0.5),
+                    topmag_keep_mask(latent, keep_count / 512),
                     weight,
                     1e-6,
                     plan,
@@ -97,7 +103,11 @@ class TestRemnantCudaGraph(CustomTestCase):
             # outside capture, then compare reconstruction with these live inputs.
             source = latent.cpu()
             packed = pack_rows_ref(
-                source, topmag_keep_mask(source, 0.5), weight.cpu(), 1e-6
+                source,
+                topmag_keep_mask(source, keep_count / 512),
+                weight.cpu(),
+                1e-6,
+                keep_count=keep_count,
             )
             for destination, reference in zip(reference_buffers, packed):
                 destination.view(torch.uint8)[locations.long()] = reference.view(
@@ -142,6 +152,81 @@ class TestRemnantCudaGraph(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(output, first))
         remnant.configure_cache_format("native")
+
+    def test_consecutive_mixed_layers_replay_with_stable_buffers(self):
+        counts = (128, 192, 256, 320)
+        remnant.configure_cache_format(
+            "remnant",
+            "triton",
+            keep_count=128,
+            layer_keep_counts='{"1":192,"2":256,"3":320}',
+            compression_ratios=(4,) * 4,
+        )
+        latents = [torch.randn(4, 512, device="cuda") for _ in counts]
+        weight = torch.ones(512, device="cuda")
+        words = torch.zeros((4, 4), dtype=torch.int32, device="cuda")
+        words[:, 0] = 4
+        plan = CompressorDecodePlan(4, words.view(torch.uint8))
+        locations = torch.arange(4, dtype=torch.int32, device="cuda")
+        physical = torch.arange(4, dtype=torch.int32, device="cuda").view(1, 4)
+        raw = torch.zeros_like(physical)
+        lengths = torch.tensor([4], dtype=torch.int32, device="cuda")
+        freqs = torch.ones((16, 32), dtype=torch.complex64, device="cuda")
+        buffers = [
+            (
+                torch.zeros((4, k), dtype=torch.uint8, device="cuda"),
+                torch.zeros((4, 8), dtype=torch.uint64, device="cuda"),
+                torch.zeros((4, 8), dtype=torch.uint8, device="cuda"),
+            )
+            for k in counts
+        ]
+        outputs = [
+            torch.empty((4, 512), dtype=torch.bfloat16, device="cuda") for _ in counts
+        ]
+        addresses = [tensor.data_ptr() for group in buffers for tensor in group]
+
+        def pipeline():
+            for x, k, planes, output in zip(latents, counts, buffers, outputs):
+                pack_rows(
+                    x,
+                    topmag_keep_mask(x, k / 512),
+                    weight,
+                    1e-6,
+                    plan,
+                    locations,
+                    planes,
+                )
+                unpack_gather_bf16(planes, physical, raw, lengths, freqs, output)
+
+        pipeline()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            pipeline()
+        for iteration in range(2):
+            for x in latents:
+                x.normal_()
+            locations.copy_(locations.roll(1))
+            physical.copy_(physical.roll(1, dims=1))
+            lengths.fill_(4 - iteration)
+            graph.replay()
+            for x, k, output in zip(latents, counts, outputs):
+                source = x.cpu()
+                planes = pack_rows_ref(
+                    source,
+                    topmag_keep_mask(source, k / 512),
+                    weight.cpu(),
+                    1e-6,
+                    keep_count=k,
+                )
+                dense = unpack_rows_ref(*planes)
+                stored = torch.empty_like(dense)
+                stored[locations.cpu().long()] = dense
+                expected = stored[physical.cpu().long().flatten()]
+                expected[4 - iteration :] = 0
+                self.assertTrue(torch.equal(output.cpu(), expected))
+            self.assertEqual(
+                addresses, [t.data_ptr() for group in buffers for t in group]
+            )
 
 
 if __name__ == "__main__":

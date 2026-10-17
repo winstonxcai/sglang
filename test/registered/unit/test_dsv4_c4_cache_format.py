@@ -249,6 +249,66 @@ class TestDSV4C4CacheFormat(CustomTestCase):
                 ]
             )
 
+    def test_per_layer_counts_publish_and_reset(self):
+        args = self._parse(
+            [
+                "--dsv4-c4-cache-format",
+                "remnant",
+                "--dsv4-c4-cache-implementation",
+                "triton",
+                "--dsv4-c4-cache-keep-count",
+                "192",
+                "--dsv4-c4-cache-layer-keep-counts",
+                '{"4":320}',
+            ]
+        )
+        args._dsv4_c4_cache_compression_ratios = (0, 128, 4, 128, 4)
+        set_global_server_args_for_scheduler(args)
+        self.assertEqual(
+            [
+                (x.layer_id, x.keep_count)
+                for x in remnant.packed_layouts(args._dsv4_c4_cache_compression_ratios)
+            ],
+            [(2, 192), (4, 320)],
+        )
+        previous = remnant.packed_profile()
+        with self.assertRaises(ValueError):
+            set_global_server_args_for_scheduler(
+                SimpleNamespace(
+                    dsv4_c4_cache_format="remnant",
+                    dsv4_c4_cache_implementation="triton",
+                    dsv4_c4_cache_keep_count=512,
+                )
+            )
+        from sglang.srt.runtime_context import get_server_args
+
+        self.assertIs(get_server_args(), args)
+        self.assertIs(remnant.packed_profile(), previous)
+        set_global_server_args_for_scheduler(SimpleNamespace())
+        self.assertEqual(remnant.packed_profile().default_count, 256)
+        self.assertEqual(remnant.packed_profile().overrides, ())
+        self.assertIsNone(remnant.packed_profile().compression_ratios)
+
+    def test_invalid_cli_counts_and_nontriton_modes(self):
+        base = [
+            "--dsv4-c4-cache-format",
+            "remnant",
+            "--dsv4-c4-cache-implementation",
+            "triton",
+        ]
+        for count in (0, 65, 512):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                self._parse([*base, "--dsv4-c4-cache-keep-count", str(count)])
+        for overrides in ("[]", '{"2":192,"2":256}', '{"2":true}'):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                self._parse([*base, "--dsv4-c4-cache-layer-keep-counts", overrides])
+        for extra in (
+            ["--dsv4-c4-cache-store-implementation", "kernel"],
+            ["--enable-hierarchical-cache"],
+        ):
+            with self.assertRaises(ValueError):
+                self._parse([*base, "--dsv4-c4-cache-keep-count", "192", *extra])
+
     def test_existing_callers_default_to_kernel(self):
         remnant.configure_cache_format("remnant", "triton")
         remnant.configure_cache_format("remnant")

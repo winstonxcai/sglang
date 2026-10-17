@@ -3,11 +3,11 @@
 Author: Winston Cai.
 """
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -57,17 +57,21 @@ def test_remnant_triton_unpack_reconstructs_selected_row():
     remnant.configure_cache_format("native")
 
 
+@pytest.mark.parametrize("keep_count", [64, 128, 192, 256, 320, 384, 448])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("empty", [None, "queries", "selections"])
-def test_triton_native_pages_match_independent_reference(strided, empty):
+def test_triton_native_pages_match_independent_reference(strided, empty, keep_count):
+    # A 256 default must not override the individual buffer's survivor width.
     remnant.configure_cache_format("remnant", "triton")
     torch.manual_seed(19)
     latent = torch.randn((6, 512), dtype=torch.float32)
     latent[0].zero_()
     latent[1].fill_(1)  # cutoff ties use the existing selection policy
     latent[2, ::3] = 0
-    mask = topmag_keep_mask(latent, 0.5)
-    values, bitmaps, scales = pack_rows_ref(latent, mask, torch.ones(512), 1e-6)
+    mask = topmag_keep_mask(latent, keep_count / 512)
+    values, bitmaps, scales = pack_rows_ref(
+        latent, mask, torch.ones(512), 1e-6, keep_count=keep_count
+    )
     buffers = tuple(t.cuda() for t in (values, bitmaps, scales))
     decoded = unpack_rows_ref(values, bitmaps, scales)
     dense_codes = torch.zeros((6, 512), dtype=torch.uint8)
@@ -269,6 +273,7 @@ def main_packed(monkeypatch):
 def test_triton_matches_main_packed(main_packed, is_decode, selected_k):
     """Exact parity on shared valid inputs, including stock attention output/LSE."""
     from sgl_kernel import flash_mla
+
     from sglang.srt.remnant.packed import pack_rows
 
     historical, historical_reference = main_packed

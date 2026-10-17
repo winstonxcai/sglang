@@ -685,13 +685,25 @@ class ServerArgs:
         Arg(
             help=(
                 "DeepSeek V4 compressed C4 cache format. 'native' keeps the "
-                "stock SGLang layout; 'remnant' uses the persistent 328-byte "
-                "TopMag50 packed layout."
+                "stock SGLang layout; 'remnant' uses persistent Packed C4 "
+                "records (328 bytes at the default 256 survivors)."
             ),
             choices=["native", "remnant"],
         ),
         NS("model"),
     ] = "native"
+    dsv4_c4_cache_keep_count: A[
+        int,
+        Arg(help="Packed C4 survivors per layer (64..448 in steps of 64)."),
+        NS("model"),
+    ] = 256
+    dsv4_c4_cache_layer_keep_counts: A[
+        Optional[str],
+        Arg(
+            help='Packed C4 overrides as JSON keyed by zero-based model layer ID, e.g. {"2":192}.'
+        ),
+        NS("model"),
+    ] = None
     dsv4_c4_cache_implementation: A[
         str,
         Arg(
@@ -3629,19 +3641,26 @@ class ServerArgs:
     def _configure_dsv4_c4_cache_format(self) -> None:
         from sglang.srt import remnant
 
-        remnant.configure_cache_format(
-            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation,
-            getattr(self, "dsv4_c4_cache_store_implementation", None),
-        )
+        remnant.configure_from_args(self, publish=False)
         if self.dsv4_c4_cache_format != "remnant":
+            remnant.configure_from_args(self)
             return
 
         from sglang.srt.configs.model_config import is_deepseek_v4
 
-        if not is_deepseek_v4(self.get_model_config().hf_config):
+        hf_config = self.get_model_config().hf_config
+        if not is_deepseek_v4(hf_config):
             raise ValueError(
                 "--dsv4-c4-cache-format remnant requires a DeepSeek V4 model"
             )
+        ratios = getattr(hf_config, "compress_ratios", None)
+        if ratios is None and (
+            getattr(self, "dsv4_c4_cache_keep_count", 256) != 256
+            or getattr(self, "dsv4_c4_cache_layer_keep_counts", None) is not None
+        ):
+            raise ValueError("Packed layer counts require model compress_ratios")
+        # The tuple travels with ServerArgs when spawned workers restore configuration.
+        remnant.configure_from_args(self, compression_ratios=ratios, publish=False)
         incompatible = []
         if self.enable_hisparse:
             incompatible.append("--enable-hisparse")
@@ -3673,6 +3692,11 @@ class ServerArgs:
                 "--dsv4-c4-cache-format remnant is incompatible with "
                 + ", ".join(incompatible)
             )
+
+        remnant.configure_from_args(self, compression_ratios=ratios)
+        self._dsv4_c4_cache_compression_ratios = (
+            None if ratios is None else tuple(ratios)
+        )
 
     def _run_resolution_pipeline(self):
         """
@@ -3706,16 +3730,14 @@ class ServerArgs:
 
         from sglang.srt import remnant
 
-        remnant.configure_cache_format(
-            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation,
-            getattr(self, "dsv4_c4_cache_store_implementation", None),
-        )
+        remnant.configure_from_args(self, publish=False)
 
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         if self.model_path.lower() in ["none", "dummy"]:
+            remnant.configure_from_args(self)
             return
 
         self._handle_model_source_paths()

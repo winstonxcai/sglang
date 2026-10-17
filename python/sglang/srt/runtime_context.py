@@ -1312,11 +1312,7 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     # Partial test configs retain the public Native / Kernel defaults.
     from sglang.srt import remnant
 
-    remnant.configure_cache_format(
-        getattr(server_args, "dsv4_c4_cache_format", "native"),
-        getattr(server_args, "dsv4_c4_cache_implementation", "kernel"),
-        getattr(server_args, "dsv4_c4_cache_store_implementation", None),
-    )
+    remnant.configure_from_args(server_args)
     _CONTEXT.set_server_args(server_args)
     _CONTEXT._publish_role = role
     if role == "scheduler":

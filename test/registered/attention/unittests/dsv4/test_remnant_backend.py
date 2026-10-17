@@ -38,13 +38,19 @@ class TestRemnantBackend(CustomTestCase):
                     self.assertIsNone(workspace.dense_bf16)
 
     def test_triton_materialization_uses_strides_and_dense_destination_indices(self):
+        for keep_count in (64, 128, 192, 256, 320, 384, 448):
+            with self.subTest(keep_count=keep_count):
+                self._check_triton_materialization(keep_count)
+
+    def _check_triton_materialization(self, keep_count):
+        # Default stays 256: the wrapper must derive each layer's actual width.
         remnant.configure_cache_format("remnant", "triton")
         workspace = NativeWorkspace.allocate(2, 8, 64, "cpu")
         physical = torch.zeros((2, 10), dtype=torch.int32)[:, :3]
         raw = torch.zeros((2, 9), dtype=torch.int32)[:, :3]
         lengths = torch.tensor([3, 1], dtype=torch.int32)
         buffers = (
-            torch.zeros((4, 256), dtype=torch.uint8),
+            torch.zeros((4, keep_count), dtype=torch.uint8),
             torch.zeros((4, 8), dtype=torch.uint64),
             torch.zeros((4, 8), dtype=torch.uint8),
         )
@@ -78,6 +84,8 @@ class TestRemnantBackend(CustomTestCase):
         materialize.__getitem__.assert_called_once_with((6,))
         launch = materialize.__getitem__.return_value
         launch.assert_called_once()
+        self.assertEqual(launch.call_args.kwargs["KEEP_K"], keep_count)
+        self.assertEqual(launch.call_args.kwargs["PACKED_ROWS"], 4)
         self.assertEqual(launch.call_args.kwargs["PHYSICAL_STRIDE_Q"], 10)
         self.assertEqual(launch.call_args.kwargs["RAW_STRIDE_Q"], 9)
         self.assertEqual(

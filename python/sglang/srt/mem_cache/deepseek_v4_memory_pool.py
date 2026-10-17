@@ -183,9 +183,47 @@ class DeepSeekV4SingleKVPool(KVCache):
 
 ## REMNANT (packed-pool)
 class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
-    """Persistent 328-byte/page-row packed storage (no native shadow pool)."""
+    """Persistent per-layer Packed planes, with no Native shadow pool."""
+
+    def __init__(
+        self,
+        *args,
+        layouts: tuple[_sg_lr.PackedLayerLayout, ...] | None = None,
+        **kwargs,
+    ):
+        self.layouts = None if layouts is None else tuple(layouts)
+        super().__init__(*args, **kwargs)
+
+    def get_packed_layout(self, layer_id: int) -> _sg_lr.PackedLayerLayout:
+        return self.layouts[self._local_layer_index(layer_id)]
+
+    def _local_layer_index(self, layer_id: int) -> int:
+        local = layer_id - self.start_layer
+        if not 0 <= local < self.layer_num:
+            raise IndexError(
+                f"Packed C4-pool layer {layer_id} is outside [{self.start_layer}, {self.start_layer + self.layer_num})"
+            )
+        return local
 
     def _create_buffers(self):
+        if self.layouts is None:
+            profile = _sg_lr.packed_profile()
+            if profile.overrides:
+                raise ValueError(
+                    "Packed layer overrides require explicit model-to-pool layouts"
+                )
+            self.layouts = tuple(
+                _sg_lr.PackedLayerLayout(i, profile.default_count)
+                for i in range(self.layer_num)
+            )
+        if len(self.layouts) != self.layer_num:
+            raise ValueError("Packed layout count must match local C4 layer count")
+        counts = tuple(layout.keep_count for layout in self.layouts)
+        # Scalar compatibility metadata exists only when every layer has one layout.
+        self.record_bytes_by_layer = tuple(
+            layout.record_bytes for layout in self.layouts
+        )
+
         num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -195,10 +233,13 @@ class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
             ):
                 self.packed_values = [
                     torch.zeros(
-                        num_pages, self.page_size, 256,
-                        dtype=torch.uint8, device=self.device,
+                        num_pages,
+                        self.page_size,
+                        count,
+                        dtype=torch.uint8,
+                        device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for count in counts
                 ]
                 self.packed_bitmaps = [
                     torch.zeros(
@@ -217,23 +258,35 @@ class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
         # Compatibility only: generic lifecycle code expects this attribute.
         # It must never be treated as a native hybrid allocation.
         self.kv_buffer = self.packed_values
-        self.kv_cache_total_dim = 328
-        self.bytes_per_page_padded = self.page_size * 328
+        uniform = len(set(self.record_bytes_by_layer)) <= 1
+        self.kv_cache_total_dim = (
+            self.record_bytes_by_layer[0] if uniform and self.layouts else None
+        )
+        self.bytes_per_page_padded = (
+            self.page_size * self.kv_cache_total_dim
+            if self.kv_cache_total_dim is not None
+            else None
+        )
         self._remnant_rope_freqs = [None] * self.layer_num
         logger.info(
             "Remnant packed pool: layers=%d pages/layer=%d "
-            "page_size=%d logical_row_bytes=328 allocated_bytes=%d",
+            "page_size=%d model_layer_counts=%s allocated_bytes=%d",
             self.layer_num,
             num_pages,
             self.page_size,
+            tuple((layout.layer_id, layout.keep_count) for layout in self.layouts),
             self.get_kv_size_bytes(),
         )
 
-    def get_bytes_per_token(self) -> int:
-        return 328
+    def get_bytes_per_token(self, layer_id: int | None = None) -> int:
+        if layer_id is not None:
+            return self.get_packed_layout(layer_id).record_bytes
+        if len(set(self.record_bytes_by_layer)) != 1:
+            raise ValueError("heterogeneous Packed geometry requires a layer index")
+        return self.record_bytes_by_layer[0]
 
     def get_packed_buffers(self, layer_id: int):
-        local = layer_id - self.start_layer
+        local = self._local_layer_index(layer_id)
         return (
             self.packed_values[local],
             self.packed_bitmaps[local],
@@ -241,7 +294,7 @@ class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
         )
 
     def set_rope_freqs(self, layer_id: int, freqs_cis) -> None:
-        local = layer_id - self.start_layer
+        local = self._local_layer_index(layer_id)
         if self._remnant_rope_freqs[local] is None:
             if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
                 raise RuntimeError(
@@ -253,7 +306,7 @@ class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
             self._remnant_rope_freqs[local] = freqs_cis
 
     def get_rope_freqs(self, layer_id: int):
-        local = layer_id - self.start_layer
+        local = self._local_layer_index(layer_id)
         value = self._remnant_rope_freqs[local]
         if value is None:
             raise RuntimeError("packed RoPE frequencies not initialized")
@@ -279,7 +332,7 @@ class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
     def get_buf_infos(self):
         ptrs, lens, items = [], [], []
         for layer in range(self.layer_num):
-            for buf in self.get_packed_buffers(layer):
+            for buf in self.get_packed_buffers(self.start_layer + layer):
                 ptrs.append(buf.data_ptr())
                 lens.append(buf.nbytes)
                 items.append(buf[0].nbytes)
@@ -974,6 +1027,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
         del global_page_size  # CUDA pools key only off their own page_size
+        extra = {}
+        if cls is RemnantPackedKVPool:
+            extra["layouts"] = _sg_lr.packed_layouts(
+                self.compression_ratios, self._stage_start, self._stage_end
+            )
         return cls(
             size,
             page_size,
@@ -983,6 +1041,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            **extra,
         )
 
     def _make_indexer_pool(

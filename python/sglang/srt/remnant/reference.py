@@ -82,22 +82,25 @@ def pack_rows_ref(
     keep_mask: torch.Tensor,
     norm_weight: torch.Tensor,
     norm_eps: float,
+    *,
+    keep_count: int = config.PACKED_KEPT_VALUES,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pure-Torch row-format reference, independent of page locations."""
+    config.validate_keep_count(keep_count)
     if keep_mask.dtype != torch.bool or keep_mask.shape != latent.shape:
         raise ValueError("keep_mask must be bool and match latent")
     if latent.shape[-1] != config.HEAD_DIM:
         raise ValueError("packed rows must have 512 coordinates")
-    if latent.shape[0] and not bool(
-        (keep_mask.sum(-1) == config.PACKED_KEPT_VALUES).all()
-    ):
-        raise ValueError("every packed row must retain exactly 256 coordinates")
+    if latent.shape[0] and not bool((keep_mask.sum(-1) == keep_count).all()):
+        raise ValueError(
+            f"every packed row must retain exactly {keep_count} coordinates"
+        )
     masked = latent.float().masked_fill(~keep_mask, 0.0)
     inv_rms = torch.rsqrt(masked.square().mean(-1, keepdim=True) + norm_eps)
     normalized = (masked * inv_rms * norm_weight.float()).to(torch.bfloat16)
     quantized, scales = _ue8m0_quantize(normalized)
     columns = torch.nonzero(keep_mask, as_tuple=False)[:, 1].reshape(
-        latent.shape[0], config.PACKED_KEPT_VALUES
+        latent.shape[0], keep_count
     )
     codes = quantized.view(torch.uint8).gather(1, columns)
     bitmaps = mask_to_bitmap(keep_mask).view(torch.uint64)

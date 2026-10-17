@@ -217,8 +217,11 @@ class CompressorBackendMixin:
                     packed_layer_id, freqs_cis_cache
                 )
                 if _sg_lr.cache_store_implementation() == "triton":
+                    keep_count = packed_pool.get_packed_buffers(packed_layer_id)[
+                        0
+                    ].shape[-1]
                     keep_mask = _sg_lr.topmag_keep_mask(
-                        kv_compressed, _sg_lr.topmag_keep()
+                        kv_compressed, keep_count / _sg_lr.HEAD_DIM
                     )
                     _sg_lr.pack_rows(
                         kv_compressed, keep_mask, norm.weight,

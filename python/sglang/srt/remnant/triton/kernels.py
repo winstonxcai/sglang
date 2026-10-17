@@ -1,4 +1,4 @@
-"""Triton kernels for persistent 328-byte FP8 records.
+"""Triton kernels for persistent per-layer Packed FP8 records.
 
 Author: Winston Cai.
 """
@@ -178,7 +178,7 @@ def _unpack_gather_bf16_kernel(
     rank = tl.cumsum(kept.to(tl.int32), axis=0) - 1
     code = tl.load(
         values_ptr + physical * KEEP_K + rank,
-        mask=valid & kept & in_bounds,
+        mask=valid & kept & in_bounds & (rank < KEEP_K),
         other=0,
     ).to(tl.uint8)
     fp8 = code.to(tl.float8e4nv, bitcast=True).to(tl.float32)
@@ -320,7 +320,7 @@ def _bf16_to_native_kernel(
     rank = tl.cumsum(kept.to(tl.int32), axis=0) - 1
     code = tl.load(
         values_ptr + physical * KEEP_K + rank,
-        mask=valid & kept & (offs < NOPE_DIM),
+        mask=valid & kept & (offs < NOPE_DIM) & (rank < KEEP_K),
         other=0,
     )
     tl.store(raw_native_ptr + value_base + offs, code, mask=offs < NOPE_DIM)

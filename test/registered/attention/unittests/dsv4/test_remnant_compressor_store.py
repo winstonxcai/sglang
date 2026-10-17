@@ -17,10 +17,13 @@ from sglang.srt import remnant
 from sglang.srt.layers.attention.dsv4 import compressor_v2 as module
 
 
+@pytest.mark.parametrize(
+    "implementation,keep_count",
+    [("kernel", 256)] + [("triton", k) for k in (64, 128, 192, 256, 320, 384, 448)],
+)
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
 @pytest.mark.parametrize("mode", ["packed", "native", "c128", "indexer"])
-@pytest.mark.parametrize("implementation", ["triton", "kernel"])
-def test_compressor_routes_store(phase, mode, implementation):
+def test_compressor_routes_store(phase, mode, implementation, keep_count):
     ratio = 128 if mode == "c128" else 4
     dim = 128 if mode == "indexer" else 512
     latent = torch.randn((2, dim), dtype=torch.float32)
@@ -36,11 +39,14 @@ def test_compressor_routes_store(phase, mode, implementation):
     )
     backend = SimpleNamespace(_get_paged_compress_metadata=lambda unused: plan)
     pool = mock.Mock()
+    pool.get_packed_buffers.return_value = (
+        torch.empty((1, 64, keep_count), dtype=torch.uint8),
+    )
     remnant.configure_cache_format(
         "native" if mode == "native" else "remnant", implementation
     )
     keep_mask = torch.zeros_like(latent, dtype=torch.bool)
-    keep_mask[:, :256] = True
+    keep_mask[:, :keep_count] = True
     try:
         with (
             mock.patch.object(module, "compress_forward", return_value=latent),
@@ -74,7 +80,7 @@ def test_compressor_routes_store(phase, mode, implementation):
             )
             if mode == "packed":
                 if implementation == "triton":
-                    select.assert_called_once_with(latent, 0.5)
+                    select.assert_called_once_with(latent, keep_count / 512)
                     explicit.assert_called_once()
                     assert explicit.call_args.args[0] is latent
                     assert explicit.call_args.args[1] is keep_mask

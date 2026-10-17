@@ -1,4 +1,4 @@
-"""Persistent 328-byte TopMag50 layout and production wrappers.
+"""Persistent per-layer Packed layout and production wrappers.
 
 Author: Winston Cai.
 """
@@ -14,6 +14,13 @@ from . import config
 
 
 class PackedBuffers(NamedTuple):
+    """Pool-owned contiguous planes on one device, shared by store and readers.
+
+    Values hold FP8 codes as uint8 [pages, rows, k] (or flattened [rows, k]);
+    bitmap uint64 and scale uint8 planes share those row dimensions and have
+    eight entries per row. The startup layout fixes k for the buffer lifetime.
+    """
+
     values: torch.Tensor
     bitmaps: torch.Tensor
     scales: torch.Tensor
@@ -71,6 +78,7 @@ class NativeWorkspace:
 
 def _as_buffers(packed_buffers, layer_id: int | None = None) -> PackedBuffers:
     if isinstance(packed_buffers, PackedBuffers):
+        _buffer_keep_count(packed_buffers)
         return packed_buffers
     # The injected SGLang pool accessor deliberately exposes the stable
     # value/bitmap/scale ABI as a plain tuple. Normalize that form before
@@ -82,15 +90,50 @@ def _as_buffers(packed_buffers, layer_id: int | None = None) -> PackedBuffers:
             raise TypeError(
                 "packed buffer sequences must contain value, bitmap, and scale tensors"
             )
-        return PackedBuffers(*packed_buffers)
+        buffers = PackedBuffers(*packed_buffers)
+        _buffer_keep_count(buffers)
+        return buffers
     if hasattr(packed_buffers, "get_packed_buffers"):
         if layer_id is None:
             raise ValueError("layer_id is required for a packed pool")
-        return PackedBuffers(*packed_buffers.get_packed_buffers(layer_id))
+        buffers = _as_buffers(packed_buffers.get_packed_buffers(layer_id))
+        if hasattr(packed_buffers, "get_packed_layout"):
+            if (
+                buffers.values.shape[-1]
+                != packed_buffers.get_packed_layout(layer_id).keep_count
+            ):
+                raise ValueError(
+                    "Packed buffer width differs from resolved layer layout"
+                )
+        return buffers
     raise TypeError(
         "packed_buffers must be PackedBuffers, a three-tensor sequence, "
         "or a packed pool"
     )
+
+
+def _buffer_keep_count(buffers: PackedBuffers) -> int:
+    """Inspect host tensor metadata only; no tensor reads or CUDA synchronization."""
+    if buffers.values.ndim not in (2, 3):
+        raise ValueError("Packed values must be [rows, k] or [pages, rows, k]")
+    count = config.validate_keep_count(buffers.values.shape[-1])
+    prefix = buffers.values.shape[:-1]
+    if buffers.bitmaps.shape != (
+        *prefix,
+        config.BITMAP_WORDS,
+    ) or buffers.scales.shape != (*prefix, config.BITMAP_WORDS):
+        raise ValueError(
+            "Packed values, bitmap and scale planes must have matching row geometry"
+        )
+    if count != config.PACKED_KEPT_VALUES:
+        if (
+            config.cache_implementation() != "triton"
+            or config.cache_store_implementation() != "triton"
+        ):
+            raise ValueError(
+                "non-256 Packed buffers require Triton storage and reconstruction"
+            )
+    return count
 
 
 def _plan_rows(compressor_plan: object) -> torch.Tensor:
@@ -135,7 +178,7 @@ def pack_rows(
         latent.shape[0],
         norm_eps=norm_eps,
         HEAD_DIM=config.HEAD_DIM,
-        KEEP_K=config.PACKED_KEPT_VALUES,
+        KEEP_K=_buffer_keep_count(buffers),
         TILE_SIZE=config.TILE_SIZE,
         BITMAP_WORDS=config.BITMAP_WORDS,
         FP8_MAX=config.FP8_E4M3_MAX,
@@ -166,6 +209,8 @@ def pack_rows_fused(
     if latent.numel() == 0:
         return
     buffers = _as_buffers(packed_buffers, layer_id)
+    if _buffer_keep_count(buffers) != config.PACKED_KEPT_VALUES:
+        raise ValueError("fused Packed storage supports only 256 survivors")
     supported = (
         latent.is_cuda
         and not torch.version.hip
@@ -206,7 +251,7 @@ def pack_rows_fused(
         latent.shape[0],
         norm_eps=norm_eps,
         HEAD_DIM=config.HEAD_DIM,
-        KEEP_K=config.PACKED_KEPT_VALUES,
+        KEEP_K=_buffer_keep_count(buffers),
         TILE_SIZE=config.TILE_SIZE,
         BITMAP_WORDS=config.BITMAP_WORDS,
         FP8_MAX=config.FP8_E4M3_MAX,
@@ -265,7 +310,7 @@ def unpack_gather_bf16(
         n_queries,
         selected_k,
         HEAD_DIM=config.HEAD_DIM,
-        KEEP_K=config.PACKED_KEPT_VALUES,
+        KEEP_K=_buffer_keep_count(buffers),
         BITMAP_WORDS=config.BITMAP_WORDS,
         BLOCK_D=config.HEAD_DIM,
         PHYSICAL_STRIDE_Q=physical_indices.stride(0),
@@ -273,7 +318,7 @@ def unpack_gather_bf16(
         RAW_STRIDE_Q=raw_indices.stride(0),
         RAW_STRIDE_K=raw_indices.stride(1),
         LENGTH_STRIDE=topk_lengths.stride(0),
-        PACKED_ROWS=buffers.values.numel() // config.PACKED_KEPT_VALUES,
+        PACKED_ROWS=buffers.values.numel() // _buffer_keep_count(buffers),
         FREQ_ROWS=freqs_cis.numel() // (config.ROPE_DIM // 2),
         num_warps=8,
     )
@@ -296,7 +341,7 @@ def unpack_gather_bf16(
         RAW_STRIDE_Q=raw_indices.stride(0),
         RAW_STRIDE_K=raw_indices.stride(1),
         LENGTH_STRIDE=topk_lengths.stride(0),
-        PACKED_ROWS=buffers.values.numel() // config.PACKED_KEPT_VALUES,
+        PACKED_ROWS=buffers.values.numel() // _buffer_keep_count(buffers),
         FREQ_ROWS=freqs_cis.numel() // (config.ROPE_DIM // 2),
         num_warps=1,
     )
@@ -366,7 +411,7 @@ def unpack_gather_native(
                 bytes_per_page=native_workspace.bytes_per_page,
                 HEAD_DIM=config.HEAD_DIM,
                 NOPE_DIM=config.NOPE_DIM,
-                KEEP_K=config.PACKED_KEPT_VALUES,
+                KEEP_K=_buffer_keep_count(buffers),
                 BITMAP_WORDS=config.BITMAP_WORDS,
                 BLOCK_D=config.HEAD_DIM,
                 PHYSICAL_STRIDE_Q=physical_indices.stride(0),
@@ -374,7 +419,7 @@ def unpack_gather_native(
                 RAW_STRIDE_Q=raw_indices.stride(0),
                 RAW_STRIDE_K=raw_indices.stride(1),
                 LENGTH_STRIDE=topk_lengths.stride(0),
-                PACKED_ROWS=buffers.values.numel() // config.PACKED_KEPT_VALUES,
+                PACKED_ROWS=buffers.values.numel() // _buffer_keep_count(buffers),
                 FREQ_ROWS=freqs_cis.numel() // (config.ROPE_DIM // 2),
                 num_warps=8,
             )

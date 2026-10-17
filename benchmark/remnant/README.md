@@ -17,7 +17,12 @@ serving TPOT, TTFT, SLO capacity, or task quality.
 | `triton` | Packed unpacking, RoPE, Native materialization, stock FlashMLA, combine | Production raw-magnitude selection and Packed storage |
 | `kernel` | Direct Packed FlashMLA and combine | Fused FP32 selection, normalization and Packed storage |
 
-Packed retains 256/512 coordinates in 328 bytes. Native has 584 logical bytes.
+The default benchmark retains 256/512 coordinates in 328 bytes. Native has
+584 logical bytes. Startup per-layer counts are supported only by the Triton
+serving path (64..448 in steps of 64). The optimized Kernel benchmark remains
+256-only; the frozen timing matrix is unchanged. Smaller configured records
+require separate GPU correctness qualification, not reinterpretation of these
+historical timings.
 Stores exclude compressor projection and common compressor computation. Native
 invalid destinations are encoded as skipped plan entries before timing; its
 production writer does not accept negative destination pointers.

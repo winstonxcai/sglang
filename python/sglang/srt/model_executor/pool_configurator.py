@@ -735,6 +735,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
         ]
+        self.packed_c4_layouts = (
+            _sg_lr.packed_layouts(
+                cfg.compress_ratios,
+                kvc.layer_info.start_layer,
+                kvc.layer_info.end_layer,
+            )
+            if _sg_lr.packed_enabled()
+            else ()
+        )
         if kvc.ps.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
@@ -873,8 +882,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return (
             self.swa_ratio * kv_bytes * self.num_layers_total
             + c4_frac
-            * (_sg_lr.PACKED_RECORD_BYTES if _sg_lr.packed_enabled() else kv_bytes)
-            * self.num_layers_ca4
+            * (
+                sum(layout.record_bytes for layout in self.packed_c4_layouts)
+                if _sg_lr.packed_enabled()
+                else kv_bytes * self.num_layers_ca4
+            )
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
