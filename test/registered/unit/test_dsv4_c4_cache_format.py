@@ -4,15 +4,52 @@ Author: Winston Cai.
 """
 
 import argparse
+import multiprocessing
+from multiprocessing.connection import Connection
 from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt import remnant
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
+def _spawned_worker_modes(
+    server_args: list[ServerArgs], connection: Connection
+) -> None:
+    """Exercise the same publication hook used before ModelRunner pool sizing."""
+
+    def state() -> tuple[str, str, bool, str]:
+        return (
+            remnant.cache_format(),
+            remnant.cache_implementation(),
+            remnant.packed_enabled(),
+            remnant.cache_store_implementation(),
+        )
+
+    try:
+        states = [state()]
+        for args in server_args:
+            set_global_server_args_for_scheduler(args)
+            states.append(state())
+        connection.send(states)
+    finally:
+        connection.close()
+
+
 class TestDSV4C4CacheFormat(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from sglang.srt.runtime_context import ParallelContext, RuntimeContext
+
+        # Publication tests must not replace another test's process context.
+        context_patch = mock.patch(
+            "sglang.srt.runtime_context._CONTEXT",
+            RuntimeContext(ParallelContext()),
+        )
+        context_patch.start()
+        self.addCleanup(context_patch.stop)
+
     def tearDown(self):
         remnant.configure_cache_format("native")
 
@@ -57,6 +94,144 @@ class TestDSV4C4CacheFormat(CustomTestCase):
                 self.assertEqual(args.dsv4_c4_cache_implementation, implementation)
                 self.assertEqual(remnant.cache_implementation(), implementation)
                 self.assertTrue(remnant.packed_enabled())
+
+    def _worker_states(self, args: list[ServerArgs]) -> list[tuple[str, str, bool, str]]:
+        context = multiprocessing.get_context("spawn")
+        receiver, sender = context.Pipe(duplex=False)
+        worker = context.Process(target=_spawned_worker_modes, args=(args, sender))
+        try:
+            worker.start()
+            sender.close()
+            worker.join(timeout=60)
+            self.assertFalse(worker.is_alive(), "worker mode initialization timed out")
+            self.assertEqual(worker.exitcode, 0, "worker mode initialization failed")
+            self.assertTrue(receiver.poll(), "worker returned no mode state")
+            return receiver.recv()
+        finally:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=10)
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=10)
+            receiver.close()
+            sender.close()
+            if worker.exitcode is not None:
+                worker.close()
+
+    def test_all_modes_in_spawned_workers(self):
+        for cache_format, implementation, packed in (
+            ("native", "kernel", False),
+            ("remnant", "triton", True),
+            ("remnant", "kernel", True),
+        ):
+            with self.subTest(cache_format=cache_format, implementation=implementation):
+                args = self._parse(
+                    [
+                        "--dsv4-c4-cache-format",
+                        cache_format,
+                        "--dsv4-c4-cache-implementation",
+                        implementation,
+                    ]
+                )
+                # Neither inherited globals nor rerunning the constructor may
+                # be required: the resolved args are pickled into a fresh worker.
+                remnant.configure_cache_format("remnant", "triton")
+                self.assertEqual(
+                    self._worker_states([args]),
+                    [
+                        ("native", "kernel", False, "kernel"),
+                        (cache_format, implementation, packed, implementation),
+                    ],
+                )
+
+    def test_store_override_in_spawned_worker(self):
+        args = []
+        expected = [("native", "kernel", False, "kernel")]
+        for decode in ("triton", "kernel"):
+            for store in ("triton", "kernel"):
+                resolved = self._parse([
+                    "--dsv4-c4-cache-format", "remnant",
+                    "--dsv4-c4-cache-implementation", decode,
+                    "--dsv4-c4-cache-store-implementation", store,
+                ])
+                self.assertEqual(resolved.dsv4_c4_cache_store_implementation, store)
+                self.assertEqual(remnant.cache_implementation(), decode)
+                self.assertEqual(remnant.cache_store_implementation(), store)
+                args.append(resolved)
+                expected.append(("remnant", decode, True, store))
+        # Republishing without an override must clear the previous override.
+        args.append(self._parse([
+            "--dsv4-c4-cache-format", "remnant",
+            "--dsv4-c4-cache-implementation", "triton",
+        ]))
+        expected.append(("remnant", "triton", True, "triton"))
+        self.assertEqual(self._worker_states(args), expected)
+
+    def test_invalid_store_override_preserves_configuration(self):
+        remnant.configure_cache_format("remnant", "triton", "kernel")
+        with self.assertRaisesRegex(ValueError, "store_implementation"):
+            remnant.configure_cache_format("native", "kernel", "cuda")
+        self.assertEqual(remnant.cache_format(), "remnant")
+        self.assertEqual(remnant.cache_implementation(), "triton")
+        self.assertEqual(remnant.cache_store_implementation(), "kernel")
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args([
+                "--model", "dummy", "--dsv4-c4-cache-store-implementation", "cuda",
+            ])
+
+    def test_worker_republication_replaces_previous_mode(self):
+        modes = [("remnant", "triton"), ("remnant", "kernel"), ("native", "kernel")]
+        args = [
+            self._parse(
+                [
+                    "--dsv4-c4-cache-format",
+                    cache_format,
+                    "--dsv4-c4-cache-implementation",
+                    implementation,
+                ]
+            )
+            for cache_format, implementation in modes
+        ]
+        self.assertEqual(
+            self._worker_states(args),
+            [
+                ("native", "kernel", False, "kernel"),
+                ("remnant", "triton", True, "triton"),
+                ("remnant", "kernel", True, "kernel"),
+                ("native", "kernel", False, "kernel"),
+            ],
+        )
+
+    def test_partial_publication_resets_to_native_defaults(self):
+        remnant.configure_cache_format("remnant", "triton")
+        set_global_server_args_for_scheduler(SimpleNamespace())
+        self.assertEqual(remnant.cache_format(), "native")
+        self.assertEqual(remnant.cache_implementation(), "kernel")
+        self.assertFalse(remnant.packed_enabled())
+
+    def test_invalid_publication_preserves_worker_configuration(self):
+        from sglang.srt.runtime_context import get_server_args
+
+        args = self._parse(
+            [
+                "--dsv4-c4-cache-format",
+                "remnant",
+                "--dsv4-c4-cache-implementation",
+                "triton",
+            ]
+        )
+        set_global_server_args_for_scheduler(args)
+        with self.assertRaises(ValueError):
+            set_global_server_args_for_scheduler(
+                SimpleNamespace(
+                    dsv4_c4_cache_format="remnant",
+                    dsv4_c4_cache_implementation="cuda",
+                )
+            )
+        self.assertIs(get_server_args(), args)
+        self.assertEqual(remnant.cache_format(), "remnant")
+        self.assertEqual(remnant.cache_implementation(), "triton")
 
     def test_native_ignores_packed_implementation(self):
         self._parse(["--dsv4-c4-cache-implementation", "triton"])

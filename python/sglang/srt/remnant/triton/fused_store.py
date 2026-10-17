@@ -3,6 +3,9 @@
 Magnitude order uses the full 31 FP32 magnitude bits. Eight radix-16 passes
 locate the cutoff; an ascending-coordinate tie rule is checked against the
 production Torch reference. FP32 packing arithmetic stays unchanged.
+
+
+Author: Winston Cai.
 """
 
 import triton
@@ -30,6 +33,23 @@ def _select_keep_fp32(x):
     equal_rank = tl.cumsum(equal.to(tl.int32), 0)
     drop = (magnitude < prefix) | (equal & (equal_rank <= 256 - below_count))
     return ~drop
+
+
+@triton.jit
+def _canonical_pair_sum_fp32(x):
+    # Stock Triton packing rounds odd^2 before fusing even^2 + odd_squared.
+    # Fix the operand order: LLVM can reverse it in the fused selector/store,
+    # changing a last FP32 bit at a BF16-to-FP8 quantization midpoint.
+    even, odd = tl.split(x.reshape(256, 2))
+    pairs = tl.inline_asm_elementwise(
+        "{ .reg .f32 t; mul.rn.f32 t, $2, $2; fma.rn.f32 $0, $1, $1, t; }",
+        constraints="=f,f,f",
+        args=[even, odd],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return tl.sum(pairs, axis=0)
 
 
 @triton.jit
@@ -84,7 +104,7 @@ def _pack_fused_fp32_kernel(
         weight = tl.load(norm_weight_ptr + offs, mask=in_bounds, other=0.0).to(
             tl.float32
         )
-        inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + norm_eps)
+        inv_rms = tl.rsqrt(_canonical_pair_sum_fp32(x) / HEAD_DIM + norm_eps)
         # Native DSV4 store quantizes a BF16 round trip of the normalized NoPE
         # coordinates. Apply it to all eight tiles, including our new tail tile.
         normalized = (x * inv_rms * weight).to(tl.bfloat16).to(tl.float32)

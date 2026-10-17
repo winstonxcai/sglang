@@ -1814,7 +1814,7 @@ class DeepseekV4AttnBackend(
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-                o = flash_mla_with_kvcache(
+                attention_result = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
@@ -1832,9 +1832,19 @@ class DeepseekV4AttnBackend(
                     remnant_buffers=direct_remnant_buffers,
                     remnant_raw_indices=direct_remnant_raw_indices,
                     remnant_freqs=direct_remnant_freqs,
-                )[0]
+                )
+                o = attention_result[0]
 
             o = o.squeeze(1)
+            from sglang.srt.remnant import capture as _capture
+            if _capture.enabled() and compress_ratio == 4:
+                _capture.observer().observe_attention(
+                    layer_id, forward_batch, q, swa_k_cache, extra_k_cache,
+                    swa_page_indices, extra_indices, swa_topk_lengths,
+                    extra_topk_lengths, attn_sink, self.softmax_scale, o,
+                    swa_window_size, token_to_kv_pool.page_size // 4,
+                    flashmla_metadata, attention_result[1] if not _is_sm120 else None,
+                )
             return o
 
         raise NotImplementedError("ragged attention")

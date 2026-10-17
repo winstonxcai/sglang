@@ -705,6 +705,19 @@ class ServerArgs:
         ),
         NS("model"),
     ] = "kernel"
+    dsv4_c4_cache_store_implementation: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Override Packed C4 storage independently of decode. 'triton' "
+                "uses explicit selection plus packing; 'kernel' uses fused "
+                "selection and packing. Defaults to --dsv4-c4-cache-implementation. "
+                "Ignored for the native cache format."
+            ),
+            choices=["triton", "kernel"],
+        ),
+        NS("model"),
+    ] = None
     kv_cache_dtype: A[
         str,
         Arg(
@@ -3617,7 +3630,8 @@ class ServerArgs:
         from sglang.srt import remnant
 
         remnant.configure_cache_format(
-            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation
+            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation,
+            getattr(self, "dsv4_c4_cache_store_implementation", None),
         )
         if self.dsv4_c4_cache_format != "remnant":
             return
@@ -3693,7 +3707,8 @@ class ServerArgs:
         from sglang.srt import remnant
 
         remnant.configure_cache_format(
-            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation
+            self.dsv4_c4_cache_format, self.dsv4_c4_cache_implementation,
+            getattr(self, "dsv4_c4_cache_store_implementation", None),
         )
 
         self._handle_moe_runner_backend_alias()

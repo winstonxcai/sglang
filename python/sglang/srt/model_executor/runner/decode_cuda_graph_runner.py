@@ -14,6 +14,8 @@
 """DecodeCudaGraphRunner — runs DECODE / TARGET_VERIFY / DLLM_EXTEND under
 a pluggable backend.
 
+Author: Winston Cai. (Remnant graph replay profiling annotations.)
+
 Backend selection comes from cuda_graph_config.decode:
   - "full"      — default, FullCudaGraphBackend: one
                       torch.cuda.CUDAGraph per shape.
@@ -109,6 +111,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.nvtx_utils import batch_profile_range
 from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
@@ -1413,7 +1416,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
-            output = self.backend.replay(self._replay_graph_key, forward_batch)
+            with batch_profile_range(
+                "decode.graph_replay", forward_batch, padded_bs=self.bs
+            ):
+                output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

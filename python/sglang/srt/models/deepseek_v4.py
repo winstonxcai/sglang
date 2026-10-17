@@ -1548,6 +1548,13 @@ class MQALayer(MqaAttentionBase):
                 inverse=True,
             )
 
+        from sglang.srt.remnant import capture as _capture
+        if _capture.enabled() and self.compress_ratio == 4:
+            _capture.observer().observe_output(
+                self.layer_id, forward_batch, o, self.freqs_cis, positions,
+                self.attn_tp_rank, self.n_local_heads,
+            )
+
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:

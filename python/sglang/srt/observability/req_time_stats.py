@@ -11,7 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utilities for Request Time Stats."""
+"""Utilities for Request Time Stats.
+
+Remnant request timing metadata: Author: Winston Cai.
+"""
 
 from __future__ import annotations
 
@@ -492,6 +495,13 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         if self.created_time > 0.0:
             meta_info["request_received_ts"] = convert_time_to_realtime(
                 self.created_time
+            )
+        if self.first_token_time > 0.0:
+            # Tokenizer receipt of the first output batch, before OpenAI/SSE
+            # delivery. Export the existing stamp; do not retime a completion
+            # or reconstruct it from throughput (undefined for one token).
+            meta_info["first_output_ts"] = convert_time_to_realtime(
+                self.first_token_time
             )
         if self.api_server_dispatch_finish_time > 0.0:
             meta_info["api_server_dispatch_finish_ts"] = convert_time_to_realtime(

@@ -11,7 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""A scheduler that manages a tensor parallel GPU worker."""
+"""A scheduler that manages a tensor parallel GPU worker.
+
+Author: Winston Cai. (Remnant batch profiling annotations.)
+"""
 
 import dataclasses
 import faulthandler
@@ -324,7 +327,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import (
+    scheduler_batch_nvtx_method,
+    scheduler_nvtx_method,
+)
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -3623,6 +3629,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
+    @scheduler_batch_nvtx_method
     def run_batch(
         self,
         batch: ScheduleBatch,

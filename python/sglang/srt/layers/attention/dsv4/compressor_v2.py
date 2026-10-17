@@ -6,6 +6,7 @@ Author: Winston Cai.
 from __future__ import annotations
 
 from sglang.srt import remnant as _sg_lr
+from sglang.srt.remnant import capture as _capture
 
 from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cast
 
@@ -165,6 +166,8 @@ class CompressorBackendMixin:
         bf16_store: bool = False,
         packed_pool=None,
         packed_layer_id: Optional[int] = None,
+        capture_batch=None,
+        capture_layer=None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -194,6 +197,12 @@ class CompressorBackendMixin:
             is_online=is_online,
         )
 
+        if _capture.enabled() and compress_ratio == 4 and not is_indexer:
+            _capture.observer().observe_raw(
+                capture_layer, capture_batch, kv_compressed, plan, out_loc,
+                norm.weight, norm.variance_epsilon, freqs_cis_cache,
+            )
+
         ## REMNANT (single-mask packed store)
         if (
             compress_ratio == 4
@@ -207,7 +216,7 @@ class CompressorBackendMixin:
                 packed_pool.set_rope_freqs(
                     packed_layer_id, freqs_cis_cache
                 )
-                if _sg_lr.cache_implementation() == "triton":
+                if _sg_lr.cache_store_implementation() == "triton":
                     keep_mask = _sg_lr.topmag_keep_mask(
                         kv_compressed, _sg_lr.topmag_keep()
                     )
@@ -322,6 +331,8 @@ class CompressorBackendMixin:
             bf16_store=bf16_store,
             packed_pool=packed_pool,
             packed_layer_id=packed_layer_id,
+            capture_batch=forward_batch,
+            capture_layer=layer_id,
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

@@ -13,7 +13,7 @@ import torch
 from sglang.srt import remnant
 from sglang.srt.layers.attention import deepseek_v4_backend as module
 from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
-from sglang.srt.remnant import NativeWorkspace
+from sglang.srt.remnant import NativeWorkspace, capture
 from sglang.srt.remnant.packed import unpack_gather_native
 from sglang.test.test_utils import CustomTestCase
 
@@ -138,6 +138,7 @@ class TestRemnantBackend(CustomTestCase):
         with (
             mock.patch.object(module, "_is_sm90", True),
             mock.patch.object(module, "_is_sm120", False),
+            mock.patch.object(capture, "enabled", return_value=False),
             mock.patch.object(
                 module.envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL,
                 "get",

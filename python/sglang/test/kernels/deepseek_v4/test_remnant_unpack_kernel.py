@@ -4,6 +4,10 @@ Author: Winston Cai.
 """
 
 import importlib.util
+import hashlib
+import json
+from pathlib import Path
+import sys
 
 import pytest
 import torch
@@ -135,3 +139,245 @@ def test_triton_native_pages_match_independent_reference(strided, empty):
             torch.bfloat16
         )
         torch.testing.assert_close(actual_tail, expected_tail, atol=2e-2, rtol=2e-2)
+
+
+def test_prefill_widths_reuse_gather_kernels(monkeypatch):
+    """Growing contexts must not compile a new unpack/RoPE kernel per width."""
+    from collections import Counter
+
+    import triton
+
+    remnant.configure_cache_format("remnant", "triton")
+    torch.manual_seed(23)
+    latent = torch.randn((19, 512), dtype=torch.float32)
+    mask = topmag_keep_mask(latent, 0.5)
+    values, bitmaps, scales = pack_rows_ref(latent, mask, torch.ones(512), 1e-6)
+    decoded = unpack_rows_ref(values, bitmaps, scales)
+    dense_codes = torch.zeros_like(latent, dtype=torch.uint8)
+    dense_codes[mask] = values.reshape(-1)
+    workspace = NativeWorkspace.allocate(2, 768, 64, "cuda")
+    names = {
+        "_unpack_gather_bf16_kernel",
+        "_rope_tail_complex_inplace_kernel",
+        "_bf16_to_native_kernel",
+    }
+    compilations = Counter()
+
+    def record_compile(*args, **kwargs):
+        name = kwargs["fn"].name.rsplit(".", 1)[-1]
+        if name in names:
+            compilations[name] += 1
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", record_compile)
+    warm_counts = None
+    # Odd widths keep ordinary scalar alignment specialization unchanged.
+    # Row strides, Packed capacity and RoPE bounds all change independently.
+    for width, capacity, freq_rows in zip(
+        (513, 529, 547, 563), (7, 11, 15, 19), (32, 48, 64, 80)
+    ):
+        buffers = tuple(t[:capacity].cuda() for t in (values, bitmaps, scales))
+        physical = torch.arange(2 * width, dtype=torch.int32).reshape(2, width) % 7
+        raw = torch.arange(2 * width, dtype=torch.int32).reshape(2, width) % 21
+        physical[0, 0] = -1
+        physical[1, 0] = capacity
+        lengths = torch.tensor((width, width - 1), dtype=torch.int32)
+        angles = torch.arange(freq_rows * 32).reshape(freq_rows, 32) * 0.0017
+        freqs = torch.polar(torch.ones_like(angles), angles)
+        native, indices = unpack_gather_native(
+            buffers,
+            physical.cuda(),
+            raw.cuda(),
+            lengths.cuda(),
+            freqs.cuda(),
+            workspace,
+        )
+        torch.cuda.synchronize()
+        if warm_counts is None:
+            warm_counts = compilations.copy()
+        else:
+            assert compilations == warm_counts, (
+                f"prefill width={width}, capacity={capacity}, freq_rows={freq_rows} "
+                f"compiled additional gather kernels: {compilations - warm_counts}"
+            )
+
+        flat_physical, flat_raw = physical.flatten(), raw.flatten()
+        valid = (
+            (torch.arange(width)[None, :] < lengths[:, None]).flatten()
+            & (flat_physical >= 0)
+            & (flat_physical < capacity)
+            & (flat_raw * 4 < freq_rows)
+        )
+        expected = torch.zeros((2 * width, 512), dtype=torch.bfloat16)
+        expected[valid] = decoded[flat_physical[valid]]
+        tails = expected[valid, 448:].float().reshape(-1, 32, 2)
+        rotated = (
+            torch.view_as_complex(tails.contiguous()) * freqs[flat_raw[valid] * 4]
+        )
+        expected[valid, 448:] = (
+            torch.view_as_real(rotated).flatten(1).to(torch.bfloat16)
+        )
+        torch.testing.assert_close(
+            workspace.dense_bf16[: 2 * width].cpu(), expected, atol=2e-2, rtol=2e-2
+        )
+        assert torch.equal(indices.cpu().flatten(), torch.arange(2 * width))
+        native_cpu = native.cpu()
+        records = native_cpu[:, : 64 * 576].reshape(-1, 576)[: 2 * width]
+        expected_codes = torch.zeros((2 * width, 448), dtype=torch.uint8)
+        expected_codes[valid] = dense_codes[flat_physical[valid], :448]
+        assert torch.equal(records[:, :448], expected_codes)
+        actual_tail = records[:, 448:].contiguous().view(torch.bfloat16)
+        torch.testing.assert_close(
+            actual_tail, expected[:, 448:], atol=2e-2, rtol=2e-2
+        )
+
+
+@pytest.fixture
+def main_packed(monkeypatch):
+    """Import immutable main source without importing its runtime patch machinery."""
+    root = Path(__file__).parent / "fixtures/main_packed"
+    manifest = json.loads((root / "source.json").read_text())
+    assert manifest["revision"] == "b69841acf0d29181f84999d9b7e3cd5505eea9ad"
+    for name, expected in manifest["files"].items():
+        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == expected, name
+    # These switches configure only the frozen package; current production uses
+    # configure_cache_format. They never alter the serving process or its source.
+    for name, value in {
+        "SGLANG_OPT_TOPMAG": "1",
+        "KEEP": "0.5",
+        "SGLANG_OPT_TOPMAG_PACKED": "1",
+        "SGLANG_OPT_TOPMAG_FUSED": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+    name = "_remnant_main_packed_fixture"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name, root / "__init__.py", submodule_search_locations=[str(root)]
+        )
+        package = importlib.util.module_from_spec(spec)
+        sys.modules[name] = package
+        spec.loader.exec_module(package)
+    from importlib import import_module
+
+    return (
+        import_module(f"{name}.packed"),
+        import_module(f"{name}.reference"),
+    )
+
+
+@pytest.mark.parametrize("is_decode", [False, True], ids=["prefill", "decode"])
+@pytest.mark.parametrize("selected_k", [64, 512])
+def test_triton_matches_main_packed(main_packed, is_decode, selected_k):
+    """Exact parity on shared valid inputs, including stock attention output/LSE."""
+    from sgl_kernel import flash_mla
+    from sglang.srt.remnant.packed import pack_rows
+
+    historical, historical_reference = main_packed
+    remnant.configure_cache_format("remnant", "triton")
+    device = torch.device("cuda")
+    torch.manual_seed(71)
+    rows, batch, page_size = 128, 2, 64
+    latent = torch.randn((rows, 512), device=device, dtype=torch.float32)
+    latent[0].zero_()
+    latent[1].fill_(1)  # equal-magnitude cutoff ties
+    latent[2, ::3] = 0
+    norm_weight = torch.linspace(0.7, 1.3, 512, device=device)
+    mask = topmag_keep_mask(latent, 0.5)
+    assert torch.equal(mask, historical_reference.topmag_keep_mask(latent, 0.5))
+
+    class Plan:
+        def __init__(self):
+            self.is_decode = is_decode
+            self.words = torch.zeros((rows, 4), device=device, dtype=torch.int32)
+            self.words[:, 0] = (torch.arange(rows, device=device) + 1) * 4
+            self.words[:, 1] = torch.arange(rows, device=device)
+            if is_decode:
+                self.words[3, 0] += 1  # neither packer should write this row
+
+        def __getitem__(self, index):
+            assert index == 1
+            return self.words
+
+    plan = Plan()
+    locations = torch.arange(rows - 1, -1, -1, device=device, dtype=torch.int32)
+
+    def buffers():
+        return (
+            torch.zeros((2, page_size, 256), device=device, dtype=torch.uint8),
+            torch.zeros((2, page_size, 8), device=device, dtype=torch.uint64),
+            torch.zeros((2, page_size, 8), device=device, dtype=torch.uint8),
+        )
+
+    current_buffers, old_buffers = buffers(), buffers()
+    pack_rows(latent, mask, norm_weight, 1e-6, plan, locations, current_buffers)
+    historical.pack_rows(
+        latent.clone(), mask.clone(), norm_weight.clone(), 1e-6,
+        plan, locations.clone(), old_buffers,
+    )
+    for label, current, old in zip(
+        ("values", "bitmaps", "scales"), current_buffers, old_buffers
+    ):
+        assert torch.equal(current, old), f"Packed {label} differs from main"
+
+    physical = (
+        torch.arange(batch * selected_k, device=device, dtype=torch.int32)
+        .reshape(batch, selected_k)
+        .remainder(rows)
+    )
+    raw = physical.remainder(29)
+    lengths = torch.tensor((selected_k, selected_k - 7), device=device,
+                           dtype=torch.int32)
+    raw[1, selected_k - 7:] = -1
+    angles = torch.arange(128 * 32, device=device).reshape(128, 32) * 0.0017
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    current_ws = NativeWorkspace.allocate(batch, selected_k, page_size, device)
+    old_ws = historical.NativeWorkspace.allocate(batch, selected_k, page_size, device)
+    current_bytes, current_indices = unpack_gather_native(
+        current_buffers, physical, raw, lengths, freqs, current_ws
+    )
+    old_bytes, old_indices = historical.unpack_gather_native(
+        old_buffers, physical.clone(), raw.clone(), lengths.clone(),
+        freqs.clone(), old_ws,
+    )
+    assert torch.equal(current_ws.dense_bf16, old_ws.dense_bf16), "BF16/RoPE parity"
+    assert torch.equal(current_indices, old_indices), "temporary index parity"
+    active = (
+        torch.arange(selected_k, device=device)[None, :] < lengths[:, None]
+    ).flatten()
+    for offset, width, label in ((0, 576, "Native values"),
+                                (page_size * 576, 8, "Native scales")):
+        current = current_bytes[:, offset:offset + page_size * width]
+        old = old_bytes[:, offset:offset + page_size * width]
+        assert torch.equal(
+            current.reshape(-1, width)[active], old.reshape(-1, width)[active]
+        ), f"{label} parity"
+
+    def cache(storage, workspace):
+        return storage.as_strided(
+            (storage.shape[0], page_size, 1, 584),
+            (workspace.bytes_per_page, 584, 584, 1),
+        )
+
+    current_cache = cache(current_bytes, current_ws)
+    q = torch.randn((batch, 1, 64, 512), device=device, dtype=torch.bfloat16)
+    sink = torch.linspace(-0.1, 0.1, 64, device=device)
+    # Both calls share identical SWA/query/sink inputs; only the reconstructed
+    # extra C4 cache differs. Native FlashMLA owns attention in both versions.
+    outputs = []
+    for storage, workspace, indices in (
+        (current_bytes, current_ws, current_indices),
+        (old_bytes, old_ws, old_indices),
+    ):
+        outputs.append(flash_mla.flash_mla_with_kvcache(
+            q, current_cache, None, None, 512, flash_mla.get_mla_metadata()[0],
+            softmax_scale=512**-0.5, is_fp8_kvcache=True,
+            # Native FlashMLA requires a 64-aligned index width, even when the
+            # active SWA prefix contains only one entry.
+            indices=current_indices[:, :page_size].unsqueeze(1).contiguous(),
+            attn_sink=sink, extra_k_cache=cache(storage, workspace),
+            extra_indices_in_kvcache=indices.unsqueeze(1),
+            topk_length=torch.ones(batch, device=device, dtype=torch.int32),
+            extra_topk_length=lengths,
+        ))
+    for label, current, old in zip(("attention output", "LSE"), *outputs):
+        assert torch.isfinite(current).all(), label
+        assert torch.equal(current, old), f"{label} parity"

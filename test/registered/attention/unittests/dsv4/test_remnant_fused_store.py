@@ -1,9 +1,13 @@
-"""Production fused-store bytes, plan routing and live graph inputs."""
+"""Production fused-store bytes, plan routing and live graph inputs.
+
+Author: Winston Cai.
+"""
 
 from unittest import mock
 
 import pytest
 import torch
+from sglang.benchmark.remnant.cases import store_cases
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
@@ -131,16 +135,7 @@ def test_adversarial_masks_and_bytes(name, phase, layout):
     assert_bytes(fixture(name), phase, layout)
 
 
-COVERAGE = (
-    [("decode", n, "all_valid") for n in (1, 8, 16, 24, 25, 32, 64, 128)]
-    + [("decode", n, "staggered") for n in (1, 25, 32, 64)]
-    + [("decode", 32, mode) for mode in ("no_boundary", "shuffled", "invalid_dest")]
-    + [("prefill", n, "all_valid") for n in (1, 64, 257, 1024, 4096, 8192)]
-    + [
-        ("prefill", 8192, mode)
-        for mode in ("shuffled", "padded", "invalid_dest", "all_invalid")
-    ]
-)
+COVERAGE = [(c.phase, c.rows, c.layout) for c in store_cases()]
 
 
 @pytest.mark.parametrize("phase,rows,layout", COVERAGE)
@@ -160,7 +155,9 @@ def test_graph_replay_with_changed_inputs_and_plans(phase):
         pack_rows_fused(x, w, 1e-5, plan, loc, actual)
     for iteration in range(2):
         x.normal_()
-        loc.copy_(torch.arange(32, device=x.device, dtype=loc.dtype).roll(iteration + 1))
+        loc.copy_(
+            torch.arange(32, device=x.device, dtype=loc.dtype).roll(iteration + 1)
+        )
         words = plan[1].view(torch.int32)
         words[:, 0] = 5 if phase == "decode" else -1
         words[iteration::2, 0] = 4
@@ -215,3 +212,28 @@ def test_empty_does_not_select_or_launch():
         pack_rows_fused(
             x, torch.ones(512, device="cuda"), 1e-6, plan, loc, sentinel(0, x.device)
         )
+
+
+@pytest.mark.parametrize(
+    "heads,batch,length", [(64, 8, 512), (128, 16, 512), (128, 16, 317)]
+)
+def test_nonuniform_fp32_weights_preserve_production_pair_rounding(
+    heads, batch, length
+):
+    from sglang.benchmark.remnant.cases import DecodeCase, SEED, case_seed
+
+    generator = torch.Generator(device="cuda").manual_seed(
+        case_seed(DecodeCase(heads, batch, length), SEED)
+    )
+    rows = batch * 512
+    x = torch.randn(
+        (rows, 512), device="cuda", dtype=torch.float32, generator=generator
+    )
+    weight = torch.linspace(0.5, 1.5, 512, device="cuda", dtype=torch.float32)
+    plan, locations = plan_and_locations(rows, "prefill", "all_valid", x.device)
+    locations = locations.to(torch.int64)
+    actual, expected = sentinel(rows, x.device), sentinel(rows, x.device)
+    pack_rows_fused(x, weight, 1e-6, plan, locations, actual)
+    pack_rows(x, topmag_keep_mask(x, 0.5), weight, 1e-6, plan, locations, expected)
+    for a, b in zip(actual, expected):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))

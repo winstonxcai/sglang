@@ -23,9 +23,13 @@ FP8_E4M3_MAX = 448.0
 # CUDA graph workspace is allocated. Native remains the safe default.
 _CACHE_FORMAT = "native"
 _CACHE_IMPLEMENTATION = "kernel"
+_STORE_IMPLEMENTATION = "kernel"
 
 
-def configure_cache_format(cache_format: str, implementation: str = "kernel") -> None:
+def configure_cache_format(
+    cache_format: str, implementation: str = "kernel",
+    store_implementation: str | None = None,
+) -> None:
     """Set startup configuration; Native ignores the Packed implementation."""
     if cache_format not in {"native", "remnant"}:
         raise ValueError(
@@ -37,9 +41,15 @@ def configure_cache_format(cache_format: str, implementation: str = "kernel") ->
             "dsv4_c4_cache_implementation must be 'triton' or 'kernel', "
             f"got {implementation!r}"
         )
-    global _CACHE_FORMAT, _CACHE_IMPLEMENTATION
+    if store_implementation not in {None, "triton", "kernel"}:
+        raise ValueError(
+            "dsv4_c4_cache_store_implementation must be None, 'triton' or 'kernel', "
+            f"got {store_implementation!r}"
+        )
+    global _CACHE_FORMAT, _CACHE_IMPLEMENTATION, _STORE_IMPLEMENTATION
     _CACHE_FORMAT = cache_format
     _CACHE_IMPLEMENTATION = implementation
+    _STORE_IMPLEMENTATION = store_implementation or implementation
 
 
 def cache_format() -> str:
@@ -48,6 +58,11 @@ def cache_format() -> str:
 
 def cache_implementation() -> str:
     return _CACHE_IMPLEMENTATION
+
+
+def cache_store_implementation() -> str:
+    """Resolved store mode; omitted overrides follow the decode implementation."""
+    return _STORE_IMPLEMENTATION
 
 
 def topmag_enabled() -> bool:

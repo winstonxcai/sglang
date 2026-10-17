@@ -13,22 +13,25 @@
 # ==============================================================================
 """Profiler span helpers for hot SGLang code paths.
 
+Author: Winston Cai. (Remnant batch metadata annotations.)
+
 A span has two independent emitters:
 
 * ``record_function`` -- emitted whenever a torch profiler is active, so spans
   show up in torch/Perfetto traces for free (no env, no extra package).
-* ``nvtx`` range -- emitted only when the caller opts in via ``nvtx_enabled``
-  (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate) and the ``nvtx``
-  package is importable, for Nsight Systems timelines.
+* Built-in ``torch.cuda.nvtx`` range -- emitted only when the caller opts in
+  via ``nvtx_enabled`` (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate)
+  and PyTorch is CUDA-enabled. No external ``nvtx`` package is required.
 
 Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
 ops, and the speculative-decoding / forward spans -- share one primitive.
 """
 
+import json
 import logging
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -39,32 +42,30 @@ logger = logging.getLogger(__name__)
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
 
-_nvtx_module = None
-if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
-    try:
-        import nvtx as _nvtx_module  # type: ignore
-    except ImportError:
-        logger.warning(
-            "An SGLANG_ENABLE_NVTX_* flag is set, but the `nvtx` package is "
-            "missing. NVTX markers are disabled; torch profiler spans still emit."
-        )
+NVTX_AVAILABLE = torch.version.cuda is not None
+if (_SCHEDULER_NVTX or _OPERATIONS_NVTX) and not NVTX_AVAILABLE:
+    logger.warning(
+        "SGLANG_ENABLE_NVTX_* requires CUDA-enabled PyTorch. "
+        "NVTX markers are disabled; torch profiler spans still emit."
+    )
 
-NVTX_AVAILABLE = _nvtx_module is not None
-# Per-subsystem nvtx gates: emit nvtx ranges only when the flag is set AND the
-# package is importable. The record_function path is independent of both.
+# Build capability only: do not initialize/query a GPU when importing helpers.
+# The profiling launcher probes the actual built-in API before starting serving.
 NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
 NVTX_OPERATIONS_ENABLED = _OPERATIONS_NVTX and NVTX_AVAILABLE
 
-# Default nvtx colors for statically-named spans (only used on the nvtx path).
-_NVTX_COLOR_MAP = {
-    "scheduler.recv_requests": "blue",
-    "scheduler.process_input_requests": "purple",
-    "scheduler.get_next_batch_to_run": "green",
-    "scheduler.run_batch": "red",
-    "scheduler.process_batch_result": "cyan",
-}
-
 _NULL_CONTEXT = nullcontext()
+
+
+def validate_nvtx_backend() -> None:
+    """Probe built-in NVTX without CUDA allocations or synchronization."""
+    if not NVTX_AVAILABLE:
+        raise RuntimeError("Nsight annotations require CUDA-enabled PyTorch")
+    try:
+        torch.cuda.nvtx.range_push("sglang.nvtx_preflight")
+        torch.cuda.nvtx.range_pop()
+    except RuntimeError as exc:
+        raise RuntimeError("PyTorch built-in torch.cuda.nvtx is unavailable") from exc
 
 
 @contextmanager
@@ -75,9 +76,11 @@ def _profile_range_impl(
         if record:
             stack.enter_context(torch.profiler.record_function(debug_name))
         if nvtx_enabled:
-            if color is None:
-                color = _NVTX_COLOR_MAP.get(debug_name)
-            stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
+            # Preserve literal JSON braces: torch.cuda.nvtx.range formats its
+            # message. Push/pop do not. Built-in NVTX has no color argument;
+            # retain the existing caller interface but ignore colors here.
+            torch.cuda.nvtx.range_push(debug_name)
+            stack.callback(torch.cuda.nvtx.range_pop)
         yield
 
 
@@ -117,3 +120,86 @@ def profile_method(
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
+
+
+def batch_profile_range(
+    name: str,
+    batch: Any,
+    *,
+    step: Optional[int] = None,
+    rank: Optional[int] = None,
+    padded_bs: Optional[int] = None,
+) -> AbstractContextManager:
+    """Annotate a launch with CPU-only metadata; never read a CUDA scalar.
+
+    Scheduler ranges describe scheduled batches. Nested graph-replay ranges
+    describe the resolved forward batch and its actual padded bucket. Join them
+    through the CPU range nesting and CUDA launch correlation, not range wall
+    time: overlap scheduling remains asynchronous.
+    """
+    if not NVTX_SCHEDULER_ENABLED:
+        return _NULL_CONTEXT
+
+    size = batch.batch_size
+    size = size() if callable(size) else size
+    mode = batch.forward_mode.name
+    decode_requests = None
+    prefill_requests = None
+    prefill_tokens = None
+    if mode == "DECODE":
+        decode_requests, prefill_requests, prefill_tokens = size, 0, 0
+    elif mode in ("EXTEND", "SPLIT_PREFILL", "MIXED"):
+        decoding_reqs = getattr(batch, "decoding_reqs", None)
+        if mode != "MIXED" or decoding_reqs is not None:
+            decode_requests = len(decoding_reqs) if decoding_reqs is not None else 0
+            prefill_requests = size - decode_requests
+            extend_tokens = getattr(batch, "extend_num_tokens", None)
+            if extend_tokens is not None:
+                prefill_tokens = extend_tokens - decode_requests
+
+    metadata = {
+        "step": step,
+        "rank": rank,
+        "mode": mode,
+        "requests": size,
+        "decode_requests": decode_requests,
+        "prefill_requests": prefill_requests,
+        "prefill_tokens": prefill_tokens,
+        "padded_bs": padded_bs,
+        "context_source": "unavailable",
+    }
+    lengths = getattr(batch, "seq_lens_cpu", None)
+    if lengths is not None and lengths.device.type == "cpu":
+        # No .cpu(), .item() or reads of seq_lens on the GPU. In the scheduler
+        # this CPU mirror may precede overlap resolution; the replay annotation
+        # uses the forward batch after load_batch has resolved its metadata.
+        values = lengths.tolist()
+        metadata.update(
+            context_source="seq_lens_cpu",
+            context_count=len(values),
+            context_min=min(values) if values else None,
+            context_max=max(values) if values else None,
+            context_sum=sum(values),
+        )
+    return profile_range(
+        name + " " + json.dumps(metadata, separators=(",", ":")),
+        nvtx_enabled=True,
+    )
+
+
+def scheduler_batch_nvtx_method(func: Callable) -> Callable:
+    """Add step metadata while preserving the existing static scheduler span."""
+
+    @wraps(func)
+    def wrapper(self: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
+        if not NVTX_SCHEDULER_ENABLED:
+            return func(self, batch, *args, **kwargs)
+        with batch_profile_range(
+            "scheduler.batch",
+            batch,
+            step=self.forward_ct + 1,
+            rank=self.ps.tp_rank,
+        ):
+            return func(self, batch, *args, **kwargs)
+
+    return wrapper
