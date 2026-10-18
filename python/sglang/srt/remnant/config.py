@@ -251,21 +251,9 @@ def cache_store_implementation() -> str:
     return _STORE_IMPLEMENTATION
 
 
-def topmag_enabled() -> bool:
-    return packed_enabled()
-
-
-def topmag_keep() -> float:
-    return 0.5 if packed_enabled() else 1.0
-
-
 def packed_enabled() -> bool:
     """Whether the startup flag selected the persistent packed layout."""
     return _CACHE_FORMAT == "remnant"
-
-
-def sparse_enabled() -> bool:
-    return False
 
 
 def validate_packed_static_config() -> None:

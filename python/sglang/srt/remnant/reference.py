@@ -2,16 +2,16 @@
 
 Author: Winston Cai.
 
-No persistent state here. The pruning helpers are shared production primitives;
+No persistent state here. The keep-mask helper is a shared production primitive;
 the Torch pack/unpack functions are numerical references. Production storage and
 reconstruction wrappers live in packed.py; the runtime integration is in the
 normal SGLang cache, compressor, and backend modules.
 
 The exact-global keep-mask (`topmag_keep_mask`) is the single source of truth.
 It MUST be computed once from the unmodified latent and passed explicitly to
-both the dense-zero baseline and the Triton packer — re-running `topk` (e.g.
-after pruning, or on inputs with natural zeros / cutoff ties) does not
-reproduce the same index set.
+the Triton packer and matched numerical references — re-running `topk` (e.g.
+after pruning, or on inputs with natural zeros / cutoff ties) does not reproduce
+the same index set.
 """
 
 import torch
@@ -41,19 +41,6 @@ def topmag_keep_mask(latent: torch.Tensor, keep: float) -> torch.Tensor:
     # emits the same device-side mask update without changing TopK semantics.
     mask.scatter_(dim=-1, index=idx, value=False)
     return mask
-
-
-def topmag_zero_from_mask(
-    latent: torch.Tensor, keep_mask: torch.Tensor
-) -> torch.Tensor:
-    """Zero every coord where keep_mask is False, in place.
-
-    Zeros survive any downstream per-row RMSNorm scaling (a scalar multiply per
-    row) and the native fp8 store encodes them as exactly 0. The mask must come
-    from `topmag_keep_mask` on the unmodified latent.
-    """
-    latent.masked_fill_(~keep_mask, 0.0)
-    return latent
 
 
 def _ue8m0_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

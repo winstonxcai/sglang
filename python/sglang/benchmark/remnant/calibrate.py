@@ -355,16 +355,29 @@ def load_state(paths, device):
 
 def validate_state(state):
     q = state["q"].float()
-    rows = torch.cat((decode_native(state["swa_bytes"][state["swa_valid"]]),
-                      decode_native(state["csa_bytes"][state["csa_valid"]])))
+    # Capture already compacts each byte array using its full selection mask.
+    # Preserve duplicate admitted rows; applying the mask again misaddresses
+    # padded/partial selections and fails on empty compact arrays.
+    for prefix in ("swa", "csa"):
+        records = state[prefix + "_bytes"]
+        expected = int(state[prefix + "_valid"].sum())
+        if records.shape != (expected, 584):
+            raise ValueError(f"{prefix} compact row count/layout mismatch: expected {(expected, 584)}, got {tuple(records.shape)}")
+    rows = torch.cat((decode_native(state["swa_bytes"]), decode_native(state["csa_bytes"])))
     output, _, lse = attention(q, rows, state["sink"].float(), state["softmax_scale"])
+    if rows.shape[0] == 0:
+        # FlashMLA's final (combined or no-split) output uses +inf for an
+        # empty domain, unlike the mathematical logsumexp result of -inf.
+        lse = torch.full_like(lse, float("inf"))
     torch.testing.assert_close(output, state["bar_o"].float(), atol=.02, rtol=.02)
     inverse = rotate(state["bar_o"].float(), state["query_freqs"], True).to(torch.bfloat16)
     torch.testing.assert_close(inverse.float(), state["o"].float(), atol=.02, rtol=.02)
     if "lse" in state:
         torch.testing.assert_close(lse, state["lse"].float(), atol=.01, rtol=0)
+        # Equal +inf values are the legitimate Native LSE for an empty domain.
+        lse_error = torch.where(lse == state["lse"].float(), 0, (lse - state["lse"].float()).abs())
     return {"max_output_error": float((output - state["bar_o"].float()).abs().max()),
-            "max_lse_error": float((lse - state["lse"].float()).abs().max()) if "lse" in state else None}
+            "max_lse_error": float(lse_error.max()) if "lse" in state else None}
 
 
 def state_paths(root, config, rid, layer):

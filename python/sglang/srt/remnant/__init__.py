@@ -1,4 +1,4 @@
-"""TopMag pruning on the native compressed-latent store (Remnant).
+"""Persistent Packed compressed-latent storage (Remnant).
 
 Author: Winston Cai.
 
@@ -21,14 +21,11 @@ from .config import (
     packed_enabled,
     packed_layouts,
     packed_profile,
-    topmag_enabled,
-    topmag_keep,
     validate_packed_static_config,
 )
 
 _LAZY_EXPORTS = {
     "topmag_keep_mask": "reference",
-    "topmag_zero_from_mask": "reference",
     "pack_rows": "packed",
     "pack_rows_fused": "packed",
     "unpack_gather_native": "packed",
@@ -55,8 +52,6 @@ __all__ = [
     "packed_layouts",
     "PackedLayerLayout",
     "packed_enabled",
-    "topmag_enabled",
-    "topmag_keep",
     "validate_packed_static_config",
     *_LAZY_EXPORTS,
 ]

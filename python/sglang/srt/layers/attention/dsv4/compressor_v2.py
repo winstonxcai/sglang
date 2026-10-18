@@ -203,42 +203,31 @@ class CompressorBackendMixin:
                 norm.weight, norm.variance_epsilon, freqs_cis_cache,
             )
 
-        ## REMNANT (single-mask packed store)
-        if (
-            compress_ratio == 4
-            and not is_indexer
-            and _sg_lr.topmag_enabled()
-        ):
-            if _sg_lr.packed_enabled():
-                _sg_lr.validate_packed_static_config()
-                assert packed_pool is not None
-                assert packed_layer_id is not None
-                packed_pool.set_rope_freqs(
-                    packed_layer_id, freqs_cis_cache
+        ## REMNANT (persistent Packed store)
+        if compress_ratio == 4 and not is_indexer and _sg_lr.packed_enabled():
+            _sg_lr.validate_packed_static_config()
+            assert packed_pool is not None
+            assert packed_layer_id is not None
+            packed_pool.set_rope_freqs(packed_layer_id, freqs_cis_cache)
+            if _sg_lr.cache_store_implementation() == "triton":
+                keep_count = packed_pool.get_packed_buffers(packed_layer_id)[
+                    0
+                ].shape[-1]
+                keep_mask = _sg_lr.topmag_keep_mask(
+                    kv_compressed, keep_count / _sg_lr.HEAD_DIM
                 )
-                if _sg_lr.cache_store_implementation() == "triton":
-                    keep_count = packed_pool.get_packed_buffers(packed_layer_id)[
-                        0
-                    ].shape[-1]
-                    keep_mask = _sg_lr.topmag_keep_mask(
-                        kv_compressed, keep_count / _sg_lr.HEAD_DIM
-                    )
-                    _sg_lr.pack_rows(
-                        kv_compressed, keep_mask, norm.weight,
-                        norm.variance_epsilon, plan, out_loc,
-                        packed_pool, layer_id=packed_layer_id,
-                    )
-                else:
-                    _sg_lr.pack_rows_fused(
-                        kv_compressed, norm.weight,
-                        norm.variance_epsilon, plan, out_loc,
-                        packed_pool, layer_id=packed_layer_id,
-                    )
-                return
-            keep_mask = _sg_lr.topmag_keep_mask(
-                kv_compressed, _sg_lr.topmag_keep()
-            )
-            _sg_lr.topmag_zero_from_mask(kv_compressed, keep_mask)
+                _sg_lr.pack_rows(
+                    kv_compressed, keep_mask, norm.weight,
+                    norm.variance_epsilon, plan, out_loc,
+                    packed_pool, layer_id=packed_layer_id,
+                )
+            else:
+                _sg_lr.pack_rows_fused(
+                    kv_compressed, norm.weight,
+                    norm.variance_epsilon, plan, out_loc,
+                    packed_pool, layer_id=packed_layer_id,
+                )
+            return
 
         # Step 2: norm + rope + store
         assert kv_cache is not None

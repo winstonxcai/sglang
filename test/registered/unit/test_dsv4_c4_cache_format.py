@@ -236,7 +236,8 @@ class TestDSV4C4CacheFormat(CustomTestCase):
     def test_native_ignores_packed_implementation(self):
         self._parse(["--dsv4-c4-cache-implementation", "triton"])
         self.assertFalse(remnant.packed_enabled())
-        self.assertFalse(remnant.topmag_enabled())
+        self.assertEqual(remnant.cache_format(), "native")
+        self.assertEqual(remnant.cache_implementation(), "triton")
 
     def test_unknown_implementation_is_rejected(self):
         with self.assertRaises(SystemExit):

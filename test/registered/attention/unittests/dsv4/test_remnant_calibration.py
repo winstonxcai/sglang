@@ -5,6 +5,7 @@ Author: Winston Cai.
 import importlib
 import importlib.util
 import json
+import math as python_math
 import tempfile
 import unittest
 import copy
@@ -494,6 +495,74 @@ class CalibrationTests(unittest.TestCase):
             converted[3].unlink()
             with self.assertRaises(FileNotFoundError):
                 math.load_state(converted, "cpu")
+
+    def test_native_validation_uses_compact_rows_once(self):
+        # Zero KV gives zero output. Native LSE excludes the sink, so it is
+        # log(admitted rows), with FlashMLA's +inf sentinel for no rows.
+        for shared in (False, True):
+            for csa_count, swa_count in ((3, 2), (0, 2), (3, 0), (0, 0)):
+                with self.subTest(shared=shared, csa=csa_count, swa=swa_count), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    paths, _ = self.shared_fixture(root / "old")
+                    for path in paths:
+                        data = math.read_snapshot(path)
+                        if not csa_count:
+                            data["csa_valid"].zero_()
+                            data["csa_indices"].fill_(-1)
+                        for key in ("raw_c", "raw_positions", "csa_freqs"):
+                            data[key] = data[key][:csa_count]
+                        data["csa_bytes"] = torch.zeros(csa_count, 584, dtype=torch.uint8)
+                        data["swa_indices"] = torch.tensor([1, -1, 1, 4], dtype=torch.int32)
+                        data["swa_valid"] = torch.tensor([True, False, True, False])
+                        if not swa_count:
+                            data["swa_valid"].zero_()
+                        data["swa_bytes"] = torch.zeros(swa_count, 584, dtype=torch.uint8)
+                        count = csa_count + swa_count
+                        data["lse"] = torch.full((16,), python_math.log(count) if count else float("inf"))
+                        capture.atomic_tensor(path, data)
+                    if shared:
+                        paths = math.convert_shared_group(paths, root / "new")
+                    state = math.load_state(paths, "cpu")
+                    result = math.validate_state(state)
+                    self.assertEqual(result["max_output_error"], 0)
+                    self.assertLessEqual(result["max_lse_error"], 1e-6)
+                    if not csa_count and not swa_count:
+                        wrong = {**state, "lse": torch.full_like(state["lse"], -float("inf"))}
+                        with self.assertRaises(AssertionError):
+                            math.validate_state(wrong)
+                    for prefix in ("csa", "swa"):
+                        wrong = dict(state)
+                        wrong[prefix + "_bytes"] = torch.cat((state[prefix + "_bytes"], torch.zeros(1, 584, dtype=torch.uint8)))
+                        with self.assertRaisesRegex(ValueError, prefix + " compact row count"):
+                            math.validate_state(wrong)
+
+    def test_owner_capture_allows_empty_csa_selection(self):
+        for schema in (1, 2):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                math.atomic_json(root / "capture-config.json", {"storage_schema_version": schema,
+                    "audit_shared": False, "layers": [2], "heads_per_rank": 16, "seed": 42,
+                    "requests": {"issue": {"quota": 1, "prompt_tokens": 100}}})
+                with patch.object(torch.distributed, "is_initialized", return_value=False):
+                    obs = capture.Observer(root)
+                self.addCleanup(obs.flush)
+                freq = torch.ones(104, 32, dtype=torch.complex64)
+                obs.layer_data[2] = (torch.ones(512), 1e-6, freq)
+                batch = SimpleNamespace(rids=["issue"], positions=torch.tensor([103]),
+                    forward_mode=SimpleNamespace(is_decode=lambda: True))
+                q = torch.zeros(1, 16, 512)
+                cache = torch.zeros(1, 16 * 584, dtype=torch.uint8)
+                obs.observe_attention(2, batch, q, cache, cache, torch.tensor([[0, -1]]),
+                    torch.tensor([[-1, -1]]), torch.tensor([1]), torch.tensor([0]),
+                    torch.zeros(16), .1, q, 16, 16, SimpleNamespace())
+                obs.observe_output(2, batch, q, freq, batch.positions, 0, 16)
+                obs.flush()
+                record = math.read_snapshot(root / "rank-0/issue/layer-02-slot-00.pt")
+                self.assertEqual(record["raw_c"].shape, (0, 512))
+                self.assertEqual(record["csa_bytes"].shape, (0, 584))
+                self.assertEqual(record["csa_freqs"].shape, (0, 32))
+                self.assertEqual(record["raw_positions"].dtype, torch.long)
+                self.assertEqual(record["swa_bytes"].shape, (1, 584))
 
     def test_shared_hash_corruption_and_audit_disagreement_fail(self):
         with tempfile.TemporaryDirectory() as directory:

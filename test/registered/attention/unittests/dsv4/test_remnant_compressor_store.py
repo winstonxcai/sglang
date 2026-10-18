@@ -27,6 +27,7 @@ def test_compressor_routes_store(phase, mode, implementation, keep_count):
     ratio = 128 if mode == "c128" else 4
     dim = 128 if mode == "indexer" else 512
     latent = torch.randn((2, dim), dtype=torch.float32)
+    original_latent = latent.clone()
     plan_blob = torch.tensor([[4, 0, 0, 0], [8, 1, 0, 0]], dtype=torch.int32).view(
         torch.uint8
     )
@@ -98,9 +99,12 @@ def test_compressor_routes_store(phase, mode, implementation, keep_count):
                 native.assert_not_called()
             else:
                 native.assert_called_once()
+                assert native.call_args.args[0] is latent
                 fused.assert_not_called()
                 explicit.assert_not_called()
                 select.assert_not_called()
                 pool.set_rope_freqs.assert_not_called()
+            # Storage dispatch must preserve the raw FP32 compressor output.
+            torch.testing.assert_close(latent, original_latent, atol=0, rtol=0)
     finally:
         remnant.configure_cache_format("native")

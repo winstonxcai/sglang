@@ -291,7 +291,7 @@ class Observer:
                 if self.physical_owners.get((layer, physical)) != (rid, records[physical][1]):
                     raise RuntimeError(f"stale raw row: {rid}, layer {layer}, physical {physical}")
                 entries.append(records[physical])
-            rope_positions = torch.tensor([entry[0] for entry in entries], device=q.device)
+            rope_positions = torch.tensor([entry[0] for entry in entries], device=q.device, dtype=torch.long)
             heads = self.config["heads_per_rank"]
             data = {"rid": rid, "layer": layer, "rank": self.rank, "ordinal": ordinal,
                     "query_position": positions[index], "heads": heads, "softmax_scale": float(scale),
