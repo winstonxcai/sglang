@@ -114,6 +114,17 @@ def test_triton_native_pages_match_independent_reference(strided, empty, keep_co
         buffers, physical, raw, lengths, freqs_cpu.cuda(), workspace
     )
     rows = physical.numel()
+    # Candidate and split outputs own distinct storage. Extra rows are a
+    # canary: neither empty nor partially valid selections may write them.
+    fused = torch.full((rows + 3, 512), -91, dtype=torch.bfloat16, device="cuda")
+    unpack_gather_bf16(
+        buffers, physical, raw, lengths, freqs_cpu.cuda(), fused, fused_rope=True
+    )
+    assert torch.equal(
+        fused[:rows].view(torch.int16),
+        workspace.dense_bf16[:rows].view(torch.int16),
+    ), f"fused/split BF16 bytes differ for k={keep_count}, strided={strided}"
+    assert torch.all(fused[rows:] == -91)
     assert torch.equal(indices.cpu().flatten(), torch.arange(rows, dtype=torch.int32))
     if not rows:
         assert torch.count_nonzero(native).item() == 0
@@ -139,10 +150,48 @@ def test_triton_native_pages_match_independent_reference(strided, empty, keep_co
             tail = decoded[p, 448:].float().reshape(32, 2)
             rotated = torch.view_as_complex(tail.contiguous()) * freqs_cpu[r * 4]
             expected_tail = torch.view_as_real(rotated).flatten().to(torch.bfloat16)
+        expected_dense = (
+            decoded[p].clone() if valid else torch.zeros(512, dtype=torch.bfloat16)
+        )
+        expected_dense[448:] = expected_tail
+        torch.testing.assert_close(
+            fused[row].cpu(), expected_dense, atol=2e-2, rtol=2e-2
+        )
         actual_tail = native[page, value_base + 448 : value_base + 576].view(
             torch.bfloat16
         )
         torch.testing.assert_close(actual_tail, expected_tail, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("keep_count", [192, 256])
+def test_fused_rope_rotates_into_pruned_partner_lanes(keep_count):
+    """A retained real/imaginary lane must contribute to its pruned partner."""
+    remnant.configure_cache_format("remnant", "triton", keep_count=keep_count)
+    latent = torch.zeros((2, 512), dtype=torch.float32)
+    latent[:, : keep_count - 2] = 2
+    latent[:, 448] = 3
+    latent[:, 451] = -3
+    mask = latent != 0
+    planes = pack_rows_ref(latent, mask, torch.ones(512), 1e-6, keep_count=keep_count)
+    physical = torch.tensor([[1, 1]], dtype=torch.int32, device="cuda")
+    raw = torch.tensor([[0, 2]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([2], dtype=torch.int32, device="cuda")
+    angles = torch.linspace(0.2, 1.1, 16 * 32).reshape(16, 32)
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    split = torch.empty((2, 512), dtype=torch.bfloat16, device="cuda")
+    fused = torch.empty_like(split)
+    buffers = tuple(t.cuda() for t in planes)
+    for flag, output in ((False, split), (True, fused)):
+        unpack_gather_bf16(
+            buffers, physical, raw, lengths, freqs.cuda(), output, fused_rope=flag
+        )
+    assert torch.equal(fused.view(torch.int16), split.view(torch.int16))
+    expected = unpack_rows_ref(*planes)[[1, 1]]
+    pairs = expected[:, 448:].float().reshape(2, 32, 2)
+    rotated = torch.view_as_complex(pairs.contiguous()) * freqs[[0, 8]]
+    expected[:, 448:] = torch.view_as_real(rotated).flatten(1).to(torch.bfloat16)
+    assert torch.all(expected[:, [449, 450]] != 0)
+    torch.testing.assert_close(fused.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
 def test_prefill_widths_reuse_gather_kernels(monkeypatch):
@@ -162,6 +211,7 @@ def test_prefill_widths_reuse_gather_kernels(monkeypatch):
     workspace = NativeWorkspace.allocate(2, 768, 64, "cuda")
     names = {
         "_unpack_gather_bf16_kernel",
+        "_unpack_gather_bf16_rope_kernel",
         "_rope_tail_complex_inplace_kernel",
         "_bf16_to_native_kernel",
     }
@@ -194,6 +244,20 @@ def test_prefill_widths_reuse_gather_kernels(monkeypatch):
             lengths.cuda(),
             freqs.cuda(),
             workspace,
+        )
+        fused = torch.empty((2 * width, 512), dtype=torch.bfloat16, device="cuda")
+        unpack_gather_bf16(
+            buffers,
+            physical.cuda(),
+            raw.cuda(),
+            lengths.cuda(),
+            freqs.cuda(),
+            fused,
+            fused_rope=True,
+        )
+        assert torch.equal(
+            fused.view(torch.int16),
+            workspace.dense_bf16[: 2 * width].view(torch.int16),
         )
         torch.cuda.synchronize()
         if warm_counts is None:

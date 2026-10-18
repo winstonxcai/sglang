@@ -8,6 +8,7 @@ from .kernels import (
     _pack_fp8_kernel,
     _rope_tail_complex_inplace_kernel,
     _unpack_gather_bf16_kernel,
+    _unpack_gather_bf16_rope_kernel,
 )
 
 __all__ = [
@@ -15,4 +16,5 @@ __all__ = [
     "_pack_fp8_kernel",
     "_rope_tail_complex_inplace_kernel",
     "_unpack_gather_bf16_kernel",
+    "_unpack_gather_bf16_rope_kernel",
 ]

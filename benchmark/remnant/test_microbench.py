@@ -71,6 +71,88 @@ def test_invalid_modes(value):
         cases.parse_modes(value)
 
 
+@pytest.mark.parametrize("keep_count", range(64, 512, 64))
+def test_survivor_counts_select_only_supported_paths(keep_count):
+    args = cases.parser().parse_args(["--keep-count", str(keep_count)])
+    assert len(cases.selected_cases(args)) == 33
+    expected = cases.MODES if keep_count == 256 else ("native", "triton")
+    assert cases.benchmark_modes(args.keep_count, args.modes) == expected
+    matrix = cases.selected_profile_matrix(keep_count=keep_count)
+    assert len(matrix) == 10 * len(expected)
+    assert {mode for _, _, mode in matrix} == set(expected)
+    assert cases.benchmark_modes(keep_count, "native") == ("native",)
+    # Survivor count never changes the raw-fixture seed or geometric matrix.
+    baseline = cases.selected_cases(cases.parser().parse_args([]))
+    assert cases.selected_cases(args) == baseline
+    assert cases.matrix_digest(cases.selected_cases(args)) == cases.matrix_digest(
+        baseline
+    )
+
+
+@pytest.mark.parametrize("keep_count", [0, 1, 63, 65, 511, 512, 576, -64, True, 192.0])
+def test_invalid_survivor_counts(keep_count):
+    with pytest.raises(ValueError, match="keep-count"):
+        cases.benchmark_modes(keep_count)
+
+
+def test_unsupported_kernel_rejected_before_fixture_setup():
+    for keep_count in cases.KEEP_COUNTS:
+        if keep_count == 256:
+            continue
+        for modes in ("kernel", "native,triton,kernel"):
+            args = cases.parser().parse_args(
+                ["--keep-count", str(keep_count), "--modes", modes]
+            )
+            with pytest.raises(ValueError, match="Kernel requires"):
+                cases.selected_cases(args)
+        with pytest.raises(ValueError, match="profile-mode"):
+            cases.selected_cases(
+                cases.parser().parse_args(
+                    [
+                        "--keep-count",
+                        str(keep_count),
+                        "--case",
+                        "h64_b8_k512",
+                        "--profile-mode",
+                        "kernel",
+                    ]
+                )
+            )
+
+
+@pytest.mark.parametrize("keep_count", cases.KEEP_COUNTS)
+def test_benchmark_configure_uses_real_runtime_survivor_profile(keep_count):
+    import ast
+
+    # Execute the real lightweight configuration function against runtime config,
+    # without importing CUDA-only attention/FFI dependencies on the CPU host.
+    runtime = load_module(
+        "_microbench_runtime_config", ROOT / "python/sglang/srt/remnant/config.py"
+    )
+    tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
+    function = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "configure"
+    )
+    namespace = {"remnant": runtime, "benchmark_modes": cases.benchmark_modes}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    configure = namespace["configure"]
+    assert runtime.VALID_KEEP_COUNTS == cases.KEEP_COUNTS
+    for mode in cases.benchmark_modes(keep_count):
+        configure(mode, keep_count)
+        assert runtime.cache_format() == ("native" if mode == "native" else "remnant")
+        assert runtime.packed_profile().default_count == (
+            256 if mode == "native" else keep_count
+        )
+        assert runtime.cache_store_implementation() == (
+            "kernel" if mode == "native" else mode
+        )
+    configure("native", keep_count)
+    assert runtime.packed_profile().default_count == 256
+
+
 def test_paired_ratios_and_round_percentile():
     result = cases.paired_ratios(
         {"native": [1.0, 2.0], "triton": [2.0, 4.0], "kernel": [1.0, 2.0]}
@@ -80,6 +162,565 @@ def test_paired_ratios_and_round_percentile():
     assert cases.summary([1.0, 2.0, 3.0])["p95"] == pytest.approx(2.9)
     with pytest.raises(ValueError):
         cases.paired_ratios({"native": [1.0, 2.0], "kernel": [1.0]})
+
+
+def test_prefill_read_matrix_shared_seeds_and_explicit_selection():
+    args = cases.parser().parse_args(["--suite", "prefill-read"])
+    matrix = cases.selected_cases(args)
+    assert len(matrix) == 36
+    assert {c.history_length for c in matrix} == {143360}
+    assert {c.query_length for c in matrix} == {512, 1536, 8192}
+    assert {c.heads for c in matrix} == {64, 128}
+    assert {c.stage for c in matrix} == set(cases.PREFILL_STAGES)
+    assert {c.cache_policy for c in matrix} == {"warm", "rotating"}
+    fixtures = {}
+    for case in matrix:
+        seed = cases.case_seed(case, cases.SEED)
+        assert fixtures.setdefault(case.fixture_name, seed) == seed
+        assert cases.case_suite(case) == "prefill-read"
+    assert len(fixtures) == 6
+    assert len(cases.selected_profile_matrix(suite="prefill-read")) == 108
+    assert args.prefill_reader == "split"
+    fused_args = cases.parser().parse_args(
+        ["--suite", "prefill-read", "--prefill-reader", "fused"]
+    )
+    assert cases.selected_cases(fused_args) == matrix
+    for argv in (
+        ["--suite", "prefill-read", "--modes", "native,triton"],
+        ["--suite", "prefill-read", "--keep-count", "192"],
+        ["--profile-path", "packed192"],
+        ["--suite", "prefill-read", "--histories", "1024"],
+        ["--prefill-reader", "fused"],
+        ["--suite", "decode", "--prefill-reader", "fused"],
+    ):
+        with pytest.raises(ValueError):
+            cases.selected_cases(cases.parser().parse_args(argv))
+
+
+def test_prefill_three_way_ratios_and_timing_coverage():
+    import copy
+    import hashlib
+    from dataclasses import asdict
+
+    samples = {"native": [2.0, 4.0], "packed192": [1.0, 2.0], "packed256": [1.5, 3.0]}
+    ratios = cases.paired_ratios(samples)
+    assert ratios["packed192_over_native"]["samples"] == [0.5, 0.5]
+    assert ratios["packed192_over_packed256"]["mean"] == pytest.approx(2 / 3)
+    payload = {
+        "protocol": cases.PREFILL_PROTOCOL,
+        "schema_version": 2,
+        "status": "passed",
+        "cases": [
+            {
+                "suite": "prefill-read",
+                "name": c.name,
+                "valid": True,
+                "case": asdict(c),
+                "common_inputs_sha256": hashlib.sha256(
+                    c.fixture_name.encode()
+                ).hexdigest(),
+                "path_layouts": cases.prefill_path_layouts(),
+                "paths": {m: {"samples": [1.0] * 30} for m in cases.PREFILL_VARIANTS},
+            }
+            for c in cases.prefill_read_cases()
+        ],
+    }
+    cases.validate_timing(payload, suite="prefill-read")
+    candidate = copy.deepcopy(payload)
+    candidate["config"] = {"prefill_reader": "fused"}
+    for record in candidate["cases"]:
+        record["prefill_reader"] = "fused"
+    cases.validate_timing(candidate, suite="prefill-read", prefill_reader="fused")
+    with pytest.raises(RuntimeError):
+        cases.validate_timing(candidate, suite="prefill-read")
+    candidate["cases"][0]["prefill_reader"] = "split"
+    with pytest.raises(RuntimeError, match="reader mismatch"):
+        cases.validate_timing(candidate, suite="prefill-read", prefill_reader="fused")
+    for change in (
+        lambda p: p["cases"].pop(),
+        lambda p: p["cases"][0]["paths"].pop("packed256"),
+        lambda p: p["cases"][0]["path_layouts"]["packed192"].update(record_bytes=328),
+        lambda p: p.update(protocol=cases.PROTOCOL),
+        lambda p: p["cases"][0].update(common_inputs_sha256="a" * 64),
+    ):
+        bad = copy.deepcopy(payload)
+        change(bad)
+        with pytest.raises(RuntimeError):
+            cases.validate_timing(bad, suite="prefill-read")
+
+
+def test_profile_application_replay_cannot_overwrite_another_result():
+    import copy
+
+    config = {
+        "suite": "prefill-read",
+        "profile_path": "packed192",
+        "profile_replay_id": "owner:case",
+    }
+    payload = {
+        "config": config.copy(),
+        "protocol": cases.PREFILL_PROTOCOL,
+        "status": "passed",
+        "cases": [{"valid": True, "path": "packed192"}],
+    }
+    cases.verify_profile_replay(payload, config)
+    for change in (
+        lambda p: p["config"].update(profile_replay_id="other"),
+        lambda p: p.update(status="failed"),
+        lambda p: p["cases"][0].update(path="native"),
+    ):
+        bad = copy.deepcopy(payload)
+        change(bad)
+        with pytest.raises(FileExistsError):
+            cases.verify_profile_replay(bad, config)
+
+
+def test_prefill_profile_batches_preserve_case_selection_and_replay_identity():
+    import copy
+
+    catalog = cases.prefill_read_cases()
+    names = [c.name for c in catalog[:2]]
+    args = cases.parser().parse_args(
+        ["--suite", "prefill-read", "--profile-path", "packed192"]
+    )
+    assert cases.selected_cases(args) == catalog
+    args.case = ",".join(reversed(names))
+    assert cases.selected_cases(args) == catalog[:2]
+    for invalid in (names[0] + ",", names[0] + "," + names[0], "missing"):
+        args.case = invalid
+        with pytest.raises(ValueError, match="unknown or ambiguous"):
+            cases.selected_cases(args)
+    config = {
+        "suite": "prefill-read",
+        "profile_path": "packed192",
+        "profile_replay_id": "owner:batch",
+    }
+    payload = {
+        "config": config.copy(),
+        "protocol": cases.PREFILL_PROTOCOL,
+        "status": "passed",
+        "cases": [{"name": n, "valid": True, "path": "packed192"} for n in names],
+    }
+    cases.verify_profile_replay(payload, config)
+    for change in (
+        lambda p: p["cases"][1].update(name=names[0]),
+        lambda p: p["cases"][1].update(valid=False),
+        lambda p: p["cases"].clear(),
+    ):
+        bad = copy.deepcopy(payload)
+        change(bad)
+        with pytest.raises(FileExistsError):
+            cases.verify_profile_replay(bad, config)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_prefill_profile_nvtx_wraps_only_warmed_operation_and_cleans_up(fail):
+    import ast
+    from contextlib import contextmanager, nullcontext
+    from types import SimpleNamespace
+
+    function = next(
+        n
+        for n in ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "profile_case"
+    )
+    state = {"profiler": False, "nvtx": None}
+    observations = []
+
+    def start():
+        state["profiler"] = True
+        return (0,)
+
+    def stop():
+        state["profiler"] = False
+        return (0,)
+
+    @contextmanager
+    def nvtx(name):
+        state["nvtx"] = name
+        try:
+            yield
+        finally:
+            state["nvtx"] = None
+
+    def call():
+        observations.append(state.copy())
+        if fail and state["profiler"]:
+            raise RuntimeError("operation failed")
+
+    cuda = SimpleNamespace(
+        cudart=lambda: SimpleNamespace(cudaProfilerStart=start, cudaProfilerStop=stop),
+        synchronize=lambda: None,
+        nvtx=SimpleNamespace(range=nvtx),
+    )
+    namespace = {
+        "torch": SimpleNamespace(cuda=cuda),
+        "Operation": object,
+        "PrefillReadCase": cases.PrefillReadCase,
+        "configure": lambda *a: None,
+        "nullcontext": nullcontext,
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    case = cases.PrefillReadCase(64, 4100, 8, "complete")
+    op = SimpleNamespace(
+        mode="triton",
+        key="packed192",
+        keep_count=192,
+        validate=lambda: None,
+        call=call,
+        expected_kernels=(),
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="operation failed"):
+            namespace["profile_case"](case, op, SimpleNamespace(warmup=10))
+    else:
+        result = namespace["profile_case"](case, op, SimpleNamespace(warmup=10))
+        assert result["capture_range"] == f"remnant_{case.name}_packed192"
+        assert result["minimum_launches"]["elementwise.*MulFunctor"] == 2
+    assert observations[:10] == [{"profiler": False, "nvtx": None}] * 10
+    assert observations[10:] == [
+        {"profiler": True, "nvtx": f"remnant_{case.name}_packed192"}
+    ]
+    assert state == {"profiler": False, "nvtx": None}
+
+
+def test_prefill_timing_preserves_variant_configuration_and_pairing():
+    import ast
+    import random
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    function = next(
+        n
+        for n in ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "time_case"
+    )
+    configure = Mock()
+    ops = [
+        SimpleNamespace(
+            key=key, mode=mode, keep_count=count, call=lambda v=v: v, validate=Mock()
+        )
+        for key, mode, count, v in (
+            ("native", "native", 256, 1.0),
+            ("packed192", "triton", 192, 2.0),
+            ("packed256", "triton", 256, 3.0),
+        )
+    ]
+    for op in ops:
+
+        def checked_call(op=op):
+            assert configure.call_args.args == (op.mode, op.keep_count)
+            return {"native": 1.0, "packed192": 2.0, "packed256": 3.0}[op.key]
+
+        op.call = checked_call
+    namespace = {
+        "Operation": object,
+        "DecodeCase": cases.DecodeCase,
+        "configure": configure,
+        "measure": lambda call, repeats: call(),
+        "case_seed": cases.case_seed,
+        "random": random,
+        "summary": cases.summary,
+        "paired_ratios": cases.paired_ratios,
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    args = SimpleNamespace(
+        repeats=100, prefill_repeats=20, warmup=0, rounds=2, seed=cases.SEED
+    )
+    result = namespace["time_case"](cases.PrefillReadCase(64, 4096, 8), ops, args)
+    assert result["paths"]["packed192"]["samples"] == [2.0, 2.0]
+    assert result["paired_ratios"]["packed192_over_native"]["mean"] == 2.0
+    assert ("triton", 192) in [c.args for c in configure.call_args_list]
+    assert all(op.validate.call_count == 2 for op in ops)
+
+
+def test_prefill_traffic_requires_reads_writes_hits_and_launch_coverage():
+    import csv
+    import io
+
+    metrics = (
+        "gpu__time_duration.sum",
+        "dram__bytes_read.sum",
+        "dram__bytes_write.sum",
+        "lts__t_sectors_op_read.sum",
+        "lts__t_sectors_op_write.sum",
+        "lts__t_sector_hit_rate.pct",
+    )
+
+    def export(omit=None, launches=2, omit_launch=None):
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(
+            ["ID", "Kernel Name", "Metric Name", "Metric Unit", "Metric Value"]
+        )
+        for launch in range(launches):
+            for metric in metrics:
+                if metric != omit or (
+                    omit_launch is not None and launch != omit_launch
+                ):
+                    writer.writerow(
+                        [str(launch), "dequantize_k_cache_paged", metric, "unit", "1"]
+                    )
+        return output.getvalue()
+
+    result = cases.profile_summary(
+        export(), ["dequantize"], traffic_only=True, minimum_launches={"dequantize": 2}
+    )
+    assert len(result["metrics"]) == 12
+    for metric in metrics:
+        with pytest.raises(RuntimeError, match="coverage"):
+            cases.profile_summary(
+                export(omit=metric), ["dequantize"], traffic_only=True
+            )
+        with pytest.raises(RuntimeError, match="per-launch metric coverage"):
+            cases.profile_summary(
+                export(omit=metric, omit_launch=1), ["dequantize"], traffic_only=True
+            )
+    with pytest.raises(RuntimeError, match="launch coverage"):
+        cases.profile_summary(
+            export(launches=1),
+            ["dequantize"],
+            traffic_only=True,
+            minimum_launches={"dequantize": 2},
+        )
+
+
+def test_native_repage_preserves_values_scales_and_zero_padding():
+    import ast
+    import torch
+
+    tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
+    function = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "repage_native"
+    )
+    namespace = {"torch": torch, "PAGE_SIZE": 64}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    source = torch.randint(0, 256, (3, 37632), dtype=torch.uint8)
+    for page_size in (128, 256):
+        target = namespace["repage_native"](source, 130, page_size)
+        for row in range(130):
+            sp, sr = divmod(row, 64)
+            tp, tr = divmod(row, page_size)
+            assert torch.equal(
+                source[sp, sr * 576 : (sr + 1) * 576],
+                target[tp, tr * 576 : (tr + 1) * 576],
+            )
+            assert torch.equal(
+                source[sp, 64 * 576 + sr * 8 : 64 * 576 + (sr + 1) * 8],
+                target[tp, page_size * 576 + tr * 8 : page_size * 576 + (tr + 1) * 8],
+            )
+        for row in range(130, len(target) * page_size):
+            page, offset = divmod(row, page_size)
+            assert not bool(target[page, offset * 576 : (offset + 1) * 576].any())
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("stage", cases.PREFILL_STAGES)
+@pytest.mark.parametrize("policy", cases.PREFILL_POLICIES)
+@pytest.mark.parametrize("fused_rope", [False, True], ids=["split", "fused"])
+def test_gpu_prefill_read_complete_fixture(heads, stage, policy, fused_rope, benchmark):
+    import torch
+
+    with torch.inference_mode():
+        operations, identity = benchmark.prefill_read_operations(
+            benchmark.PrefillReadCase(heads, 4100, 8, stage, policy),
+            cases.SEED,
+            fused_rope=fused_rope,
+        )
+        assert [op.key for op in operations] == list(cases.PREFILL_VARIANTS)
+        assert identity["path_layouts"] == cases.prefill_path_layouts()
+        assert identity["prefill_reader"] == ("fused" if fused_rope else "split")
+        if stage != "attention":
+            for op in operations[1:]:
+                assert ("unpack_gather_bf16_rope" in op.expected_kernels) == fused_rope
+                assert ("rope_tail_complex" in op.expected_kernels) != fused_rope
+        assert identity["buffer_banks"] == (4 if policy == "rotating" else 1)
+        assert len({op.owned[0].data_ptr() for op in operations}) == 1
+        operations[0].owned[0].mul_(0.9)
+        indices, lengths = operations[0].owned[4:6]
+        indices[0, 0, 1] = indices[0, 0, 0]
+        indices[0, 0, 2] = -1
+        lengths[1] -= 3
+        for op in operations:
+            benchmark.configure(op.mode, op.keep_count)
+            op.call()
+            op.validate()
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_fused_reader_preserves_bf16_rounding_and_rotation_on_cpu(valid):
+    """Execute the actual Triton arithmetic body with CPU memory primitives.
+
+    This checks rounding/sign/position/store semantics against independent
+    Torch complex arithmetic, not GPU compilation, layout or synchronization.
+    The H100 tests separately cover the real gather, compilation and graphs.
+    """
+    import ast
+    from types import SimpleNamespace
+
+    import torch
+
+    class Pointer:
+        def __init__(self, data, offsets=0):
+            self.data, self.offsets = data, offsets
+
+        def __add__(self, offsets):
+            return Pointer(self.data, self.offsets + offsets)
+
+    def load(pointer, mask, other):
+        result = torch.full(mask.shape, other, dtype=torch.float32)
+        result[mask] = pointer.data[pointer.offsets[mask]]
+        return result
+
+    def store(pointer, value, mask):
+        pointer.data[pointer.offsets[mask]] = value[mask].to(pointer.data.dtype)
+
+    # Deliberately non-BF16 inputs make a missing intermediate rounding visible.
+    value = torch.linspace(-1.137, 1.377, 512)
+    rounded = value.to(torch.bfloat16).float()
+    angles = torch.linspace(0.13, 1.17, 16 * 32).reshape(16, 32)
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    raw = torch.tensor(2 if valid else 2**31 - 1, dtype=torch.int64)
+    output = torch.full((3 * 512,), -91, dtype=torch.bfloat16)
+    tl = SimpleNamespace(
+        constexpr=int,
+        bfloat16=torch.bfloat16,
+        float32=torch.float32,
+        arange=torch.arange,
+        program_id=lambda axis: 1,
+        gather=lambda x, indices, axis: torch.gather(x, axis, indices.long()),
+        load=load,
+        store=store,
+        where=torch.where,
+    )
+    path = ROOT / "python/sglang/srt/remnant/triton/kernels.py"
+    function = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_unpack_gather_bf16_rope_kernel"
+    )
+    function.decorator_list = []
+    namespace = {
+        "tl": tl,
+        "_unpack_gather_row": lambda *args: (
+            value if valid else torch.zeros_like(value),
+            raw,
+            torch.tensor(valid),
+        ),
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    args = {arg.arg: None for arg in function.args.args}
+    args.update(
+        freq_ptr=Pointer(torch.view_as_real(freqs).flatten()),
+        output_ptr=Pointer(output),
+        HEAD_DIM=512,
+        NOPE_DIM=448,
+        ROPE_PAIRS=32,
+        BLOCK_D=512,
+    )
+    namespace[function.name](**args)
+    expected = torch.zeros(512, dtype=torch.bfloat16)
+    if valid:
+        expected.copy_(rounded)
+        tail = torch.view_as_complex(rounded[448:].reshape(32, 2)) * freqs[8]
+        expected[448:] = torch.view_as_real(tail).flatten().to(torch.bfloat16)
+        unrounded = torch.view_as_complex(value[448:].reshape(32, 2)) * freqs[8]
+        assert not torch.equal(
+            expected[448:], torch.view_as_real(unrounded).flatten().to(torch.bfloat16)
+        ), "fixture must detect removal of the pre-RoPE BF16 round trip"
+    assert torch.equal(output[512:1024].view(torch.int16), expected.view(torch.int16))
+    assert torch.all(output[:512] == -91) and torch.all(output[1024:] == -91)
+
+
+def test_prefill_workspace_dtype_and_independent_constant_attention_on_cpu():
+    import ast
+    import math
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import torch
+
+    tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
+    factory = next(
+        n for n in tree.body if getattr(n, "name", None) == "prefill_read_operations"
+    )
+    validate = next(
+        n
+        for n in ast.walk(factory)
+        if isinstance(n, ast.FunctionDef) and n.name == "validate"
+    )
+    # Two all-one KV rows, queries producing unit scores, and a zero sink:
+    # SGL's public max/LSE outputs are log2(e) and log2(2e), while output
+    # coordinates are 2e/(2e+1). Nonzero logits expose a log-base mismatch.
+    # The reference stays FP32; the production workspace/output are BF16.
+    workspaces = [torch.ones((2, 1, 512), dtype=torch.bfloat16)]
+    q = torch.zeros((1, 2, 512))
+    q[..., 0] = math.sqrt(512)
+    cursor = [7]
+    namespace = dict(
+        torch=torch,
+        math=math,
+        ATOL=2e-2,
+        RTOL=2e-2,
+        reconstruct=lambda bank: workspaces[bank],
+        attention=lambda bank: (
+            torch.full(
+                (1, 2, 512), 2 * math.e / (2 * math.e + 1), dtype=torch.bfloat16
+            ),
+            torch.full((1, 2), 1 / math.log(2)),
+            torch.full((1, 2), (1 + math.log(2)) / math.log(2)),
+        ),
+        configure=lambda *args: None,
+        mode="native",
+        keep_count=256,
+        expected_workspace=torch.ones((2, 512), dtype=torch.float32),
+        workspaces=workspaces,
+        split_workspace=None,
+        sources=[],
+        cursor=cursor,
+        label="native",
+        banks=1,
+        case=SimpleNamespace(name="constant-prefill"),
+        q=q,
+        indices=torch.tensor([[[0, 1]]]),
+        lengths=torch.tensor([2]),
+        sample_ids=torch.tensor([0]),
+        sink=torch.zeros(2),
+    )
+    exec(
+        compile(ast.Module(body=[validate], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    arange = torch.arange
+    with patch.object(
+        torch,
+        "arange",
+        side_effect=lambda *a, **kw: arange(*a, **{**kw, "device": "cpu"}),
+    ):
+        namespace["validate"]()
+        assert cursor == [0]
+        workspaces[0][0, 0, 0] = 0
+        with pytest.raises(AssertionError):
+            namespace["validate"]()
+        workspaces[0][0, 0, 0] = 1
+        workspaces[0] = workspaces[0].float()
+        with pytest.raises(RuntimeError, match="expected BF16 workspace"):
+            namespace["validate"]()
 
 
 @pytest.fixture
@@ -101,40 +742,70 @@ def benchmark():
     module.configure("native")
 
 
+@pytest.mark.parametrize("keep_count", [192, 256])
 @pytest.mark.parametrize(
     "heads,batch,length",
     [(h, b, k) for h in (64, 128) for b in (8, 16) for k in (512, 317)],
 )
-def test_gpu_decode_outputs(heads, batch, length, benchmark):
+def test_gpu_decode_outputs(heads, batch, length, keep_count, benchmark):
     import torch
 
     with torch.inference_mode():
         ops, identity = benchmark.decode_operations(
-            benchmark.DecodeCase(heads, batch, length), cases.SEED
+            benchmark.DecodeCase(heads, batch, length), cases.SEED, keep_count
         )
         assert identity["native_baseline"] == "unpruned production Native"
         for op in ops:
             op.validate()
 
 
+@pytest.mark.parametrize("keep_count", [192, 256])
 @pytest.mark.parametrize("case", cases.store_cases(), ids=lambda c: c.name)
-def test_gpu_store_contract(case, benchmark):
+def test_gpu_store_contract(case, keep_count, benchmark):
     import torch
 
     with torch.inference_mode():
         ops, _ = benchmark.store_operations(
-            benchmark.StoreCase(case.phase, case.rows, case.layout), cases.SEED
+            benchmark.StoreCase(case.phase, case.rows, case.layout),
+            cases.SEED,
+            keep_count,
         )
         for op in ops:
             op.validate()
 
 
-def test_gpu_graph_replay_changes_queries_lengths_and_selections(benchmark):
+def test_gpu_all_survivor_counts_preserve_native_and_raw_inputs(benchmark):
+    import torch
+
+    identity = native_hash = None
+    with torch.inference_mode():
+        for keep_count in cases.KEEP_COUNTS:
+            ops, record = benchmark.decode_operations(
+                benchmark.DecodeCase(64, 8, 317),
+                cases.SEED,
+                keep_count,
+                ("native", "triton"),
+            )
+            assert [op.mode for op in ops] == ["native", "triton"]
+            assert record["packed_keep_count"] == keep_count
+            assert record["packed_record_bytes"] == keep_count + 72
+            assert ops[1].owned[2]["triton"].values.shape[-1] == keep_count
+            current_native = benchmark.tensor_hash(dict(cache=ops[0].owned[3]))
+            if identity is not None:
+                assert record["common_inputs_sha256"] == identity
+                assert current_native == native_hash
+            identity, native_hash = record["common_inputs_sha256"], current_native
+            for op in ops:
+                op.validate()
+
+
+@pytest.mark.parametrize("keep_count", [64, 192, 256, 448])
+def test_gpu_graph_replay_changes_queries_lengths_and_selections(keep_count, benchmark):
     import torch
 
     with torch.inference_mode():
         ops, _ = benchmark.decode_operations(
-            benchmark.DecodeCase(64, 8, 512), cases.SEED
+            benchmark.DecodeCase(64, 8, 512), cases.SEED, keep_count
         )
         captured = [benchmark.capture(op, 3) for op in ops]
         # Shared tensors retain their addresses. Duplicate selections, invalid
@@ -147,7 +818,7 @@ def test_gpu_graph_replay_changes_queries_lengths_and_selections(benchmark):
         raw[:, :, 2] = -1
         lengths.fill_(317)
         for op, (graph, output) in zip(ops, captured):
-            benchmark.configure(op.mode)
+            benchmark.configure(op.mode, op.keep_count)
             graph.replay()
             torch.cuda.synchronize()
             # Validate actual captured outputs against fresh independent
@@ -210,10 +881,12 @@ def test_json_and_flat_csv_schema(tmp_path):
                 "suite": "decode",
                 "name": "example",
                 "case": {"batch": 8},
+                "packed_keep_count": 192,
+                "packed_record_bytes": 264,
                 "common_inputs_sha256": "inputs",
                 "execution": "cuda_graph",
                 "valid": True,
-                "paths": {"native": cases.summary([1.0, 2.0])},
+                "paths": {m: cases.summary([1.0, 2.0]) for m in ("native", "triton")},
                 "paired_ratios": {},
             }
         ],
@@ -221,18 +894,60 @@ def test_json_and_flat_csv_schema(tmp_path):
     base = tmp_path / "timing"
     cases.write_results(result, base)
     assert json.loads(base.with_suffix(".json").read_text()) == result
-    row = list(csv.DictReader(base.with_suffix(".csv").open()))[0]
+    rows = list(csv.DictReader(base.with_suffix(".csv").open()))
+    row = rows[0]
     assert json.loads(row["samples_ms"]) == [1.0, 2.0]
     assert json.loads(row["source"]) == result["source"]
     assert row["protocol"] == cases.PROTOCOL and row["input_sha256"] == "inputs"
+    assert [r["packed_keep_count"] for r in rows] == ["192", "192"]
+    assert [r["record_bytes"] for r in rows] == ["584", "264"]
 
 
-def test_gpu_store_graph_replay_changes_inputs_and_destinations(benchmark):
+@pytest.mark.parametrize("keep_count", cases.KEEP_COUNTS)
+def test_timing_validation_matches_requested_modes_and_survivor_identity(keep_count):
+    import copy
+
+    modes = cases.benchmark_modes(keep_count)
+    payload = {
+        "protocol": cases.PROTOCOL,
+        "schema_version": 2,
+        "status": "passed",
+        "config": {"keep_count": keep_count},
+        "cases": [
+            {
+                "suite": "decode" if isinstance(case, cases.DecodeCase) else "store",
+                "name": case.name,
+                "valid": True,
+                "packed_keep_count": keep_count,
+                "packed_record_bytes": keep_count + 72,
+                "paths": {m: {"samples": [1.0] * 30} for m in modes},
+            }
+            for case in cases.selected_cases(cases.parser().parse_args([]))
+        ],
+    }
+    cases.validate_timing(payload, keep_count=keep_count)
+    for field, value in (("packed_keep_count", 512), ("packed_record_bytes", 584)):
+        bad = copy.deepcopy(payload)
+        bad["cases"][0][field] = value
+        with pytest.raises(RuntimeError):
+            cases.validate_timing(bad, keep_count=keep_count)
+    bad = copy.deepcopy(payload)
+    bad["cases"][0]["paths"].pop("triton")
+    with pytest.raises(RuntimeError):
+        cases.validate_timing(bad, keep_count=keep_count)
+    bad = copy.deepcopy(payload)
+    bad["config"]["keep_count"] = 512
+    with pytest.raises(RuntimeError):
+        cases.validate_timing(bad, keep_count=keep_count)
+
+
+@pytest.mark.parametrize("keep_count", [64, 192, 256, 448])
+def test_gpu_store_graph_replay_changes_inputs_and_destinations(keep_count, benchmark):
     import torch
 
     with torch.inference_mode():
         ops, _ = benchmark.store_operations(
-            benchmark.StoreCase("decode", 25), cases.SEED
+            benchmark.StoreCase("decode", 25), cases.SEED, keep_count
         )
         captured = [benchmark.capture(op, 3) for op in ops]
         (
@@ -251,14 +966,18 @@ def test_gpu_store_graph_replay_changes_inputs_and_destinations(benchmark):
         loc.copy_(loc.roll(3))
         native_loc.copy_(loc)
         for op, (graph, output) in zip(ops, captured):
-            benchmark.configure(op.mode)
+            benchmark.configure(op.mode, op.keep_count)
             graph.replay()
         torch.cuda.synchronize()
         ids = loc.long()
         expected = benchmark.pack_rows_ref(
-            x, benchmark.topmag_keep_mask(x, 0.5), weight, benchmark.EPS
+            x,
+            benchmark.topmag_keep_mask(x, keep_count / 512),
+            weight,
+            benchmark.EPS,
+            keep_count=keep_count,
         )
-        for mode in ("triton", "kernel"):
+        for mode in caches_:
             actual = tuple(
                 benchmark.indexed_rows(t.flatten(0, 1), ids) for t in caches_[mode]
             )
@@ -269,8 +988,9 @@ def test_gpu_store_graph_replay_changes_inputs_and_destinations(benchmark):
                 atol=benchmark.ATOL,
                 rtol=benchmark.RTOL,
             )
-        for a, b in zip(caches_["triton"], caches_["kernel"]):
-            assert torch.equal(a, b)
+        if "kernel" in caches_:
+            for a, b in zip(caches_["triton"], caches_["kernel"]):
+                assert torch.equal(a, b)
         expected_native = benchmark.native_reference(
             x, weight, torch.zeros(25, device="cuda", dtype=torch.long), freqs
         )

@@ -153,6 +153,95 @@ class TestRemnantCudaGraph(CustomTestCase):
         self.assertTrue(torch.equal(output, first))
         remnant.configure_cache_format("native")
 
+    def test_fused_read_replays_changed_planes_indices_lengths_and_frequencies(self):
+        for count in (64, 128, 192, 256, 320, 384, 448):
+            with self.subTest(keep_count=count):
+                remnant.configure_cache_format("remnant", "triton", keep_count=count)
+                torch.manual_seed(101 + count)
+                source = torch.randn(4, 512)
+                weight = torch.linspace(0.5, 1.5, 512)
+                planes = pack_rows_ref(
+                    source,
+                    topmag_keep_mask(source, count / 512),
+                    weight,
+                    1e-6,
+                    keep_count=count,
+                )
+                buffers = tuple(x.cuda() for x in planes)
+                physical = torch.tensor(
+                    [[0, 2, -1, 3], [3, 3, 1, 0]], device="cuda", dtype=torch.int32
+                )
+                raw = torch.tensor(
+                    [[0, 2, 1, 3], [2, 0, 1, 4]], device="cuda", dtype=torch.int32
+                )
+                lengths = torch.tensor([4, 3], device="cuda", dtype=torch.int32)
+                angles = torch.arange(32 * 32).float().reshape(32, 32) * 0.0037
+                freqs = torch.polar(torch.ones_like(angles), angles).cuda()
+                output = torch.empty((8, 512), device="cuda", dtype=torch.bfloat16)
+                split = torch.empty_like(output)
+                owned = (*buffers, physical, raw, lengths, freqs, output)
+                addresses = [x.data_ptr() for x in owned]
+
+                def call():
+                    unpack_gather_bf16(
+                        buffers,
+                        physical,
+                        raw,
+                        lengths,
+                        freqs,
+                        output,
+                        fused_rope=True,
+                    )
+
+                call()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    call()
+                for iteration in range(2):
+                    source.normal_()
+                    planes = pack_rows_ref(
+                        source,
+                        topmag_keep_mask(source, count / 512),
+                        weight,
+                        1e-6,
+                        keep_count=count,
+                    )
+                    for target, values in zip(buffers, planes):
+                        target.copy_(values)
+                    physical.copy_(physical.roll(1, dims=1))
+                    raw.copy_(raw.roll(1, dims=1))
+                    raw[0, 1] = -1
+                    lengths.copy_(torch.tensor([4 - iteration, 2 + iteration]))
+                    phase = angles * (iteration + 2)
+                    freq_cpu = torch.polar(torch.ones_like(phase), phase)
+                    freqs.copy_(freq_cpu)
+                    graph.replay()
+                    unpack_gather_bf16(buffers, physical, raw, lengths, freqs, split)
+                    self.assertTrue(
+                        torch.equal(output.view(torch.int16), split.view(torch.int16))
+                    )
+                    decoded = unpack_rows_ref(*planes)
+                    expected = torch.zeros((8, 512), dtype=torch.bfloat16)
+                    p_cpu, r_cpu, lens = physical.cpu(), raw.cpu(), lengths.cpu()
+                    for row in range(8):
+                        query, k = divmod(row, 4)
+                        p, r = int(p_cpu[query, k]), int(r_cpu[query, k])
+                        if k < lens[query] and 0 <= p < 4 and 0 <= r * 4 < 32:
+                            expected[row] = decoded[p]
+                            tail = decoded[p, 448:].float().reshape(32, 2)
+                            rotated = (
+                                torch.view_as_complex(tail.contiguous())
+                                * freq_cpu[r * 4]
+                            )
+                            expected[row, 448:] = (
+                                torch.view_as_real(rotated).flatten().to(torch.bfloat16)
+                            )
+                    torch.testing.assert_close(
+                        output.cpu(), expected, atol=2e-2, rtol=2e-2
+                    )
+                    self.assertEqual([x.data_ptr() for x in owned], addresses)
+
     def test_consecutive_mixed_layers_replay_with_stable_buffers(self):
         counts = (128, 192, 256, 320)
         remnant.configure_cache_format(

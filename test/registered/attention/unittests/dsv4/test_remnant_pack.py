@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt import remnant
 from sglang.srt.remnant import config
-from sglang.srt.remnant.packed import _as_buffers, pack_rows_fused
+from sglang.srt.remnant.packed import _as_buffers, pack_rows_fused, unpack_gather_bf16
 from sglang.srt.remnant.reference import (
     pack_rows_ref,
     topmag_keep_mask,
@@ -23,6 +23,63 @@ class TestRemnantPack(CustomTestCase):
 
     def tearDown(self):
         remnant.configure_cache_format("native")
+
+    def test_bf16_reader_opt_in_dispatch_and_empty_inputs(self):
+        import sys
+        from unittest.mock import patch
+
+        calls = []
+
+        class Kernel:
+            def __init__(self, name):
+                self.name = name
+
+            def __getitem__(self, grid):
+                return lambda *args, **kwargs: calls.append((self.name, grid))
+
+        exports = SimpleNamespace(
+            _unpack_gather_bf16_kernel=Kernel("split"),
+            _rope_tail_complex_inplace_kernel=Kernel("rope"),
+            _unpack_gather_bf16_rope_kernel=Kernel("fused"),
+        )
+        buffers = (
+            torch.zeros((1, 256), dtype=torch.uint8),
+            torch.zeros((1, 8), dtype=torch.uint64),
+            torch.zeros((1, 8), dtype=torch.uint8),
+        )
+        index = torch.zeros((1, 1), dtype=torch.int32)
+        lengths = torch.ones(1, dtype=torch.int32)
+        freqs = torch.ones((16, 32), dtype=torch.complex64)
+        output = torch.empty((1, 512), dtype=torch.bfloat16)
+        package = unpack_gather_bf16.__module__.rsplit(".", 1)[0]
+        with patch.dict(sys.modules, {package + ".triton": exports}):
+            unpack_gather_bf16(buffers, index, index, lengths, freqs, output)
+            self.assertEqual(calls, [("split", (1,)), ("rope", (1,))])
+            calls.clear()
+            unpack_gather_bf16(
+                buffers, index, index, lengths, freqs, output, fused_rope=True
+            )
+            self.assertEqual(calls, [("fused", (1,))])
+            calls.clear()
+            for physical, raw, active in (
+                (index[:0], index[:0], lengths[:0]),
+                (index[:, :0], index[:, :0], lengths),
+            ):
+                unpack_gather_bf16(
+                    buffers, physical, raw, active, freqs, output, fused_rope=True
+                )
+            self.assertEqual(calls, [])
+            for invalid in (1, 0, "fused", None):
+                with self.assertRaisesRegex(TypeError, "fused_rope must be a bool"):
+                    unpack_gather_bf16(
+                        buffers,
+                        index,
+                        index,
+                        lengths,
+                        freqs,
+                        output,
+                        fused_rope=invalid,
+                    )
 
     def test_profiles_validate_counts_ids_and_atomic_updates(self):
         ratios = (0, 128, 4, 128, 4, 0, 4)

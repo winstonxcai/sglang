@@ -270,6 +270,7 @@ def unpack_gather_bf16(
     output: torch.Tensor,
     *,
     layer_id: int | None = None,
+    fused_rope: bool = False,
 ) -> torch.Tensor:
     """Gather selected records, dequantize, zero-fill and apply tail RoPE.
 
@@ -277,7 +278,11 @@ def unpack_gather_bf16(
     physical entries address Packed rows, raw entries address logical C4 rows.
     Lengths are int32 [queries]. The caller owns contiguous BF16 output and a
     contiguous complex RoPE table. Invalid/padded selections produce zero rows.
+    ``fused_rope`` opts into the experimental one-launch reader; the verified
+    split path remains the default. Neither reader changes the persistent ABI.
     """
+    if type(fused_rope) is not bool:
+        raise TypeError("fused_rope must be a bool")
     buffers = _as_buffers(packed_buffers, layer_id)
     if physical_indices.shape != raw_indices.shape:
         raise ValueError("physical_indices and raw_indices must have equal shape")
@@ -293,6 +298,36 @@ def unpack_gather_bf16(
     if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
         raise ValueError("freqs_cis must be a contiguous complex tensor")
     if flat_rows == 0:
+        return output
+    if fused_rope:
+        from .triton import _unpack_gather_bf16_rope_kernel
+
+        _unpack_gather_bf16_rope_kernel[(flat_rows,)](
+            buffers.values,
+            buffers.bitmaps,
+            buffers.scales,
+            physical_indices,
+            raw_indices,
+            topk_lengths,
+            torch.view_as_real(freqs_cis),
+            out2d,
+            n_queries,
+            selected_k,
+            HEAD_DIM=config.HEAD_DIM,
+            NOPE_DIM=config.NOPE_DIM,
+            ROPE_PAIRS=config.ROPE_DIM // 2,
+            KEEP_K=_buffer_keep_count(buffers),
+            BITMAP_WORDS=config.BITMAP_WORDS,
+            BLOCK_D=config.HEAD_DIM,
+            PHYSICAL_STRIDE_Q=physical_indices.stride(0),
+            PHYSICAL_STRIDE_K=physical_indices.stride(1),
+            RAW_STRIDE_Q=raw_indices.stride(0),
+            RAW_STRIDE_K=raw_indices.stride(1),
+            LENGTH_STRIDE=topk_lengths.stride(0),
+            PACKED_ROWS=buffers.values.numel() // _buffer_keep_count(buffers),
+            FREQ_ROWS=freqs_cis.numel() // (config.ROPE_DIM // 2),
+            num_warps=8,
+        )
         return output
     from .triton import (
         _rope_tail_complex_inplace_kernel,

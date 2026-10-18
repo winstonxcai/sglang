@@ -123,15 +123,14 @@ def _pack_fp8_kernel(
         )
 
 
-@triton.jit(do_not_specialize=_GATHER_RUNTIME_PARAMETERS)
-def _unpack_gather_bf16_kernel(
+@triton.jit
+def _unpack_gather_row(
     values_ptr,
     bitmap_ptr,
     scales_ptr,
     physical_indices_ptr,
     raw_indices_ptr,
     topk_lengths_ptr,
-    output_ptr,
     n_queries,
     selected_k,
     HEAD_DIM: tl.constexpr,
@@ -146,7 +145,7 @@ def _unpack_gather_bf16_kernel(
     PACKED_ROWS,
     FREQ_ROWS,
 ):
-    """Gather packed rows and reconstruct pre-RoPE BF16 rows."""
+    """Shared guarded gather; return pre-round FP32 values, raw row and validity."""
     selected_row = tl.program_id(0)
     query = selected_row // selected_k
     k = selected_row % selected_k
@@ -189,7 +188,138 @@ def _unpack_gather_bf16_kernel(
     ).to(tl.int32)
     scale = tl.exp2((scale_code - 127).to(tl.float32))
     value = tl.where(valid & kept & in_bounds, fp8 * scale, 0.0)
+    return value, raw, valid
+
+
+@triton.jit(do_not_specialize=_GATHER_RUNTIME_PARAMETERS)
+def _unpack_gather_bf16_kernel(
+    values_ptr,
+    bitmap_ptr,
+    scales_ptr,
+    physical_indices_ptr,
+    raw_indices_ptr,
+    topk_lengths_ptr,
+    output_ptr,
+    n_queries,
+    selected_k,
+    HEAD_DIM: tl.constexpr,
+    KEEP_K: tl.constexpr,
+    BITMAP_WORDS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PHYSICAL_STRIDE_Q,
+    PHYSICAL_STRIDE_K: tl.constexpr,
+    RAW_STRIDE_Q,
+    RAW_STRIDE_K: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    PACKED_ROWS,
+    FREQ_ROWS,
+):
+    """Known-good split reader: materialize pre-RoPE BF16 rows."""
+    value, _, _ = _unpack_gather_row(
+        values_ptr,
+        bitmap_ptr,
+        scales_ptr,
+        physical_indices_ptr,
+        raw_indices_ptr,
+        topk_lengths_ptr,
+        n_queries,
+        selected_k,
+        HEAD_DIM,
+        KEEP_K,
+        BITMAP_WORDS,
+        BLOCK_D,
+        PHYSICAL_STRIDE_Q,
+        PHYSICAL_STRIDE_K,
+        RAW_STRIDE_Q,
+        RAW_STRIDE_K,
+        LENGTH_STRIDE,
+        PACKED_ROWS,
+        FREQ_ROWS,
+    )
+    selected_row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_D)
+    in_bounds = offs < HEAD_DIM
     tl.store(output_ptr + selected_row * HEAD_DIM + offs, value, mask=in_bounds)
+
+
+@triton.jit(do_not_specialize=_GATHER_RUNTIME_PARAMETERS)
+def _unpack_gather_bf16_rope_kernel(
+    values_ptr,
+    bitmap_ptr,
+    scales_ptr,
+    physical_indices_ptr,
+    raw_indices_ptr,
+    topk_lengths_ptr,
+    freq_ptr,
+    output_ptr,
+    n_queries,
+    selected_k,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_PAIRS: tl.constexpr,
+    KEEP_K: tl.constexpr,
+    BITMAP_WORDS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PHYSICAL_STRIDE_Q,
+    PHYSICAL_STRIDE_K: tl.constexpr,
+    RAW_STRIDE_Q,
+    RAW_STRIDE_K: tl.constexpr,
+    LENGTH_STRIDE: tl.constexpr,
+    PACKED_ROWS,
+    FREQ_ROWS,
+):
+    """Opt-in fused read: preserve the split reader's intermediate BF16 rounding.
+
+    Adjacent logical coordinates form complex pairs, even when only one is
+    retained. Rotate both reconstructed components, including pruned zero lanes.
+    XOR-1 gathers each partner from the same 512-coordinate register vector;
+    no dense intermediate or cross-program synchronization is required.
+    """
+    value, raw, valid = _unpack_gather_row(
+        values_ptr,
+        bitmap_ptr,
+        scales_ptr,
+        physical_indices_ptr,
+        raw_indices_ptr,
+        topk_lengths_ptr,
+        n_queries,
+        selected_k,
+        HEAD_DIM,
+        KEEP_K,
+        BITMAP_WORDS,
+        BLOCK_D,
+        PHYSICAL_STRIDE_Q,
+        PHYSICAL_STRIDE_K,
+        RAW_STRIDE_Q,
+        RAW_STRIDE_K,
+        LENGTH_STRIDE,
+        PACKED_ROWS,
+        FREQ_ROWS,
+    )
+    # The split path stores BF16 before its RoPE kernel reloads FP32. Do not
+    # rotate the unrounded dequantized value merely because it is in registers.
+    value = value.to(tl.bfloat16).to(tl.float32)
+    offs = tl.arange(0, BLOCK_D)
+    partner = tl.gather(value, offs ^ 1, axis=0)
+    tail = (offs >= NOPE_DIM) & (offs < HEAD_DIM)
+    pair = (offs - NOPE_DIM) // 2
+    freq_base = raw * 4 * ROPE_PAIRS + pair
+    c = tl.load(freq_ptr + freq_base * 2, mask=valid & tail, other=1.0).to(tl.float32)
+    s = tl.load(freq_ptr + freq_base * 2 + 1, mask=valid & tail, other=0.0).to(
+        tl.float32
+    )
+    # Keep the operand order of the separate complex rotation, including the
+    # imaginary component's real*s + imag*c expression and final BF16 store.
+    even = offs % 2 == 0
+    x_real = tl.where(even, value, partner)
+    x_imag = tl.where(even, partner, value)
+    rotated = tl.where(even, x_real * c - x_imag * s, x_real * s + x_imag * c)
+    result = tl.where(tail, rotated, value)
+    tl.store(
+        output_ptr + tl.program_id(0) * HEAD_DIM + offs,
+        result,
+        mask=offs < HEAD_DIM,
+    )
 
 
 @triton.jit(do_not_specialize=_GATHER_RUNTIME_PARAMETERS)
