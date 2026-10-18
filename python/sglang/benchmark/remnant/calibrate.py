@@ -10,7 +10,6 @@ import copy
 import csv
 import hashlib
 import io
-import importlib.util
 import json
 import math
 import os
@@ -774,6 +773,42 @@ def audit_published_capture(root, scratch):
     return proof
 
 
+def capture_preflight(root: Path, published: Path, model: Path, port: int) -> None:
+    """Check prepared capture inputs and actual mounts, without loading a model.
+
+    Server lifecycle, deadlines and container ownership belong to the shell
+    launcher. This command is also safe in its GPU-free preflight container.
+    """
+    import socket
+    import tempfile
+
+    if not 1 <= port <= 65535:
+        raise ValueError("port in 1..65535 required")
+    if any(not p.is_absolute() or p.resolve() == Path("/") for p in (root, published, model)):
+        raise ValueError("explicit absolute, non-root capture/model/publication directories required")
+    if root.resolve() == published.resolve():
+        raise ValueError("scratch and persistent destinations must differ")
+    if not model.is_dir() or not (root / "replay.jsonl").is_file():
+        raise ValueError("model directory and prepared capture root/replay.jsonl required")
+    config = json.loads((root / "capture-config.json").read_text())
+    if config.get("storage_schema_version") != 2 or not isinstance(config.get("audit_shared"), bool):
+        raise ValueError("schema 2 and an explicit audit_shared policy are required")
+    if config.get("concurrency") != 2:
+        raise ValueError("capture pilot requires concurrency two")
+    if not config["audit_shared"]:
+        verify_shared_rollout(config, json.loads((root / "shared-audit-proof.json").read_text()))
+    published.mkdir(parents=True, exist_ok=True)
+    for destination in (root, published):
+        # Access bits alone do not detect read-only mounts.
+        with tempfile.TemporaryFile(dir=destination) as probe:
+            probe.write(b"capture mount probe")
+            probe.flush()
+    if shutil.disk_usage(root).free < 50 * 1024**3:
+        raise ValueError(f"local scratch {root} must leave 50 GiB free")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", port))
+
+
 def capture_client(root, endpoint, deadline, publish_root=None):
     import requests
     config = json.loads((root / "capture-config.json").read_text())
@@ -1238,11 +1273,12 @@ def report(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "capture-client", "replay", "report", "archive", "audit-shared"))
+    parser.add_argument("command", choices=("preflight", "capture-preflight", "capture-client", "replay", "report", "archive", "audit-shared"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cohort", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--endpoint", default="http://127.0.0.1:30000")
+    parser.add_argument("--port", type=int, default=30312)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--resume", action="store_true")
@@ -1260,6 +1296,10 @@ def main():
         print(json.dumps(audit_published_capture(args.root, args.scratch_root)))
     elif args.command == "preflight":
         preflight(args.cohort, args.model, args.root, args.storage_schema, args.audit_shared)
+    elif args.command == "capture-preflight":
+        if args.model is None or args.publish_root is None:
+            parser.error("capture-preflight requires --model and --publish-root")
+        capture_preflight(args.root, args.publish_root, args.model, args.port)
     elif args.command == "capture-client":
         capture_client(args.root, args.endpoint, deadline, args.publish_root)
     elif args.command == "replay":
