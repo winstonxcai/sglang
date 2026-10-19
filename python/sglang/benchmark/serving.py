@@ -5,6 +5,7 @@
 
 """
 Benchmark online serving with dynamic requests.
+Author: Winston Cai. (recorded tool-call benchmark support)
 
 Usage:
 python3 -m sglang.benchmark.serving --backend sglang --num-prompt 10
@@ -145,7 +146,12 @@ def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
     # standard field when both are present to avoid counting the same tokens
     # twice on servers that expose aliases.
     reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-    return reasoning + (message.get("content") or "")
+    # Tool-call-only responses are real output too. Keep their deltas for
+    # first-output timing; serialized text is only a retokenization diagnostic,
+    # while the server's usage count supplies generated-token throughput.
+    tool_calls = message.get("tool_calls")
+    tool_text = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else ""
+    return reasoning + (message.get("content") or "") + tool_text
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -391,9 +397,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    assert api_url.endswith("chat/completions"), (
+        "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    )
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -461,6 +467,8 @@ async def async_request_openai_chat_completions(
 
         generated_text = ""
         output_len = request_func_input.output_len
+        usage_received = False
+        require_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -513,9 +521,16 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
+                                reported_tokens = (data.get("usage") or {}).get(
+                                    "completion_tokens"
                                 )
+                                if (
+                                    isinstance(reported_tokens, int)
+                                    and not isinstance(reported_tokens, bool)
+                                    and reported_tokens >= 0
+                                ):
+                                    output_len = reported_tokens
+                                    usage_received = True
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
@@ -546,6 +561,12 @@ async def async_request_openai_chat_completions(
                                     most_recent_timestamp = timestamp
                                     generated_text += content
 
+                        if require_usage and not usage_received:
+                            raise ValueError(
+                                "Server omitted requested streaming completion-token usage"
+                            )
+                        if require_usage and ttft == 0.0:
+                            raise ValueError("Server returned no output event")
                         output.generated_text = generated_text
                         output.success = True
                         output.latency = latency

@@ -1,3 +1,5 @@
+"""OpenAI request loader, including recorded length estimates. Author: Winston Cai."""
+
 import json
 from argparse import Namespace
 from dataclasses import dataclass
@@ -46,6 +48,9 @@ def sample_openai_requests(
     Each line should be a JSON object with:
     - "messages": list of {"role": str, "content": str}
     - "max_tokens": int (used as output_len if fixed_output_len not set)
+    - "prompt_len": optional nonnegative integer estimate from a recorded trace;
+      zero denotes unavailable accounting, not an empty prompt. Bypasses local
+      chat-template rendering without changing messages or tools.
     - "tools": optional list of tool definitions
     - "temperature": optional temperature value
     - "top_p": optional top_p value
@@ -67,7 +72,13 @@ def sample_openai_requests(
     # These are either handled separately or are metadata
     # max_tokens is excluded because it's handled via output_len -> max_completion_tokens
     # max_completion_tokens is also excluded to avoid conflicts
-    EXCLUDED_FIELDS = {"messages", "max_tokens", "max_completion_tokens", "model"}
+    EXCLUDED_FIELDS = {
+        "messages",
+        "max_tokens",
+        "max_completion_tokens",
+        "model",
+        "prompt_len",
+    }
 
     filtered_dataset: List[DatasetRow] = []
     for data in dataset:
@@ -83,15 +94,26 @@ def sample_openai_requests(
 
         # Calculate prompt length by applying chat template
         # This includes the messages but not the tools
-        prompt_len = len(
-            tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
+        prompt_len = data.get("prompt_len")
+        if prompt_len is not None:
+            if (
+                not isinstance(prompt_len, int)
+                or isinstance(prompt_len, bool)
+                or prompt_len < 0
+            ):
+                raise ValueError(
+                    "OpenAI dataset prompt_len must be a nonnegative integer"
+                )
+        else:
+            prompt_len = len(
+                tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True
+                )
             )
-        )
 
         # If tools are present, we need to add their token count
         # Tools are sent as part of the request and count toward input tokens
-        if "tools" in extra_body:
+        if "tools" in extra_body and data.get("prompt_len") is None:
             # Encode tools as JSON string to estimate token count
             tools_str = json.dumps(extra_body["tools"])
             tools_tokens = len(tokenizer.encode(tools_str))
