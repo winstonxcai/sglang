@@ -11,7 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""TokenizerManager is a process that tokenizes the text."""
+"""TokenizerManager is a process that tokenizes the text.
+
+Remnant frontend transport diagnostics. Author: Winston Cai.
+"""
 
 from __future__ import annotations
 
@@ -113,7 +116,9 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
+    SGLANG_FRONTEND_DIAGNOSTICS,
     convert_time_to_realtime,
+    monotonic_time,
     real_time,
     set_time_batch,
 )
@@ -2201,11 +2206,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await async_sock_recv(self.recv_from_detokenizer)
+                if SGLANG_FRONTEND_DIAGNOSTICS:
+                    recv_time = monotonic_time()
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
             ):
-                await self._handle_batch_output(recv_obj)
+                if SGLANG_FRONTEND_DIAGNOSTICS:
+                    await self._handle_batch_output(recv_obj, recv_time=recv_time)
+                else:
+                    await self._handle_batch_output(recv_obj)
             else:
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
@@ -2218,7 +2228,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
         ],
+        *,
+        recv_time: Optional[float] = None,
     ):
+        # Author: Winston Cai. Keep receive and per-request handling distinct;
+        # unpickling and earlier requests in this batch may consume CPU time.
         recv_obj.time_stats = unwrap_from_pickle(recv_obj.time_stats)
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
@@ -2227,6 +2241,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
+            if SGLANG_FRONTEND_DIAGNOSTICS:
+                handle_time = monotonic_time()
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
@@ -2236,6 +2252,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
+
+            if SGLANG_FRONTEND_DIAGNOSTICS:
+                state.time_stats.record_frontend_first_output(
+                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None,
+                    recv_time if recv_time is not None else 0.0,
+                    handle_time,
+                )
 
             # Build meta_info and return value
             meta_info = {
@@ -2460,7 +2483,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if get_spec().speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                if self.enable_metrics:
+                if self.enable_metrics or SGLANG_FRONTEND_DIAGNOSTICS:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]
                         if recv_obj.time_stats is not None

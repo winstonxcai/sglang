@@ -17,6 +17,8 @@ from __future__ import annotations
 """
 Mixin classes and utils for multi-http-worker mode
 This file uses multiple processes to handle requests and tokenization, reducing the overhead of python and http server.
+
+Remnant frontend transport diagnostics. Author: Winston Cai.
 """
 
 import asyncio
@@ -61,6 +63,10 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.req_time_stats import (
+    SGLANG_FRONTEND_DIAGNOSTICS,
+    monotonic_time,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -404,8 +410,18 @@ class MultiHttpWorkerDetokenizerMixin:
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
+                if SGLANG_FRONTEND_DIAGNOSTICS:
+                    recv_time = monotonic_time()
+            if SGLANG_FRONTEND_DIAGNOSTICS:
+                self._record_output_transport_time(
+                    recv_obj, "detokenizer_recv_time", recv_time
+                )
             output = self._request_dispatcher(recv_obj)
             if output is not None:
+                if SGLANG_FRONTEND_DIAGNOSTICS:
+                    self._record_output_transport_time(
+                        output, "detokenizer_send_time", monotonic_time()
+                    )
                 # Fan out the output back to the originating tokenizer worker(s).
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.

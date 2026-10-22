@@ -11,7 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DetokenizerManager is a process that detokenizes the token ids."""
+"""DetokenizerManager is a process that detokenizes the token ids.
+
+Remnant frontend transport diagnostics. Author: Winston Cai.
+"""
 
 import dataclasses
 import logging
@@ -36,9 +39,15 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     sock_recv,
     sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.req_time_stats import (
+    SGLANG_FRONTEND_DIAGNOSTICS,
+    monotonic_time,
+)
 from sglang.srt.runtime_context import get_device, get_serving, publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
@@ -169,10 +178,42 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
+                if SGLANG_FRONTEND_DIAGNOSTICS:
+                    recv_time = monotonic_time()
+            if SGLANG_FRONTEND_DIAGNOSTICS:
+                self._record_output_transport_time(
+                    recv_obj, "detokenizer_recv_time", recv_time
+                )
             output = self._request_dispatcher(recv_obj)
             if output is not None:
+                if SGLANG_FRONTEND_DIAGNOSTICS:
+                    self._record_output_transport_time(
+                        output, "detokenizer_send_time", monotonic_time()
+                    )
                 sock_send(self.send_to_tokenizer, output)
             self.soft_watchdog.feed()
+
+    def _record_output_transport_time(
+        self,
+        output: Union[BatchTokenIDOutput, BatchStrOutput],
+        field_name: str,
+        timestamp: float,
+    ) -> None:
+        """Preserve per-packet stages across pickle and msgpack IPC.
+
+        Unwrapping rebases scheduler clocks into this process. Rewrapping before
+        forwarding is required for msgpack and recalibrates the next IPC hop.
+        The API manager latches the first packet, never a later snapshot.
+        """
+        if not isinstance(output, (BatchTokenIDOutput, BatchStrOutput)):
+            return
+        time_stats = unwrap_from_pickle(output.time_stats)
+        if time_stats is None:
+            return
+        for stats in time_stats:
+            if stats is not None:
+                setattr(stats, field_name, timestamp)
+        output.time_stats = wrap_as_pickle(time_stats)
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool

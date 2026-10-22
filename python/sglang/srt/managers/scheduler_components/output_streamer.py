@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Remnant frontend transport diagnostics. Author: Winston Cai.
+
 import logging
 from dataclasses import dataclass, field
 from typing import (
@@ -27,6 +29,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability.req_time_stats import (
+    SGLANG_FRONTEND_DIAGNOSTICS,
+    monotonic_time,
+)
 from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -169,6 +175,13 @@ class SchedulerOutputStreamer:
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
+
+        # Stamp included requests after result/cache processing, before serialization.
+        if SGLANG_FRONTEND_DIAGNOSTICS:
+            send_time = monotonic_time()
+            for time_stats in acc.time_stats:
+                if time_stats.first_output_send_time == 0.0:
+                    time_stats.first_output_send_time = send_time
 
         # Send to detokenizer
         payload = acc.to_payload(

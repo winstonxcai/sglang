@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+# Startup-only diagnostics; no extra timestamps are collected by default.
+SGLANG_FRONTEND_DIAGNOSTICS = get_bool_env_var("SGLANG_FRONTEND_DIAGNOSTICS")
 
 
 logger = logging.getLogger(__name__)
@@ -393,6 +395,38 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
 
+    # First output-batch diagnostics, on this process's perf_counter clock.
+    # Copy the first packet's stages because later scheduler snapshots do not
+    # contain the detokenizer's earlier receive/send stamps.
+    first_output_send_time: float = 0.0
+    detokenizer_recv_time: float = 0.0
+    detokenizer_send_time: float = 0.0
+    frontend_recv_time: float = 0.0
+    frontend_handle_time: float = 0.0
+    _frontend_diagnostics_recorded: bool = field(default=False, init=False, repr=False)
+
+    def record_frontend_first_output(
+        self,
+        scheduler_stats: Optional[SchedulerReqTimeStats],
+        recv_time: float,
+        handle_time: float,
+    ) -> None:
+        """Latch the first output batch without changing first-token semantics.
+
+        Transport stamps have already been rebased by ReqTimeStatsBase while
+        deserializing. Missing scheduler timing remains unset, even if a later
+        packet contains timing; combining different packets would hide gaps.
+        """
+        if not SGLANG_FRONTEND_DIAGNOSTICS or self._frontend_diagnostics_recorded:
+            return
+        self._frontend_diagnostics_recorded = True
+        self.frontend_recv_time = recv_time
+        self.frontend_handle_time = handle_time
+        if scheduler_stats is not None:
+            self.first_output_send_time = scheduler_stats.first_output_send_time
+            self.detokenizer_recv_time = scheduler_stats.detokenizer_recv_time
+            self.detokenizer_send_time = scheduler_stats.detokenizer_send_time
+
     def __getstate__(self) -> object:
         state = {}
         # send to DP controller or Scheduler
@@ -516,6 +550,18 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 self.finished_time
             )
 
+        if SGLANG_FRONTEND_DIAGNOSTICS:
+            for name in (
+                "first_output_send",
+                "detokenizer_recv",
+                "detokenizer_send",
+                "frontend_recv",
+                "frontend_handle",
+            ):
+                timestamp = getattr(self, f"{name}_time")
+                if timestamp > 0.0:
+                    meta_info[f"{name}_ts"] = convert_time_to_realtime(timestamp)
+
         decode_latency = self.get_decode_latency()
         if decode_latency > 0.0 and completion_tokens > 1:
             meta_info["decode_throughput"] = (completion_tokens - 1) / decode_latency
@@ -619,6 +665,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
+    # Optional output transport diagnostics. Zero denotes an unstamped stage.
+    # The scheduler stamps its first emitted batch before IPC serialization;
+    # detokenizer receive/send stamps describe the packet being forwarded.
+    first_output_send_time: float = 0.0
+    detokenizer_recv_time: float = 0.0
+    detokenizer_send_time: float = 0.0
+
     # prefill node, get by time.perf_counter()
     prefill_bootstrap_queue_entry_time: float = 0.0
     prefill_transfer_queue_entry_time: float = 0.0
@@ -654,7 +707,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not (self.enable_metrics or self.has_timing_data):
+        if not (
+            self.enable_metrics or self.has_timing_data or SGLANG_FRONTEND_DIAGNOSTICS
+        ):
             return {}
 
         state = {
@@ -664,6 +719,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        if SGLANG_FRONTEND_DIAGNOSTICS:
+            state.update(
+                first_output_send_time=self.first_output_send_time,
+                detokenizer_recv_time=self.detokenizer_recv_time,
+                detokenizer_send_time=self.detokenizer_send_time,
+            )
         return state
 
     def set_scheduler_recv_time(self, ts=None):
