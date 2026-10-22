@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Scoped DSV4 asynchronous preparation. Author: Winston Cai.
+
 import json
 import logging
 import uuid
@@ -90,7 +92,7 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
+            adapted_request, processed_request = await self._convert_to_internal_request_async(
                 request, raw_request
             )
 
@@ -147,6 +149,17 @@ class OpenAIServingBase(ABC):
             return rid
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+
+    async def _convert_to_internal_request_async(
+        self,
+        request: OpenAIServingRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
+        """Preserve synchronous conversion unless an endpoint opts into offload."""
+        return self._convert_to_internal_request(request, raw_request)
+
+    async def aclose(self) -> None:
+        """Release endpoint-owned background resources at HTTP shutdown."""
 
     @abstractmethod
     def _convert_to_internal_request(

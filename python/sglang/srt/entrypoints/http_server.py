@@ -418,16 +418,21 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
-        if sidecar is not None:
-            try:
-                sidecar.stop()
-            except Exception:
-                logger.exception("Failed to stop sidecar")
-        _shutdown_native_grpc_server(grpc_handle)
-        if tool_server is not None and hasattr(tool_server, "aclose"):
-            await tool_server.aclose()
-        if warmup_thread is not None:
-            warmup_thread.join()
+        # Author: Winston Cai. Drain the optional DSV4 input worker before the
+        # HTTP event loop closes; its completion callbacks release admission.
+        try:
+            await fast_api_app.state.openai_serving_chat.aclose()
+        finally:
+            if sidecar is not None:
+                try:
+                    sidecar.stop()
+                except Exception:
+                    logger.exception("Failed to stop sidecar")
+            _shutdown_native_grpc_server(grpc_handle)
+            if tool_server is not None and hasattr(tool_server, "aclose"):
+                await tool_server.aclose()
+            if warmup_thread is not None:
+                warmup_thread.join()
 
 
 # Fast API

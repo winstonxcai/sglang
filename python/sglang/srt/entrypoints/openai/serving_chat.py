@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+# Scoped DSV4 asynchronous preparation. Author: Winston Cai.
+
+import asyncio
+import contextvars
 import copy
 import json
 import logging
 import math
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -20,7 +25,7 @@ class ThinkingMode(str, Enum):
 
 import jinja2
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
@@ -289,6 +294,81 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+
+        self._init_input_preparation()
+
+    def _init_input_preparation(self) -> None:
+        """Create one worker only for the explicitly enabled DSV4 text path."""
+        enabled = (
+            envs.SGLANG_DSV4_ASYNC_PREPARATION.get()
+            and self.chat_encoding_spec == "dsv4"
+            and not self.tokenizer_manager.model_config.is_multimodal
+        )
+        self._input_preparation_closed = False
+        self._input_preparation_gate = asyncio.Semaphore(1) if enabled else None
+        self._input_preparation_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv4-input")
+            if enabled
+            else None
+        )
+        if enabled:
+            logger.info("DSV4 asynchronous input preparation enabled: one CPU worker")
+
+    async def _convert_to_internal_request_async(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        executor = self._input_preparation_executor
+        if executor is None:
+            return self._convert_to_internal_request(request, raw_request)
+        if self._input_preparation_closed:
+            raise HTTPException(status_code=503, detail="Input preparation is closed")
+        if request.input_ids is not None:
+            return self._convert_to_internal_request(request, raw_request)
+
+        # Do not submit an unbounded executor queue. Only the admitted request
+        # may mutate its request-local inputs. The received timestamp was taken
+        # before this wait, so queue time remains part of end-to-end TTFT.
+        gate = self._input_preparation_gate
+        assert gate is not None
+        await gate.acquire()
+        if self._input_preparation_closed:
+            gate.release()
+            raise HTTPException(status_code=503, detail="Input preparation is closed")
+        loop = asyncio.get_running_loop()
+        context = contextvars.copy_context()
+        try:
+            concurrent_result = executor.submit(
+                context.run, self._convert_to_internal_request, request, raw_request
+            )
+        except BaseException:
+            gate.release()
+            raise
+
+        # asyncio/AnyIO task cancellation cannot stop a running Python thread.
+        # The concurrent future, rather than the cancelling caller, owns this
+        # slot until conversion really ends. No cancelled caller can dispatch
+        # the completed result to the scheduler later.
+        concurrent_result.add_done_callback(
+            lambda completed: loop.call_soon_threadsafe(gate.release)
+        )
+        result = asyncio.wrap_future(concurrent_result, loop=loop)
+        # Retrieve an exception even if the HTTP caller disconnects/cancels.
+        result.add_done_callback(
+            lambda completed: None if completed.cancelled() else completed.exception()
+        )
+        adapted = await asyncio.shield(result)
+        if self._input_preparation_closed:
+            raise HTTPException(status_code=503, detail="Input preparation is closed")
+        return adapted
+
+    async def aclose(self) -> None:
+        """Drain the owned worker without blocking the output event loop."""
+        self._input_preparation_closed = True
+        executor = self._input_preparation_executor
+        if executor is not None:
+            await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=False)
 
     def _handle_last_assistant_message(
         self,

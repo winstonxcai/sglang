@@ -1,5 +1,7 @@
 """
 Unit-tests for OpenAIServingChat -- rewritten to use only the std-lib 'unittest'.
+
+DSV4 asynchronous input preparation regression checks. Author: Winston Cai.
 Run with either:
     python tests/test_serving_chat_unit.py -v
 or
@@ -10,14 +12,21 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
+import contextvars
+import copy
+import dataclasses
 import json
+import threading
+import time
 import tempfile
 import unittest
 import uuid
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import Request
 
@@ -3427,6 +3436,215 @@ class InklingReasoningEffortTest(unittest.TestCase):
             prompt_ids[-1],
             INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
         )
+
+
+
+class AsyncInputPreparationTests(unittest.IsolatedAsyncioTestCase):
+    """Use the actual converter with independent tokenizer and thread fixtures."""
+
+    def make_serving(self, enabled=True, *, encoding="dsv4", multimodal=False):
+        class ByteTokenizer:
+            bos_token_id = None
+
+            def encode(self, text):
+                return list(text.encode("utf-8"))
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.tokenizer_manager = SimpleNamespace(
+            tokenizer=ByteTokenizer(),
+            model_config=SimpleNamespace(is_multimodal=multimodal),
+            request_logger=SimpleNamespace(log_requests=False, log_requests_level=0),
+        )
+        serving.chat_encoding_spec = encoding
+        serving._dsv4_reasoning_effort_profile = "official"
+        serving.template_manager = SimpleNamespace(
+            chat_template_name=None, jinja_template_content_format="string"
+        )
+        serving.default_chat_template_kwargs = {}
+        serving.default_sampling_params = {}
+        serving.tool_call_parser = serving.reasoning_parser = None
+        serving.is_gpt_oss = serving.is_gemma4 = False
+        serving._tokenizer_auto_adds_specials = False
+        serving.allowed_custom_labels = None
+        serving._validate_request = lambda request: None
+        with envs.SGLANG_DSV4_ASYNC_PREPARATION.override(enabled):
+            serving._init_input_preparation()
+        self.addAsyncCleanup(serving.aclose)
+        return serving
+
+    @staticmethod
+    def request(**kwargs):
+        return ChatCompletionRequest(
+            model="test", messages=[{"role": "user", "content": "hello ∑"}], **kwargs
+        )
+
+    async def wait_started(self, event):
+        self.assertTrue(await asyncio.to_thread(event.wait, 2), "worker did not start")
+
+    async def test_disabled_and_other_models_create_no_executor(self):
+        for enabled, encoding, multimodal in (
+            (False, "dsv4", False), (True, None, False), (True, "dsv4", True)
+        ):
+            with self.subTest(enabled=enabled, encoding=encoding, multimodal=multimodal):
+                serving = self.make_serving(enabled, encoding=encoding, multimodal=multimodal)
+                self.assertIsNone(serving._input_preparation_executor)
+                thread = threading.get_ident()
+                serving._convert_to_internal_request = lambda request, raw: threading.get_ident()
+                self.assertEqual(await serving._convert_to_internal_request_async(self.request()), thread)
+
+    async def test_actual_dsv4_converter_preserves_ids_tools_reasoning_and_options(self):
+        serving = self.make_serving()
+        cases = [
+            self.request(temperature=0, max_tokens=17),
+            self.request(reasoning_effort="high", chat_template_kwargs={"thinking": True}),
+            ChatCompletionRequest(
+                model="test", messages=[{"role": "user", "content": [
+                    {"type": "text", "text": "find ∑"}]}],
+                tools=[{"type": "function", "function": {"name": "search",
+                    "description": "search repository", "parameters": {
+                        "type": "object", "properties": {"q": {"type": "string"}}}}}],
+                tool_choice="auto", parallel_tool_calls=False,
+            ),
+            ChatCompletionRequest(model="test", messages=[
+                {"role": "user", "content": "write"},
+                {"role": "assistant", "content": "prefix"}], continue_final_message=True),
+        ]
+        for request in cases:
+            with self.subTest(request=request):
+                expected = serving._convert_to_internal_request(request.model_copy(deep=True))
+                actual = await serving._convert_to_internal_request_async(request.model_copy(deep=True))
+                self.assertEqual(dataclasses.asdict(actual[0]), dataclasses.asdict(expected[0]))
+                self.assertEqual(actual[1].model_dump(), expected[1].model_dump())
+                self.assertTrue(actual[0].input_ids)
+
+    async def test_pretokenized_request_and_contextvars(self):
+        serving = self.make_serving()
+        local = contextvars.ContextVar("preparation-test", default="absent")
+        local.set("present")
+        loop_thread = threading.get_ident()
+        observed = []
+        serving._convert_to_internal_request = lambda request, raw: observed.append(
+            (threading.get_ident(), local.get()))
+        await serving._convert_to_internal_request_async(self.request())
+        self.assertNotEqual(observed[-1][0], loop_thread)
+        self.assertEqual(observed[-1][1], "present")
+        await serving._convert_to_internal_request_async(self.request(input_ids=[1, 2]))
+        self.assertEqual(observed[-1][0], loop_thread)
+
+    async def test_conversion_errors_retain_http_400_and_release_admission(self):
+        serving = self.make_serving()
+        request = ChatCompletionRequest(model="test", messages=[
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "bad",
+                "type": "function", "function": {"name": "search", "arguments": "{"}}]},
+            {"role": "user", "content": "continue"}])
+        with self.assertRaises(ValueError) as expected:
+            serving._convert_to_internal_request(request.model_copy(deep=True))
+        response = await serving.handle_request(request.model_copy(deep=True), None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(str(expected.exception), json.loads(response.body)["message"])
+        # The failure must not leave the only preparation slot occupied.
+        await asyncio.wait_for(serving._convert_to_internal_request_async(self.request()), 2)
+
+    async def test_native_cancellation_retains_worker_slot_and_never_dispatches(self):
+        serving = self.make_serving()
+        first_started, release, second_started = (threading.Event() for _ in range(3))
+        dispatch = AsyncMock(return_value="dispatched")
+        serving._handle_non_streaming_request = dispatch
+        calls = []
+        def convert(request, raw):
+            calls.append(request.extra_key)
+            if request.extra_key == "first":
+                first_started.set()
+                if not release.wait(3):
+                    raise TimeoutError("test failed to release first conversion")
+                raise ValueError("cancelled conversion result must be consumed")
+            second_started.set()
+            return GenerateReqInput(input_ids=[1]), request
+        serving._convert_to_internal_request = convert
+        first = asyncio.create_task(serving.handle_request(self.request(extra_key="first"), None))
+        try:
+            await self.wait_started(first_started)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            queued = asyncio.create_task(serving.handle_request(self.request(extra_key="queued"), None))
+            await asyncio.sleep(.02)
+            queued.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await queued
+            admitted_at = time.perf_counter()
+            second = asyncio.create_task(serving.handle_request(self.request(extra_key="second"), None))
+            await asyncio.sleep(.02)
+            self.assertFalse(second_started.is_set())
+            dispatch.assert_not_called()
+            released_at = time.perf_counter()
+            release.set()
+            self.assertEqual(await asyncio.wait_for(second, 2), "dispatched")
+            self.assertEqual(calls, ["first", "second"])
+            dispatch.assert_awaited_once()
+            self.assertGreaterEqual(dispatch.await_args.args[0].received_time, admitted_at)
+            self.assertLess(dispatch.await_args.args[0].received_time, released_at)
+        finally:
+            release.set()
+
+    async def test_anyio_cancellation_retains_worker_slot(self):
+        import anyio
+        serving = self.make_serving()
+        started, release, other_started = (threading.Event() for _ in range(3))
+        serving._handle_non_streaming_request = AsyncMock(return_value="dispatched")
+        scope_ready = asyncio.Future()
+        def convert(request, raw):
+            if request.extra_key == "first":
+                started.set()
+                if not release.wait(3):
+                    raise TimeoutError("test failed to release conversion")
+            else:
+                other_started.set()
+            return GenerateReqInput(input_ids=[1]), request
+        serving._convert_to_internal_request = convert
+        async def first():
+            with anyio.CancelScope() as scope:
+                scope_ready.set_result(scope)
+                await serving.handle_request(self.request(extra_key="first"), None)
+        caller = asyncio.create_task(first())
+        try:
+            scope = await scope_ready
+            await self.wait_started(started)
+            scope.cancel()
+            await asyncio.wait_for(caller, 2)
+            other = asyncio.create_task(serving.handle_request(self.request(extra_key="other"), None))
+            await asyncio.sleep(.02)
+            self.assertFalse(other_started.is_set())
+            serving._handle_non_streaming_request.assert_not_called()
+            release.set()
+            self.assertEqual(await asyncio.wait_for(other, 2), "dispatched")
+            serving._handle_non_streaming_request.assert_awaited_once()
+        finally:
+            release.set()
+
+    async def test_close_drains_responsively_without_late_dispatch(self):
+        serving = self.make_serving()
+        started, release = threading.Event(), threading.Event()
+        serving._handle_non_streaming_request = AsyncMock(return_value="dispatched")
+        def convert(request, raw):
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("test failed to release conversion")
+            return GenerateReqInput(input_ids=[1]), request
+        serving._convert_to_internal_request = convert
+        caller = asyncio.create_task(serving.handle_request(self.request(), None))
+        try:
+            await self.wait_started(started)
+            close = asyncio.create_task(serving.aclose())
+            await asyncio.sleep(.02)
+            self.assertFalse(close.done())
+            release.set()
+            await asyncio.wait_for(close, 2)
+            response = await asyncio.wait_for(caller, 2)
+            self.assertEqual(response.status_code, 503)
+            serving._handle_non_streaming_request.assert_not_called()
+        finally:
+            release.set()
 
 
 if __name__ == "__main__":

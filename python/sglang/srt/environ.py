@@ -1202,6 +1202,8 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Scoped DSV4 input preparation candidate. Author: Winston Cai.
+    SGLANG_DSV4_ASYNC_PREPARATION = EnvBool(False)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
