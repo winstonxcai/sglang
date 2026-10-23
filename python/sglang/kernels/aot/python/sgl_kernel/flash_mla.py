@@ -1,3 +1,8 @@
+"""Python bindings and dispatch for the Remnant FlashMLA extension.
+
+Author: Winston Cai.
+"""
+
 import dataclasses
 from typing import Optional, Tuple
 
@@ -107,6 +112,9 @@ def flash_mla_with_kvcache(
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     kv_format: Optional[str] = None,
+    remnant_buffers: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    remnant_raw_indices: Optional[torch.Tensor] = None,
+    remnant_freqs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -153,8 +161,15 @@ def flash_mla_with_kvcache(
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
             kv_format=kv_format,
+            remnant_buffers=remnant_buffers,
+            remnant_raw_indices=remnant_raw_indices,
+            remnant_freqs=remnant_freqs,
         )
 
+    if remnant_buffers is not None:
+        raise ValueError(
+            "Packed Direct requires FlashMLASchedMeta, not legacy tensor metadata"
+        )
     assert num_splits is not None
     assert block_table is not None
     assert cache_seqlens is not None
@@ -165,9 +180,9 @@ def flash_mla_with_kvcache(
     assert extra_topk_length is None
     if indices is not None:
         assert causal == False, "causal must be `false` if sparse attention is enabled."
-    assert (descale_q is None) == (descale_k is None), (
-        "descale_q and descale_k should be both None or both not None"
-    )
+    assert (descale_q is None) == (
+        descale_k is None
+    ), "descale_q and descale_k should be both None or both not None"
 
     if indices is not None:
         assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
@@ -250,6 +265,9 @@ def _flash_mla_with_kvcache_sched_meta(
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
     kv_format: Optional[str],
+    remnant_buffers: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    remnant_raw_indices: Optional[torch.Tensor],
+    remnant_freqs: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -291,14 +309,41 @@ def _flash_mla_with_kvcache_sched_meta(
         assert sched_meta.config.causal == causal, helper_msg
         assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, helper_msg
         assert sched_meta.config.topk == topk, helper_msg
-        assert sched_meta.config.extra_page_block_size == extra_page_block_size, (
-            helper_msg
-        )
+        assert (
+            sched_meta.config.extra_page_block_size == extra_page_block_size
+        ), helper_msg
         assert sched_meta.config.extra_topk == extra_topk, helper_msg
 
     if topk is not None:
         assert not causal, "causal must be False when sparse attention is enabled"
         assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
+        if remnant_buffers is not None:
+            assert extra_k_cache is None
+            assert remnant_raw_indices is not None and remnant_freqs is not None
+            values, bitmaps, scales = remnant_buffers
+            out, lse, new_tile_scheduler_metadata, new_num_splits = (
+                torch.ops.sgl_kernel.remnant_sparse_decode_fwd.default(
+                    q,
+                    k_cache,
+                    indices,
+                    topk_length,
+                    attn_sink,
+                    sched_meta.tile_scheduler_metadata,
+                    sched_meta.num_splits,
+                    extra_indices_in_kvcache,
+                    extra_topk_length,
+                    values,
+                    bitmaps,
+                    scales,
+                    remnant_raw_indices,
+                    remnant_freqs,
+                    head_dim_v,
+                    softmax_scale,
+                )
+            )
+            sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
+            sched_meta.num_splits = new_num_splits
+            return out, lse
         out, lse, new_tile_scheduler_metadata, new_num_splits = (
             torch.ops.sgl_kernel.sparse_decode_fwd.default(
                 q,

@@ -1,20 +1,22 @@
+# Authored by Winston Cai.
+
 # flash_mla
-# DeepSeek v4.1 kernels, 528 B/token caches read as V4.1 by default (sgl-project/FlashMLA@3620b63).
+# Build the selected local fork, never silently fetch a different FlashMLA.
+set(REMNANT_FLASHMLA_SOURCE_DIR "$ENV{REMNANT_FLASHMLA_SOURCE_DIR}" CACHE PATH
+    "Local Remnant FlashMLA v0.5.22 source tree")
+if(NOT EXISTS "${REMNANT_FLASHMLA_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h64.cu")
+    message(FATAL_ERROR "REMNANT_FLASHMLA_SOURCE_DIR must point to the v0.5.22 Packed fork")
+endif()
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3620b63fc4ebe33950c50e1b7701b6607f44150e.tar.gz
-    URL_HASH SHA256=7d7f9819bc1b121ef8226281de7265cd97be0cbe15d6450575fc8e3f241041a2
+    SOURCE_DIR ${REMNANT_FLASHMLA_SOURCE_DIR}
 )
 FetchContent_Populate(repo-flashmla)
 
-# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
-FetchContent_Declare(
-    repo-flashmla-cutlass
-    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
-    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
-    SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
-)
-FetchContent_Populate(repo-flashmla-cutlass)
+if(NOT EXISTS "${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include/cutlass/bfloat16.h")
+    message(FATAL_ERROR
+        "Initialize third_party/flashmla/csrc/cutlass before building FlashMLA")
+endif()
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
@@ -25,6 +27,8 @@ set(FLASHMLA_CUDA_FLAGS
 )
 
 set(FLASHMLA_ENABLE_SM100 OFF)
+option(SGL_KERNEL_ENABLE_FLASHMLA_SM100
+    "Build FlashMLA's SM100 targets in addition to SM90" OFF)
 
 # The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
 # Only build FlashMLA kernels if we are building for something compatible with
@@ -34,14 +38,14 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(${CUDA_VERSION} VERSION_GREATER 12.8 AND SGL_KERNEL_ENABLE_FLASHMLA_SM100)
     # sm_100f is compatible with all sm_10x
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100f,code=sm_100f"
     )
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+if(FLASHMLA_ENABLE_SM100 AND ${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # B300 is sm_103; sm_100f is family-compatible so it runs there, but ptxas emits
     # better SASS for the native arch. FlashMLA's setup.py picks sm_100a + sm_103a
     # over sm_100f for the same reason. The cutlass patch below is what lets a TU
@@ -109,6 +113,8 @@ set(FlashMLA_SOURCES
     # sm90 sparse decode.
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu
