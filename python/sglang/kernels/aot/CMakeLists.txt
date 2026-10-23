@@ -327,7 +327,7 @@ set(REMNANT_CUDA_FLAGS ${SGL_KERNEL_CUDA_FLAGS})
 list(FILTER REMNANT_CUDA_FLAGS EXCLUDE REGEX "^-gencode=")
 list(APPEND REMNANT_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
 target_compile_options(remnant_ops PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
+    $<$<COMPILE_LANGUAGE:CXX>:-std=c++${SGL_KERNEL_CXX_STANDARD}>
     $<$<COMPILE_LANGUAGE:CUDA>:${REMNANT_CUDA_FLAGS}>
 )
 target_include_directories(remnant_ops PRIVATE ${INCLUDES})

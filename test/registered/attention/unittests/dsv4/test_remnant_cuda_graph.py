@@ -67,7 +67,7 @@ class TestRemnantCudaGraph(CustomTestCase):
         actual = NativeWorkspace.allocate(2, 8, 4, "cuda")
         expected = NativeWorkspace.allocate(2, 8, 4, "cuda")
 
-        def pipeline():
+        def store():
             if implementation == "triton":
                 pack_rows(
                     latent,
@@ -80,9 +80,59 @@ class TestRemnantCudaGraph(CustomTestCase):
                 )
             else:
                 pack_rows_fused(latent, weight, 1e-6, plan, locations, buffers)
+
+        def reconstruct():
             unpack_gather_native(buffers, physical, raw, lengths, freqs, actual)
 
+        def pipeline():
+            store()
+            reconstruct()
+
         pipeline()
+        torch.cuda.synchronize()
+        # A warmed reconstruction must not make even transient allocator requests;
+        # pointer equality alone would miss these. Store/selection and attention
+        # have different allocation contracts and are deliberately outside this.
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        for _ in range(3):
+            reconstruct()
+        torch.cuda.synchronize()
+        self.assertEqual(torch.cuda.memory_stats()["allocation.all.allocated"], before)
+
+        producer, reader, consumer = (torch.cuda.Stream() for _ in range(3))
+        produced, reconstructed, consumed = (torch.cuda.Event() for _ in range(3))
+        observed = torch.empty_like(actual.native_bytes)
+        producer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(producer):
+            torch.cuda._sleep(100000)
+            latent.add_(0.25)
+            store()
+            produced.record()
+        with torch.cuda.stream(reader):
+            reader.wait_event(produced)
+            reconstruct()
+            reconstructed.record()
+        with torch.cuda.stream(consumer):
+            consumer.wait_event(reconstructed)
+            observed.copy_(actual.native_bytes)
+            consumed.record()
+        consumed.synchronize()  # Event order, not a device-wide fence.
+        source = latent.cpu()
+        independent = pack_rows_ref(
+            source,
+            topmag_keep_mask(source, keep_count / 512),
+            weight.cpu(),
+            1e-6,
+            keep_count=keep_count,
+        )
+        for actual_plane, reference_plane, destination in zip(
+            buffers, independent, reference_buffers
+        ):
+            self.assertTrue(torch.equal(actual_plane.cpu(), reference_plane))
+            destination.copy_(reference_plane)
+        unpack_gather_native(reference_buffers, physical, raw, lengths, freqs, expected)
+        self.assertTrue(torch.equal(observed, expected.native_bytes))
+
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             pipeline()
@@ -98,7 +148,12 @@ class TestRemnantCudaGraph(CustomTestCase):
                     [iteration + 1, 4 - iteration], device="cuda", dtype=torch.int32
                 )
             )
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(
+                torch.cuda.memory_stats()["allocation.all.allocated"], before
+            )
             # Build Packed records with the independent CPU numerical reference
             # outside capture, then compare reconstruction with these live inputs.
             source = latent.cpu()

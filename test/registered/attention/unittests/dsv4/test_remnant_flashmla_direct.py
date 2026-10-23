@@ -335,8 +335,32 @@ class TestRemnantFlashMLADirect:
 
         meta = flash_mla.get_mla_metadata()[0]
         for _ in range(3):
-            run(meta)
+            warm = run(meta)
         torch.cuda.synchronize()
+        # Force producer/attention/consumer ordering on three nondefault streams.
+        # Keep returned output/scratch owners alive until the consumer event.
+        producer, attention, consumer = (torch.cuda.Stream() for _ in range(3))
+        produced, attended, consumed = (torch.cuda.Event() for _ in range(3))
+        observed = tuple(torch.empty_like(x) for x in warm)
+        producer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(producer):
+            torch.cuda._sleep(100000)
+            q.add_(0.125)
+            produced.record()
+        with torch.cuda.stream(attention):
+            attention.wait_event(produced)
+            stream_output = run(meta)
+            attended.record()
+        with torch.cuda.stream(consumer):
+            consumer.wait_event(attended)
+            for destination, source in zip(observed, stream_output):
+                destination.copy_(source)
+            consumed.record()
+        consumed.synchronize()
+        expected = run(meta)
+        for actual, wanted in zip(observed, expected):
+            torch.testing.assert_close(actual, wanted, atol=2.0e-2, rtol=2.0e-2)
+
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = run(meta)
@@ -350,8 +374,10 @@ class TestRemnantFlashMLADirect:
         physical.copy_(physical.roll(1, dims=-1))
         raw.copy_(raw.roll(1, dims=-1))
         lengths.sub_(13)
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
         second = tuple(x.clone() for x in captured)
         eager = run(meta)
         assert torch.isfinite(second[0]).all(), "Replayed direct output is non-finite"
