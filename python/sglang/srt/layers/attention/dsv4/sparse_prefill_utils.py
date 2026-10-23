@@ -149,9 +149,9 @@ def combine_topk_swa_indices(
     assert compressed_base.dtype == torch.int32
     assert swa_base.dtype == torch.int32
     assert compress_ratio >= 1, "compress_ratio must be >= 1 (use topk=0 for SWA-only)"
-    assert topk_indices.shape[-1] >= topk, (
-        f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
-    )
+    assert (
+        topk_indices.shape[-1] >= topk
+    ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
 
     num_tokens = topk_indices.shape[0]
     if swa_indices is not None:
@@ -294,6 +294,9 @@ class CompressedGather:
     # chunk-invariant per request; subsequent layers only overwrite that prefix.
     combined_indices: Optional[torch.Tensor] = None
     combined_lens: Optional[torch.Tensor] = None
+    # Author: Winston Cai. Request-local raw C4 positions, never physical slots.
+    raw_positions: Optional[torch.Tensor] = None
+    packed_length: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -549,9 +552,9 @@ class SparsePrefillChunkCache:
         device = self.seq_lens.device
         c_max = max(self.max_seq_len // compress_ratio, 1)
         c_capacity = page_table.shape[-1] * c_page_size
-        assert c_max <= c_capacity, (
-            f"live c{compress_ratio} extent {c_max} exceeds metadata capacity {c_capacity}"
-        )
+        assert (
+            c_max <= c_capacity
+        ), f"live c{compress_ratio} extent {c_max} exceeds metadata capacity {c_capacity}"
         first_q_per_req = (
             self.query_start_loc[:-1].clamp_max(self.num_qo_tokens - 1).long()
         )
@@ -586,6 +589,7 @@ class SparsePrefillChunkCache:
             flat_token_ids=flat_ids,
             compressed_base=compressed_base,
             swa_base=swa_base,
+            raw_positions=positions,
         )
         self.compressed[compress_ratio] = gather
         return gather

@@ -1542,6 +1542,10 @@ def _configure_context(
             "its namespace set (None for the full tree)."
         )
     server_args.resolve_once()
+    # Author: Winston Cai. Restore process-local dispatch in spawned workers.
+    from sglang.srt import remnant
+
+    remnant.configure_from_args(server_args)
     discarded = context.overrides_log()
     context.set_server_args(server_args)
     if discarded:

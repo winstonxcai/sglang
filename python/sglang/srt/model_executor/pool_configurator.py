@@ -1,5 +1,7 @@
 """Memory pool configurators for profiling and sizing KV cache pools.
 
+Author: Winston Cai.
+
 Each model architecture has its own configurator that computes pool sizes
 from available GPU memory using a unified coeff+bias model:
 
@@ -7,6 +9,8 @@ from available GPU memory using a unified coeff+bias model:
 """
 
 from __future__ import annotations
+
+from sglang.srt import remnant as _sg_lr
 
 import logging
 from bisect import bisect_right
@@ -642,9 +646,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
-        assert self._swa_layers_num > 0, (
-            "Hybrid SWA model must have at least one SWA layer"
-        )
+        assert (
+            self._swa_layers_num > 0
+        ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -1089,6 +1093,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
         self.stage_compress_ratios = cfg.compress_ratios[stage.start : stage.stop]
+        self.packed_c4_layouts = (
+            _sg_lr.packed_layouts(cfg.compress_ratios, stage.start, stage.stop)
+            if _sg_lr.packed_enabled()
+            else ()
+        )
         if kvc.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
@@ -1305,6 +1314,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
+        if compress_ratio == 4 and _sg_lr.packed_enabled():
+            return (
+                sum(layout.record_bytes for layout in self.packed_c4_layouts)
+                / len(self.packed_c4_layouts)
+                if self.packed_c4_layouts
+                else 0
+            )
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
@@ -1559,9 +1575,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert page_size % 128 == 0, (
-            "page_size must be multiple of 128 for compressed attention"
-        )
+        assert (
+            page_size % 128 == 0
+        ), "page_size must be multiple of 128 for compressed attention"
 
         max_running_requests_per_worker = self._resolve_max_running_requests_per_worker(
             available_bytes
@@ -1617,9 +1633,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         # Token count, not a byte budget: the fixed pools are not re-subtracted, so
         # the input must not exceed what calculate_pool_sizes derived for it.
-        assert page_size % 128 == 0, (
-            "page_size must be multiple of 128 for compressed attention"
-        )
+        assert (
+            page_size % 128 == 0
+        ), "page_size must be multiple of 128 for compressed attention"
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

@@ -1,4 +1,12 @@
+"""DeepSeek V4 compressed-state writes with Remnant format support.
+
+Author: Winston Cai.
+"""
+
 from __future__ import annotations
+
+from sglang.srt import remnant as _sg_lr
+from sglang.srt.remnant import capture as _capture
 
 from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cast
 
@@ -72,7 +80,7 @@ class CompressorBackendMixin:
         head_dim: int,
         norm: RMSNorm,
         freqs_cis_cache: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
         is_indexer: bool,
         rotate: bool,
         compress_ratio: int,
@@ -85,6 +93,10 @@ class CompressorBackendMixin:
         kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
+        packed_pool=None,
+        packed_layer_id: Optional[int] = None,
+        capture_batch=None,
+        capture_layer=None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -120,6 +132,48 @@ class CompressorBackendMixin:
             is_online=is_online,
         )
 
+        if _capture.enabled() and compress_ratio == 4 and not is_indexer:
+            _capture.observer().observe_raw(
+                capture_layer,
+                capture_batch,
+                kv_compressed,
+                plan,
+                out_loc,
+                norm.weight,
+                norm.variance_epsilon,
+                freqs_cis_cache,
+            )
+
+        if compress_ratio == 4 and not is_indexer and _sg_lr.packed_enabled():
+            if kv_layout is not KVLayout.V4:
+                raise RuntimeError("Packed requires the V4 layout, not V4.1")
+            assert packed_pool is not None and packed_layer_id is not None
+            packed_pool.set_rope_freqs(packed_layer_id, freqs_cis_cache)
+            if _sg_lr.cache_store_implementation() == "triton":
+                count = packed_pool.get_packed_buffers(packed_layer_id)[0].shape[-1]
+                mask = _sg_lr.topmag_keep_mask(kv_compressed, count / _sg_lr.HEAD_DIM)
+                _sg_lr.pack_rows(
+                    kv_compressed,
+                    mask,
+                    norm.weight,
+                    norm.variance_epsilon,
+                    plan,
+                    out_loc,
+                    packed_pool,
+                    layer_id=packed_layer_id,
+                )
+            else:
+                _sg_lr.pack_rows_fused(
+                    kv_compressed,
+                    norm.weight,
+                    norm.variance_epsilon,
+                    plan,
+                    out_loc,
+                    packed_pool,
+                    layer_id=packed_layer_id,
+                )
+            return
+
         # The AITER FP4 writer takes BF16; the compressor mirrors its FP32 norm
         # weight so the conversion stays out of the per-layer forward.
         norm_weight = norm.weight
@@ -127,6 +181,7 @@ class CompressorBackendMixin:
             norm_weight = getattr(norm, "fp4_weight_bf16", norm_weight)
 
         # Step 2: norm + rope + store
+        assert kv_cache is not None
         compress_norm_rope_store(
             kv_compressed,
             plan,
@@ -164,6 +219,11 @@ class CompressorBackendMixin:
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
+        # A prefix can be restored from HiCache without running a packed
+        # compressor write first. Install the model's existing RoPE table
+        # before the attention backend reads packed rows during decode.
+        if _sg_lr.packed_enabled() and compressor.ratio == 4:
+            token_to_kv_pool.set_packed_rope_freqs(layer_id, compressor.freqs_cis)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
@@ -198,6 +258,8 @@ class CompressorBackendMixin:
         kv_scale_cache = None
         fp8_2buff = False
         kv_cache_rope = None
+        packed_pool = None
+        packed_layer_id = None
         if compressor.is_in_indexer:
             page_size = token_to_kv_pool.get_index_k_page_size(compressor.ratio)
             if use_hip_fp4:
@@ -218,9 +280,16 @@ class CompressorBackendMixin:
             else:
                 bf16_store = True
         else:
-            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            _, compress_layer_id, compress_kv_pool = token_to_kv_pool.layer_mapping[
+                layer_id
+            ]
             assert compress_kv_pool is not None
-            kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            if _sg_lr.packed_enabled() and compressor.ratio == 4:
+                kv_cache = None
+                packed_pool = compress_kv_pool
+                packed_layer_id = compress_layer_id
+            else:
+                kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             # The pool's page format (V4, or the V4.1 fp8 / fp4 layouts).
             kv_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
@@ -233,7 +302,11 @@ class CompressorBackendMixin:
             head_dim=compressor.head_dim,
             norm=compressor.norm,
             freqs_cis_cache=compressor.freqs_cis,
-            kv_cache=kv_cache if use_hip_fp4 else kv_cache.view(dtype=torch.uint8),
+            kv_cache=(
+                kv_cache
+                if use_hip_fp4 or kv_cache is None
+                else kv_cache.view(dtype=torch.uint8)
+            ),
             is_indexer=compressor.is_in_indexer,
             rotate=compressor.rotate,
             compress_ratio=compressor.ratio,
@@ -241,6 +314,10 @@ class CompressorBackendMixin:
             out_loc=out_loc,
             use_fp4_indexer=use_fp4_indexer,
             bf16_store=bf16_store,
+            packed_pool=packed_pool,
+            packed_layer_id=packed_layer_id,
+            capture_batch=forward_batch,
+            capture_layer=layer_id,
             kv_scale_cache=kv_scale_cache,
             rope_cache=(
                 (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None

@@ -1,4 +1,7 @@
-"""Config fields of the ``model`` namespace."""
+"""Config fields of the ``model`` namespace.
+
+Author: Winston Cai. (Packed cache options.)
+"""
 
 from __future__ import annotations
 
@@ -32,6 +35,52 @@ class Model(msgspec.Struct):
     """Namespace ``model``."""
 
     _NS_PATH = "model"
+
+    dsv4_c4_cache_format: A[
+        str,
+        Arg(
+            help=(
+                "DeepSeek V4 compressed C4 cache format. 'native' keeps the "
+                "stock SGLang layout; 'remnant' uses persistent Packed C4 "
+                "records (328 bytes at the default 256 survivors)."
+            ),
+            choices=["native", "remnant"],
+        ),
+    ] = "native"
+    dsv4_c4_cache_keep_count: A[
+        int,
+        Arg(help="Packed C4 survivors per layer (64..448 in steps of 64)."),
+    ] = 256
+    dsv4_c4_cache_layer_keep_counts: A[
+        Optional[str],
+        Arg(
+            help='Packed C4 overrides as JSON keyed by zero-based model layer ID, e.g. {"2":192}.'
+        ),
+    ] = None
+    dsv4_c4_cache_implementation: A[
+        str,
+        Arg(
+            help=(
+                "Implementation for --dsv4-c4-cache-format remnant. 'triton' "
+                "uses explicit selection and Triton Native-page reconstruction; "
+                "'kernel' uses fused packing and optimized decode dispatch. "
+                "Ignored for the native cache format."
+            ),
+            choices=["triton", "kernel"],
+        ),
+    ] = "kernel"
+    dsv4_c4_cache_store_implementation: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Override Packed C4 storage independently of decode. 'triton' "
+                "uses explicit selection plus packing; 'kernel' uses fused "
+                "selection and packing. Defaults to --dsv4-c4-cache-implementation. "
+                "Ignored for the native cache format."
+            ),
+            choices=["triton", "kernel"],
+        ),
+    ] = None
 
     # ---- derived: computed at publish from the leaves below.
     is_startup_weight_load_overlap = Derived(

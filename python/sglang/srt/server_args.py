@@ -11,7 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Server argument construction, resolution, CLI registration, and network ports."""
+"""Server argument construction, resolution, CLI registration, and network ports.
+
+Author: Winston Cai. (Packed configuration integration.)
+"""
 
 from __future__ import annotations
 
@@ -239,6 +242,66 @@ class ServerArgs:
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
+
+    def _configure_dsv4_c4_cache_format(self) -> None:
+        from sglang.srt import remnant
+
+        remnant.configure_from_args(self, publish=False)
+        if self.dsv4_c4_cache_format != "remnant":
+            remnant.configure_from_args(self)
+            return
+
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        hf_config = model_config_of(self).hf_config
+        if not is_deepseek_v4(hf_config):
+            raise ValueError(
+                "--dsv4-c4-cache-format remnant requires a DeepSeek V4 model"
+            )
+        ratios = getattr(hf_config, "compress_ratios", None)
+        if ratios is None and (
+            getattr(self, "dsv4_c4_cache_keep_count", 256) != 256
+            or getattr(self, "dsv4_c4_cache_layer_keep_counts", None) is not None
+        ):
+            raise ValueError("Packed layer counts require model compress_ratios")
+        # The tuple travels with ServerArgs when spawned workers restore configuration.
+        remnant.configure_from_args(self, compression_ratios=ratios, publish=False)
+        incompatible = []
+        if self.enable_hisparse:
+            incompatible.append("--enable-hisparse")
+        if self.speculative_algorithm is not None:
+            incompatible.append("speculative decoding")
+        if self.cpu_offload_gb > 0:
+            incompatible.append("--cpu-offload-gb")
+        if self.disaggregation_decode_enable_offload_kvcache:
+            incompatible.append("decode KV offload")
+        if self.enable_hierarchical_cache and self.hicache_storage_backend is not None:
+            incompatible.append("HiCache L3 storage (--hicache-storage-backend)")
+        if (
+            self.enable_hierarchical_cache
+            and self.hicache_storage_backend is None
+            and self.hicache_mem_layout != "layer_first"
+        ):
+            logger.warning(
+                "Remnant HiCache L2 currently requires layer_first layout; "
+                "switching hicache_mem_layout from %s to layer_first.",
+                self.hicache_mem_layout,
+            )
+            resolving_view(self).hicache_mem_layout = "layer_first"
+        if self.enable_prefill_context_parallel:
+            incompatible.append("--enable-prefill-context-parallel")
+        if self.enable_dsa_prefill_context_parallel:
+            incompatible.append("--enable-dsa-prefill-context-parallel")
+        if incompatible:
+            raise ValueError(
+                "--dsv4-c4-cache-format remnant is incompatible with "
+                + ", ".join(incompatible)
+            )
+
+        remnant.configure_from_args(self, compression_ratios=ratios)
+        self._dsv4_c4_cache_compression_ratios = (
+            None if ratios is None else tuple(ratios)
+        )
 
     def resolve_once(self) -> None:
         """Resolve once, preserving declarations across pickling to child processes.

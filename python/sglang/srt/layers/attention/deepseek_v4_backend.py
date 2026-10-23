@@ -1,4 +1,11 @@
+"""DeepSeek V4 attention backend with Remnant decode dispatch.
+
+Author: Winston Cai.
+"""
+
 from __future__ import annotations
+
+from sglang.srt import remnant as _sg_lr
 
 import enum
 import functools
@@ -542,9 +549,11 @@ class DSV4AttnMetadata:
             )
         self.trtllm_swa_lens = _tile_padded(
             SWA_WINDOW,
-            self.swa_topk_lengths.clamp_min(SWA_WINDOW)
-            if swa_width > SWA_WINDOW
-            else None,
+            (
+                self.swa_topk_lengths.clamp_min(SWA_WINDOW)
+                if swa_width > SWA_WINDOW
+                else None
+            ),
         )
         for ratio in self.low_ratios:
             lengths = self.sparse_topk_lengths(ratio)
@@ -712,9 +721,9 @@ class DSV4AttnMetadata:
         # logical token; num_tokens is that unpadded length.
         if num_tokens is None:
             num_tokens = self.seq_lens_casual.shape[0]
-        assert self.raw_out_loc.shape[0] == num_tokens, (
-            f"{self.raw_out_loc.shape=}, {num_tokens=}"
-        )
+        assert (
+            self.raw_out_loc.shape[0] == num_tokens
+        ), f"{self.raw_out_loc.shape=}, {num_tokens=}"
 
         if self.has_c4 or self.has_c128:
             # One kernel produces both ratios; compute_page_indices=False only
@@ -815,13 +824,13 @@ class DSV4AttnMetadata:
         for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
             val = getattr(self, field_name, None)
             if val is None:
-                assert field_name in self._CP_REINDEX_OPTIONAL_FIELDS, (
-                    f"CP reindex: {field_name} is None"
-                )
+                assert (
+                    field_name in self._CP_REINDEX_OPTIONAL_FIELDS
+                ), f"CP reindex: {field_name} is None"
                 continue
-            assert isinstance(val, torch.Tensor), (
-                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
-            )
+            assert isinstance(
+                val, torch.Tensor
+            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             val = val[idx].contiguous()
             setattr(self, field_name, val)
             assert val.shape[0] == expected_local_len, (
@@ -854,7 +863,7 @@ class DSV4AttnMetadata:
                 device=self.c4_topk_lengths_clamp1.device,
             )
             self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
-            if is_prefill:
+            if is_prefill or _sg_lr.packed_enabled():
                 self.c4_sparse_raw_indices = torch.empty_like(
                     self.c4_sparse_page_indices
                 )
@@ -1137,9 +1146,9 @@ class DeepseekV4AttnBackend(
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
-        assert head_dim == 512, (
-            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
-        )
+        assert (
+            head_dim == 512
+        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -1237,6 +1246,53 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        ## REMNANT (static native gather workspace)
+        self.remnant_workspace = None
+        if _sg_lr.packed_enabled():
+            _sg_lr.validate_packed_static_config()
+            args = model_runner.server_args
+            if self.device.type != "cuda":
+                raise RuntimeError("packed requires CUDA")
+            if self.index_topk != 512:
+                raise RuntimeError("packed requires index_topk=512")
+            if (
+                not get_platform().is_sm90
+                or self.token_to_kv_pool.kv_layout is not KVLayout.V4
+            ):
+                raise RuntimeError(
+                    "Packed v0.5.22 currently requires SM90 and the V4 layout"
+                )
+            if self.token_to_kv_pool.request_window is not None:
+                raise RuntimeError("Packed does not support encoder SWA bounded replay")
+            if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+                raise RuntimeError("Packed currently requires BF16 sparse prefill")
+            if self.token_to_kv_pool._unified_kv:
+                raise RuntimeError("packed is incompatible with unified KV")
+            if self.hisparse_coordinator is not None or args.enable_hisparse:
+                raise RuntimeError("packed is incompatible with HiSparse")
+            if args.speculative_algorithm is not None or self.mtp_enabled:
+                raise RuntimeError("packed is incompatible with speculative decode")
+            if args.disaggregation_mode != "null":
+                raise RuntimeError("packed is incompatible with disaggregation")
+            if (
+                args.cpu_offload_gb > 0
+                or args.disaggregation_decode_enable_offload_kvcache
+            ):
+                raise RuntimeError(
+                    "packed is incompatible with CPU or decode KV offload"
+                )
+            if (
+                args.enable_prefill_context_parallel
+                or args.enable_dsa_prefill_context_parallel
+                or get_parallel().attn_cp_size != 1
+            ):
+                raise RuntimeError("packed is incompatible with context parallelism")
+            self.remnant_workspace = _sg_lr.NativeWorkspace.allocate(
+                self.token_to_kv_pool.max_num_reqs,
+                512,
+                self.page_size // 4,
+                self.device,
+            )
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -3646,7 +3702,11 @@ class DeepseekV4AttnBackend(
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio != 0:
-                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+                if compress_ratio == 4 and _sg_lr.packed_enabled():
+                    raw_indices = core_attn_metadata.c4_sparse_raw_indices
+                    assert raw_indices is not None
+                else:
+                    extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.sparse_page_indices(compress_ratio)
                 extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                     compress_ratio
@@ -3688,6 +3748,8 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
+            if compress_ratio == 4 and _sg_lr.packed_enabled():
+                raw_indices = match_num_queries(raw_indices, value=-1)
 
             if self.trtllm_attn:
                 # The uniform-FP8 pool is readable only by trtllm-gen.
@@ -3709,23 +3771,39 @@ class DeepseekV4AttnBackend(
                 swa_page_indices = swa_page_indices.unsqueeze(1)
             if extra_indices is not None and extra_indices.ndim == 2:
                 extra_indices = extra_indices.unsqueeze(1)
+            if (
+                compress_ratio == 4
+                and _sg_lr.packed_enabled()
+                and raw_indices is not None
+                and raw_indices.ndim == 2
+            ):
+                # FlashMLA's direct Remnant entry point uses the same
+                # [batch, query, top-k] shape as extra_indices.
+                raw_indices = raw_indices.unsqueeze(1)
 
             assert attn_sink is not None
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
-            assert swa_page_indices.shape[-1] % 64 == 0, (
-                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
-            )
+            assert (
+                swa_page_indices.shape[-1] % 64 == 0
+            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
             if extra_indices is not None:
-                assert extra_indices.shape[-1] % 64 == 0, (
-                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
-                )
+                assert (
+                    extra_indices.shape[-1] % 64 == 0
+                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
             # The tail stays dense: its window floor lives in swa_page_indices,
             # which the sparse chunk cache ignores.
             if (
-                self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
+                (
+                    self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
+                    or (
+                        _sg_lr.packed_enabled()
+                        and self.remnant_workspace is not None
+                        and q.shape[0] > self.remnant_workspace.max_queries
+                    )
+                )
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
@@ -3781,6 +3859,50 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
+            direct_remnant_buffers = None
+            direct_remnant_raw_indices = None
+            direct_remnant_freqs = None
+            if (
+                compress_ratio == 4
+                and _sg_lr.packed_enabled()
+                and _sg_lr.cache_implementation() == "kernel"
+                and get_platform().is_sm90
+            ):
+                direct_remnant_buffers = token_to_kv_pool.get_packed_buffers(layer_id)
+                direct_remnant_raw_indices = raw_indices
+                direct_remnant_freqs = torch.view_as_real(
+                    token_to_kv_pool.get_packed_freqs(layer_id)
+                )
+            elif compress_ratio == 4 and _sg_lr.packed_enabled():
+                ## REMNANT (decode/small-extend native reconstruction)
+                assert self.remnant_workspace is not None
+                packed_indices = (
+                    extra_indices.squeeze(1)
+                    if extra_indices.ndim == 3
+                    else extra_indices
+                )
+                packed_raw_indices = (
+                    raw_indices.squeeze(1) if raw_indices.ndim == 3 else raw_indices
+                )
+                extra_k_cache, extra_indices = _sg_lr.unpack_gather_native(
+                    token_to_kv_pool.get_packed_buffers(layer_id),
+                    packed_indices,
+                    packed_raw_indices,
+                    extra_topk_lengths,
+                    token_to_kv_pool.get_packed_freqs(layer_id),
+                    self.remnant_workspace,
+                )
+                extra_page_size = token_to_kv_pool.page_size // 4
+                extra_k_cache = extra_k_cache[
+                    :, : extra_page_size * k_cache_total_dim
+                ].view(
+                    extra_k_cache.shape[0],
+                    extra_page_size,
+                    1,
+                    k_cache_total_dim,
+                )
+                extra_indices = extra_indices.unsqueeze(1)
+
             if get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
@@ -3823,7 +3945,7 @@ class DeepseekV4AttnBackend(
                         extra_indices=extra_indices,
                         extra_topk_length=extra_topk_lengths,
                     )
-                o = flash_mla_with_kvcache(
+                attention_result = flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
@@ -3838,9 +3960,34 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
-                )[0]
+                    remnant_buffers=direct_remnant_buffers,
+                    remnant_raw_indices=direct_remnant_raw_indices,
+                    remnant_freqs=direct_remnant_freqs,
+                )
+                o = attention_result[0]
 
             o = o.squeeze(1)
+            from sglang.srt.remnant import capture as _capture
+
+            if _capture.enabled() and compress_ratio == 4:
+                _capture.observer().observe_attention(
+                    layer_id,
+                    forward_batch,
+                    q,
+                    swa_k_cache,
+                    extra_k_cache,
+                    swa_page_indices,
+                    extra_indices,
+                    swa_topk_lengths,
+                    extra_topk_lengths,
+                    attn_sink,
+                    self.softmax_scale,
+                    o,
+                    SWA_WINDOW,
+                    token_to_kv_pool.page_size // 4,
+                    flashmla_metadata,
+                    attention_result[1] if not get_platform().is_sm120 else None,
+                )
             return o
 
         raise NotImplementedError("ragged attention")
@@ -3885,7 +4032,8 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
-            extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            if compress_ratio != 4 or not _sg_lr.packed_enabled():
+                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
@@ -3897,13 +4045,29 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
-                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
-            )
+            if compress_ratio == 4 and _sg_lr.packed_enabled():
+                gather = cache.compressed[4]
+                assert gather.raw_positions is not None
+                if gather.packed_length is None:
+                    gather.packed_length = torch.full(
+                        (1,), flat_token_ids.numel(), dtype=torch.int32, device=q.device
+                    )
+                _sg_lr.unpack_gather_bf16(
+                    token_to_kv_pool.get_packed_buffers(layer_id),
+                    flat_token_ids[None, :],
+                    gather.raw_positions[None, :],
+                    gather.packed_length,
+                    token_to_kv_pool.get_packed_freqs(layer_id),
+                    compressed_slice,
+                )
+            else:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                    layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+                )
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
@@ -4237,9 +4401,9 @@ class DeepseekV4AttnBackend(
                 f"and is only valid on the DSpark draft backend "
                 f"(is_dspark_draft={self.is_dspark_draft})."
             )
-            assert swa_replay_start is None, (
-                "swa_replay_start is not wired for the DSpark draft window"
-            )
+            assert (
+                swa_replay_start is None
+            ), "swa_replay_start is not wired for the DSpark draft window"
             if dspark_swa_buffers is None:
                 swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
                     seq_lens_casual=seq_lens_casual,

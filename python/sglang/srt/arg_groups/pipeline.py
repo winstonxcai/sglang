@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ordered configuration resolution, called by ``ServerArgs.resolve_once``."""
+"""Ordered configuration resolution, called by ``ServerArgs.resolve_once``.
+
+Author: Winston Cai. (Packed validation and dispatch publication.)
+"""
 
 from __future__ import annotations
 
@@ -99,7 +102,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(validate_prefill_cp_platform, server_args)
     run_hook(handle_hardware_runtime_validation, server_args)
+    from sglang.srt import remnant
+
+    remnant.configure_from_args(server_args, publish=False)
     if cfg.model_path.lower() in ["none", "dummy"]:
+        remnant.configure_from_args(server_args)
         from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
         run_post_process_pass(server_args, resolve_boundary_reduction)
@@ -213,6 +220,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_model_specific_adjustments, server_args)
+    server_args._configure_dsv4_c4_cache_format()
     run_hook(default_unset_prefill_decode_interval, server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)

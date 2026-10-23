@@ -1,4 +1,11 @@
+"""DeepSeek V4 memory pools, including the persistent Remnant pool.
+
+Author: Winston Cai.
+"""
+
 from __future__ import annotations
+
+from sglang.srt import remnant as _sg_lr
 
 import logging
 from contextlib import nullcontext
@@ -169,9 +176,10 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
-        assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
-            "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
-        )
+        assert mode in ("auto", "v4") and option in (
+            "auto",
+            "fp8",
+        ), "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
         return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
@@ -398,6 +406,169 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
         ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
 
 
+class RemnantPackedKVPool(DeepSeekV4SingleKVPool):
+    """Persistent per-layer Packed planes, with no Native shadow pool."""
+
+    def __init__(
+        self,
+        *args,
+        layouts: tuple[_sg_lr.PackedLayerLayout, ...] | None = None,
+        **kwargs,
+    ):
+        self.layouts = None if layouts is None else tuple(layouts)
+        super().__init__(*args, **kwargs)
+
+    def get_packed_layout(self, layer_id: int) -> _sg_lr.PackedLayerLayout:
+        return self.layouts[self._local_layer_index(layer_id)]
+
+    def _local_layer_index(self, layer_id: int) -> int:
+        local = layer_id - self.start_layer
+        if not 0 <= local < self.layer_num:
+            raise IndexError(
+                f"Packed C4-pool layer {layer_id} is outside [{self.start_layer}, {self.start_layer + self.layer_num})"
+            )
+        return local
+
+    def _create_buffers(self):
+        if self.layouts is None:
+            profile = _sg_lr.packed_profile()
+            if profile.overrides:
+                raise ValueError(
+                    "Packed layer overrides require explicit model-to-pool layouts"
+                )
+            self.layouts = tuple(
+                _sg_lr.PackedLayerLayout(i, profile.default_count)
+                for i in range(self.layer_num)
+            )
+        if len(self.layouts) != self.layer_num:
+            raise ValueError("Packed layout count must match local C4 layer count")
+        counts = tuple(layout.keep_count for layout in self.layouts)
+        # Scalar compatibility metadata exists only when every layer has one layout.
+        self.record_bytes_by_layer = tuple(
+            layout.record_bytes for layout in self.layouts
+        )
+
+        if self.kv_layout is not KVLayout.V4:
+            raise ValueError("Packed supports only the V4 KV layout")
+        num_pages = _num_dsv4_physical_kv_pages(
+            self.size, self.page_size, self.global_page_size
+        )
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.packed_values = [
+                    torch.zeros(
+                        num_pages,
+                        self.page_size,
+                        count,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for count in counts
+                ]
+                self.packed_bitmaps = [
+                    torch.zeros(
+                        num_pages,
+                        self.page_size,
+                        8,
+                        dtype=torch.uint64,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.packed_scales = [
+                    torch.zeros(
+                        num_pages,
+                        self.page_size,
+                        8,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+        # Compatibility only: generic lifecycle code expects this attribute.
+        # It must never be treated as a native hybrid allocation.
+        self.kv_buffer = self.packed_values
+        uniform = len(set(self.record_bytes_by_layer)) <= 1
+        self.kv_cache_total_dim = (
+            self.record_bytes_by_layer[0] if uniform and self.layouts else None
+        )
+        self.bytes_per_page_padded = (
+            self.page_size * self.kv_cache_total_dim
+            if self.kv_cache_total_dim is not None
+            else None
+        )
+        self._remnant_rope_freqs = [None] * self.layer_num
+        logger.info(
+            "Remnant packed pool: layers=%d pages/layer=%d "
+            "page_size=%d model_layer_counts=%s allocated_bytes=%d",
+            self.layer_num,
+            num_pages,
+            self.page_size,
+            tuple((layout.layer_id, layout.keep_count) for layout in self.layouts),
+            self.get_kv_size_bytes(),
+        )
+
+    def get_bytes_per_token(self, layer_id: int | None = None) -> int:
+        if layer_id is not None:
+            return self.get_packed_layout(layer_id).record_bytes
+        if len(set(self.record_bytes_by_layer)) != 1:
+            raise ValueError("heterogeneous Packed geometry requires a layer index")
+        return self.record_bytes_by_layer[0]
+
+    def get_packed_buffers(self, layer_id: int):
+        local = self._local_layer_index(layer_id)
+        return (
+            self.packed_values[local],
+            self.packed_bitmaps[local],
+            self.packed_scales[local],
+        )
+
+    def set_rope_freqs(self, layer_id: int, freqs_cis) -> None:
+        local = self._local_layer_index(layer_id)
+        if self._remnant_rope_freqs[local] is None:
+            if not freqs_cis.is_complex() or not freqs_cis.is_contiguous():
+                raise RuntimeError("packed requires a contiguous complex RoPE table")
+            # Retain the compressor's existing table. Creating contiguous real
+            # and imaginary copies costs 256 MiB per rank at 135168 context and
+            # can OOM after KV-pool sizing has consumed the remaining HBM.
+            self._remnant_rope_freqs[local] = freqs_cis
+
+    def get_rope_freqs(self, layer_id: int):
+        local = self._local_layer_index(layer_id)
+        value = self._remnant_rope_freqs[local]
+        if value is None:
+            raise RuntimeError("packed RoPE frequencies not initialized")
+        return value
+
+    def get_key_buffer(self, layer_id: int):
+        raise RuntimeError("packed has no native key buffer; unpack first")
+
+    def set_key_buffer(self, *args, **kwargs):
+        raise RuntimeError("packed must be written through pack_rows")
+
+    set_key_buffer_fused = set_key_buffer
+
+    def get_kv_size_bytes(self):
+        return sum(
+            t.nbytes
+            for group in (self.packed_values, self.packed_bitmaps, self.packed_scales)
+            for t in group
+        )
+
+    def get_buf_infos(self):
+        ptrs, lens, items = [], [], []
+        for layer in range(self.layer_num):
+            for buf in self.get_packed_buffers(self.start_layer + layer):
+                ptrs.append(buf.data_ptr())
+                lens.append(buf.nbytes)
+                items.append(buf[0].nbytes)
+        return ptrs, lens, items
+
+
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
     def __init__(
         self,
@@ -429,9 +600,9 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             kv_layout=kv_layout,
         )
         # The HiSparse transfer kernels hardcode the V4 token layout.
-        assert self.kv_layout is KVLayout.V4, (
-            f"HiSparse C4 pools support the V4 layout only, got {self.kv_layout}"
-        )
+        assert (
+            self.kv_layout is KVLayout.V4
+        ), f"HiSparse C4 pools support the V4 layout only, got {self.kv_layout}"
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -1122,9 +1293,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 ),
             )
         elif self._unified_kv:
-            assert self.kv_layout is KVLayout.V4, (
-                "unified_kv keeps bf16 rows, not a paged FlashMLA layout"
-            )
+            assert (
+                self.kv_layout is KVLayout.V4
+            ), "unified_kv keeps bf16 rows, not a paged FlashMLA layout"
             self.swa_kv_pool = None
             swa_ring_size = get_swa_ring_size(
                 self.sliding_window, get_spec().speculative_algorithm is not None
@@ -1264,6 +1435,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                         append_unified_compress(
                             self.unified_kv_pool.kv_buffer_rope[local_layer_id], ratio
                         )
+            elif isinstance(kv_pool, RemnantPackedKVPool):
+                ptrs, lens, items = kv_pool.get_buf_infos()
+                data_ptrs.extend(ptrs)
+                data_lens.extend(lens)
+                item_lens.extend(items)
             elif kv_pool is not None:
                 for buf in kv_pool.kv_buffer:
                     append_page_buffer(buf)
@@ -1449,18 +1625,28 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio in (1, 2)
         }
         if low_ratio_sources:
-            assert self.full_size is not None, (
-                "low compress ratios need the full pool size"
-            )
+            assert (
+                self.full_size is not None
+            ), "low compress ratios need the full pool size"
             assert not self._unified_kv, "unified_kv has no low compress ratio layout"
 
         if not self._unified_kv:
             for ratio, config in configs.items():
                 pool_cls = kv_pool_cls
-                if ratio == 4 and enable_hisparse:
-                    assert not self.uniform_fp8, (
-                        "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
-                    )
+                if ratio == 4 and _sg_lr.packed_enabled():
+                    if (
+                        enable_hisparse
+                        or self.uniform_fp8
+                        or self.kv_layout is not KVLayout.V4
+                    ):
+                        raise ValueError(
+                            "Packed requires V4 paged storage without HiSparse"
+                        )
+                    pool_cls = RemnantPackedKVPool
+                elif ratio == 4 and enable_hisparse:
+                    assert (
+                        not self.uniform_fp8
+                    ), "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
                     pool_cls = HiSparseC4DevicePool
                 self.kv_pools[ratio] = self._make_kv_pool(
                     size=config.kv_size,
@@ -1537,6 +1723,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         physical rows for the allocator's dummy logical page.
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
+        extra = {}
+        if cls is RemnantPackedKVPool:
+            extra["layouts"] = _sg_lr.packed_layouts(
+                self.compression_ratios, self._stage_start, self._stage_end
+            )
         return cls(
             size,
             page_size,
@@ -1548,6 +1739,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
             global_page_size=global_page_size,
             kv_layout=kv_layout,
+            **extra,
         )
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
@@ -1710,9 +1902,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert compress_state_pool is not None, (
-            "Only c4/c128 layers and ratio-2 kv_source layers have attention states."
-        )
+        assert (
+            compress_state_pool is not None
+        ), "Only c4/c128 layers and ratio-2 kv_source layers have attention states."
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1769,9 +1961,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # One index list addresses every request-state buffer (one per layer), so
         # the request-scoped pools must share a ring layout.
         layout = (pools[0].ratio, pools[0].online, pools[0].ring_size)
-        assert all((p.ratio, p.online, p.ring_size) == layout for p in pools), (
-            "request-scoped state pools must share one ring layout"
-        )
+        assert all(
+            (p.ratio, p.online, p.ring_size) == layout for p in pools
+        ), "request-scoped state pools must share one ring layout"
         return pools[0].transfer_indices(req_pool_idx, seq_len)
 
     def clear_request_scoped_state(self, req_pool_idx: int) -> None:
@@ -1819,9 +2011,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert indexer_compress_state_pool is not None, (
-            "Only c4 layers have indexer states."
-        )
+        assert (
+            indexer_compress_state_pool is not None
+        ), "Only c4 layers have indexer states."
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
@@ -1889,6 +2081,32 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             return self.swa_kv_pool.kv_cache_total_dim
         return self.kv_layout.bytes_per_token
 
+    def get_packed_pool(self, layer_id: int):
+        ratio, _, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError("layer does not use packed")
+        self.wait_layer_transfer(layer_id)
+        return pool
+
+    def get_packed_buffers(self, layer_id: int):
+        ratio, local, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError("layer does not use packed")
+        self.wait_layer_transfer(layer_id)
+        return pool.get_packed_buffers(local)
+
+    def get_packed_freqs(self, layer_id: int):
+        ratio, local, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError("layer does not use packed")
+        return pool.get_rope_freqs(local)
+
+    def set_packed_rope_freqs(self, layer_id: int, freqs_cis) -> None:
+        ratio, local, pool = self.layer_mapping[layer_id]
+        if ratio != 4 or not isinstance(pool, RemnantPackedKVPool):
+            raise RuntimeError("layer does not use packed")
+        pool.set_rope_freqs(local, freqs_cis)
+
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
         self.wait_layer_transfer(layer_id)
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
@@ -1909,9 +2127,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def _indexer_pool(self, compress_ratio: int) -> DeepSeekV4IndexerPool:
         pool = self.index_pools.get(compress_ratio)
-        assert pool is not None, (
-            f"No indexer pool for compression ratio {compress_ratio}"
-        )
+        assert (
+            pool is not None
+        ), f"No indexer pool for compression ratio {compress_ratio}"
         return pool
 
     def get_low_ratio_index_k_dequant(
@@ -2110,9 +2328,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
-                "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
-            )
+            assert (
+                compress_kv_pool.kv_layout is KVLayout.V41_FP4
+            ), "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
         )
