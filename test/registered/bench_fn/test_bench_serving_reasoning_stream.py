@@ -1,4 +1,5 @@
 """Unit tests for bench_serving streaming with reasoning chunks.
+Author: Winston Cai. (recorded-request and tool-output coverage)
 
 Reasoning models (DeepSeek-R1, MiMo, Qwen3 reasoning, Kimi-K2, ...) stream their
 chain-of-thought via fields such as OpenAI's `delta.reasoning_content` and
@@ -12,10 +13,15 @@ import asyncio
 import json
 import socket
 import threading
+import tempfile
 import time
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from unittest.mock import Mock
+
+from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
 
 from sglang.benchmark.serving import (
     RequestFuncInput,
@@ -124,7 +130,7 @@ class TestBenchServingReasoningStream(CustomTestCase):
             )
         )
 
-    def _run(self, chunks):
+    def _run(self, chunks, extra_request_body=None):
         port = _free_port()
 
         class Handler(_SSEHandler):
@@ -143,12 +149,93 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 model="dummy-model",
                 lora_name="",
                 image_data=None,
-                extra_request_body={},
+                extra_request_body=extra_request_body or {},
             )
             return asyncio.run(async_request_openai_chat_completions(req))
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_tool_call_only_stream_records_first_output_and_usage(self):
+        call = [{"index": 0, "function": {"name": "run", "arguments": ""}}]
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": call}}]},
+            {"choices": [], "usage": {"completion_tokens": 7}},
+        ]
+        out = self._run(chunks, {"stream_options": {"include_usage": True}})
+        self.assertTrue(out.success, out.error)
+        self.assertGreater(out.ttft, 0)
+        self.assertEqual(out.output_len, 7)
+        self.assertEqual(out.generated_text, json.dumps(call))
+
+    def test_requested_stream_usage_must_be_present(self):
+        out = self._run(
+            [_make_chunk(content="answer")], {"stream_options": {"include_usage": True}}
+        )
+        self.assertFalse(out.success)
+        self.assertIn("omitted requested", out.error)
+
+    def test_recorded_prompt_length_preserves_messages_and_tools(self):
+        messages = [{"role": "user", "content": [{"type": "text", "text": "code"}]}]
+        tools = [{"type": "function", "function": {"name": "run"}}]
+        tokenizer = Mock()
+        tokenizer.apply_chat_template.side_effect = AssertionError("no HF template")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "requests.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "messages": messages,
+                        "tools": tools,
+                        "prompt_len": 12345,
+                        "max_tokens": 39,
+                    }
+                )
+                + "\n"
+            )
+            rows = sample_openai_requests(str(path), 1, tokenizer)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].prompt, messages)
+        self.assertEqual(rows[0].prompt_len, 12345)
+        self.assertEqual(rows[0].output_len, 39)
+        self.assertEqual(rows[0].extra_request_body, {"tools": tools})
+        tokenizer.apply_chat_template.assert_not_called()
+
+    def test_invalid_recorded_prompt_lengths_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "requests.jsonl"
+            for length in [-1, True, "123"]:
+                with self.subTest(length=length):
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "messages": [{"role": "user", "content": "x"}],
+                                "prompt_len": length,
+                            }
+                        )
+                        + "\n"
+                    )
+                    with self.assertRaisesRegex(ValueError, "nonnegative integer"):
+                        sample_openai_requests(str(path), 1, Mock())
+
+    def test_unknown_recorded_prompt_length_is_explicit_zero(self):
+        tokenizer = Mock()
+        tokenizer.apply_chat_template.side_effect = AssertionError("no HF template")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "requests.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "messages": [{"role": "user", "content": "code"}],
+                        "prompt_len": 0,
+                        "max_tokens": 2,
+                    }
+                )
+                + "\n"
+            )
+            rows = sample_openai_requests(str(path), 1, tokenizer)
+        self.assertEqual(rows[0].prompt_len, 0)
+        self.assertNotIn("prompt_len", rows[0].extra_request_body)
 
     def test_reasoning_only_stream_populates_metrics(self):
         chunks = [

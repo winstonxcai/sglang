@@ -1,5 +1,7 @@
 """Unit tests for ReqTimeStats.
 
+Author: Winston Cai. (Remnant first-output timestamp coverage.)
+
 ReqTimeStatsBase.__setstate__ rebases perf_counter fields onto the receiving
 process's clock anchor. Rebasing a field that was never stamped (0.0) turns
 the sentinel into a tiny epsilon (sender_diff - receiver_diff), which defeats
@@ -62,8 +64,12 @@ class TestOutputMetaInfo(CustomTestCase):
                 meta_info = stats.convert_to_output_meta_info()
                 if expected is None:
                     self.assertNotIn("first_token_latency", meta_info)
+                    self.assertNotIn("first_output_ts", meta_info)
                 else:
                     self.assertAlmostEqual(meta_info["first_token_latency"], expected)
+                    self.assertAlmostEqual(
+                        meta_info["first_output_ts"], rts.convert_time_to_realtime(first)
+                    )
 
     def test_tpot_excludes_first_token_from_denominator(self):
         stats = rts.APIServerReqTimeStats()

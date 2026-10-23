@@ -1,4 +1,5 @@
 from __future__ import annotations
+from sglang.srt.mem_cache.memory_pool_host import RemnantPackedHostPool
 
 import logging
 from dataclasses import dataclass, field
@@ -898,6 +899,21 @@ def build_deepseek_v4_hicache_stack(
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
+    from sglang.srt import remnant
+
+    is_remnant_packed = remnant.packed_enabled()
+    if is_remnant_packed:
+        if remnant.packed_profile().nondefault:
+            raise ValueError("non-256 Packed counts do not support HiCache")
+        if storage_backend is not None:
+            raise ValueError(
+                "Packed HiCache supports L2 host memory only, not L3 storage"
+            )
+        if get_memory().hicache_mem_layout != "layer_first":
+            raise ValueError("Packed HiCache requires layer_first layout")
+        if is_unified_kv or not has_paged_swa:
+            raise ValueError("Packed HiCache requires paged V4 SWA")
+        remnant.validate_packed_static_config()
     mtp_swa_device_buffers = []
     if not has_paged_swa:
         # Unified KV and encoder replay rebuild SWA state; keep it out of host cache.
@@ -990,21 +1006,33 @@ def build_deepseek_v4_hicache_stack(
         )
 
     if c4_layer_mapping:
-        c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
-        # C4 is KV-derived, so its HiCache indices stay in the FULL logical
-        # coordinate space. NPU transfer code derives the native C4 page size
-        # (for example 32 rather than 128) from the device-buffer shape.
-        c4_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C4),
-            device_buffers=c4_device_buffers,
-            item_bytes=c4_item_bytes,
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
-            layout=get_memory().hicache_mem_layout,
-            allocator_type=_get_allocator_type(),
-            page_aligned_only=is_unified_kv
-            or _dsv4_page_aligned_only(kvcache.c4_kv_pool),
-        )
+        if is_remnant_packed:
+            c4_host_pool = RemnantPackedHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4),
+                device_pool=kvcache.c4_kv_pool,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+            )
+        else:
+            c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(
+                kvcache, 4
+            )
+            # C4 is KV-derived, so its HiCache indices stay in the FULL logical
+            # coordinate space. NPU transfer code derives the native C4 page size
+            # (for example 32 rather than 128) from the device-buffer shape.
+            c4_host_pool = DeepSeekV4PagedHostPool(
+                pool_name=str(PoolName.DEEPSEEK_V4_C4),
+                device_buffers=c4_device_buffers,
+                item_bytes=c4_item_bytes,
+                num_host_pages=num_host_pages,
+                slot_page_size=page_size,
+                layout=get_memory().hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                page_aligned_only=is_unified_kv
+                or _dsv4_page_aligned_only(kvcache.c4_kv_pool),
+            )
         entries.append(
             build_pool_entry(
                 name=PoolName.DEEPSEEK_V4_C4,

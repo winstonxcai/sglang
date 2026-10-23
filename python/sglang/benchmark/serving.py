@@ -5,6 +5,7 @@
 
 """
 Benchmark online serving with dynamic requests.
+Author: Winston Cai. (recorded tool-call benchmark support)
 
 Usage:
 python3 -m sglang.benchmark.serving --backend sglang --num-prompt 10
@@ -146,7 +147,12 @@ def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
     # standard field when both are present to avoid counting the same tokens
     # twice on servers that expose aliases.
     reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-    return reasoning + (message.get("content") or "")
+    # Tool-call-only responses are real output too. Keep their deltas for
+    # first-output timing; serialized text is only a retokenization diagnostic,
+    # while the server's usage count supplies generated-token throughput.
+    tool_calls = message.get("tool_calls")
+    tool_text = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else ""
+    return reasoning + (message.get("content") or "") + tool_text
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -286,9 +292,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith("completions"), (
-        "OpenAI Completions API URL must end with 'completions'."
-    )
+    assert api_url.endswith(
+        "completions"
+    ), "OpenAI Completions API URL must end with 'completions'."
 
     prompt = request_func_input.prompt
 
@@ -418,9 +424,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith("chat/completions"), (
-        "OpenAI Chat Completions API URL must end with 'chat/completions'."
-    )
+    assert api_url.endswith(
+        "chat/completions"
+    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -488,6 +494,8 @@ async def async_request_openai_chat_completions(
 
         generated_text = ""
         output_len = request_func_input.output_len
+        usage_received = False
+        require_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -541,9 +549,15 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
+                                reported_tokens = (data.get("usage") or {}).get(
+                                    "completion_tokens"
                                 )
+                                if (
+                                    type(reported_tokens) is int
+                                    and reported_tokens >= 0
+                                ):
+                                    output_len = reported_tokens
+                                    usage_received = True
                                 _record_server_prompt_len(data, output)
 
                                 if getattr(args, "cache_report", False):
@@ -575,6 +589,12 @@ async def async_request_openai_chat_completions(
                                     most_recent_timestamp = timestamp
                                     generated_text += content
 
+                        if require_usage and not usage_received:
+                            raise ValueError(
+                                "Server omitted requested streaming completion-token usage"
+                            )
+                        if require_usage and ttft == 0.0:
+                            raise ValueError("Server returned no output event")
                         output.generated_text = generated_text
                         output.success = True
                         output.latency = latency
@@ -1326,9 +1346,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
-    assert backend in MULTI_TURN_BACKENDS, (
-        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
-    )
+    assert (
+        backend in MULTI_TURN_BACKENDS
+    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -1580,9 +1600,9 @@ async def benchmark(
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
-                assert lora_request_distribution == "skewed", (
-                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-                )
+                assert (
+                    lora_request_distribution == "skewed"
+                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -2053,9 +2073,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
-        assert args.backend == "sglang", (
-            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
-        )
+        assert (
+            args.backend == "sglang"
+        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
     # Set url
     if args.port is None:
@@ -2132,18 +2152,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
-        assert not args.tokenize_prompt, (
-            "`--tokenize-prompt` not compatible with image dataset"
-        )
+        assert (
+            not args.tokenize_prompt
+        ), "`--tokenize-prompt` not compatible with image dataset"
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert args.lora_name is not None and len(args.lora_name) > 1, (
-            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
-        )
+        assert (
+            args.lora_name is not None and len(args.lora_name) > 1
+        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
 
-    assert args.lora_zipf_alpha > 1, (
-        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
-    )
+    assert (
+        args.lora_zipf_alpha > 1
+    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
 
     print(f"{args}\n")
 
