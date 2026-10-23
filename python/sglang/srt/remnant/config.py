@@ -238,6 +238,27 @@ def configure_from_args(
     )
 
 
+def _snapshot_dispatch() -> tuple[str, str, str, PackedProfile]:
+    return _CACHE_FORMAT, _CACHE_IMPLEMENTATION, _STORE_IMPLEMENTATION, _PROFILE
+
+
+def _restore_dispatch(state: tuple[str, str, str, PackedProfile] | None) -> None:
+    global _CACHE_FORMAT, _CACHE_IMPLEMENTATION, _STORE_IMPLEMENTATION, _PROFILE
+    _CACHE_FORMAT, _CACHE_IMPLEMENTATION, _STORE_IMPLEMENTATION, _PROFILE = (
+        state if state is not None else ("native", "kernel", "kernel", PackedProfile())
+    )
+
+
+def _dispatch_from_args(args: Any) -> tuple[str, str, str, PackedProfile]:
+    """Validate a context's startup dispatch without changing the active model."""
+    previous = _snapshot_dispatch()
+    try:
+        configure_from_args(args)
+        return _snapshot_dispatch()
+    finally:
+        _restore_dispatch(previous)
+
+
 def cache_format() -> str:
     return _CACHE_FORMAT
 

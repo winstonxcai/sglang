@@ -122,6 +122,8 @@ class TestRemnantBackend(CustomTestCase):
         core.c4_sparse_page_indices = torch.zeros((1, 64), dtype=torch.int32)
         core.c4_sparse_raw_indices = torch.ones((1, 64), dtype=torch.int32)
         core.c4_sparse_topk_lengths = torch.tensor([32], dtype=torch.int32)
+        core.sparse_page_indices.return_value = core.c4_sparse_page_indices
+        core.sparse_topk_lengths.return_value = core.c4_sparse_topk_lengths
         core.swa_page_indices = torch.zeros((1, 64), dtype=torch.int32)
         core.swa_topk_lengths = torch.tensor([64], dtype=torch.int32)
         pool = mock.Mock(spec=module.DeepSeekV4TokenToKVPool)
@@ -130,10 +132,20 @@ class TestRemnantBackend(CustomTestCase):
         pool.swa_kv_pool = SimpleNamespace(kv_cache_total_dim=584)
         pool.get_swa_key_buffer_radix.return_value = torch.zeros((1, 64 * 584))
         pool.get_extra_key_buffer.return_value = workspace.native_bytes
+        pool.get_swa_key_page_size.return_value = 64
+        pool.get_swa_key_bytes_per_token.return_value = 584
+        pool.get_extra_key_page_size.return_value = 64
+        pool.get_extra_key_bytes_per_token.return_value = 584
+        pool.request_window = None
         pool.get_packed_freqs.return_value = torch.ones((16, 32), dtype=torch.complex64)
         backend = SimpleNamespace(
             mtp_enabled=False,
-            forward_metadata=SimpleNamespace(core_attn_metadata=core),
+            trtllm_attn=False,
+            is_dsv41=False,
+            _use_sparse_prefill=lambda *args, **kwargs: False,
+            forward_metadata=SimpleNamespace(
+                core_attn_metadata=core, late_layer_tail=None
+            ),
             token_to_kv_pool=pool,
             remnant_workspace=workspace,
             head_dim_v=512,
@@ -144,14 +156,14 @@ class TestRemnantBackend(CustomTestCase):
         q = torch.ones((1, 64, 512), dtype=torch.bfloat16)
         flashmla = mock.Mock(return_value=(q.unsqueeze(1), torch.zeros((1, 64))))
         with (
-            mock.patch.object(module, "_is_sm90", True),
-            mock.patch.object(module, "_is_sm120", False),
-            mock.patch.object(capture, "enabled", return_value=False),
             mock.patch.object(
-                module.envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL,
-                "get",
-                return_value=False,
+                module,
+                "get_platform",
+                return_value=SimpleNamespace(
+                    is_sm90=True, is_sm120=False, is_sm100=False
+                ),
             ),
+            mock.patch.object(capture, "enabled", return_value=False),
             mock.patch.object(
                 remnant,
                 "unpack_gather_native",
@@ -166,7 +178,7 @@ class TestRemnantBackend(CustomTestCase):
                 },
             ),
         ):
-            output = module.DeepseekV4AttnBackend.forward(
+            output = module.DeepseekV4AttnBackend._forward_attention(
                 backend,
                 q,
                 q,
@@ -208,7 +220,8 @@ class TestRemnantBackend(CustomTestCase):
             positions_casual=torch.zeros(1, dtype=torch.int32),
             swa_page_indices=torch.zeros((1, 1), dtype=torch.int32),
             swa_topk_lengths=torch.ones(1, dtype=torch.int32),
-            c4_sparse_topk=512,
+            index_topk=512,
+            present_ratios=(4, 128),
             c4_topk_lengths_clamp1=torch.ones(1, dtype=torch.int32),
             c128_page_indices=torch.zeros((1, 1), dtype=torch.int32),
             c128_topk_lengths_clamp1=torch.ones(1, dtype=torch.int32),

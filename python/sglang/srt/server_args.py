@@ -245,10 +245,11 @@ class ServerArgs:
 
     def _configure_dsv4_c4_cache_format(self) -> None:
         from sglang.srt import remnant
+        from sglang.srt.arg_groups.overrides import declare_resolution
 
-        remnant.configure_from_args(self, publish=False)
-        if self.dsv4_c4_cache_format != "remnant":
-            remnant.configure_from_args(self)
+        cfg = resolving_view(self)
+        remnant.configure_from_args(cfg, publish=False)
+        if cfg.dsv4_c4_cache_format != "remnant":
             return
 
         from sglang.srt.configs.model_config import is_deepseek_v4
@@ -265,40 +266,41 @@ class ServerArgs:
         ):
             raise ValueError("Packed layer counts require model compress_ratios")
         # The tuple travels with ServerArgs when spawned workers restore configuration.
-        remnant.configure_from_args(self, compression_ratios=ratios, publish=False)
+        remnant.configure_from_args(cfg, compression_ratios=ratios, publish=False)
         incompatible = []
-        if self.enable_hisparse:
+        if cfg.enable_hisparse:
             incompatible.append("--enable-hisparse")
-        if self.speculative_algorithm is not None:
+        if cfg.speculative_algorithm is not None:
             incompatible.append("speculative decoding")
-        if self.cpu_offload_gb > 0:
+        if cfg.cpu_offload_gb > 0:
             incompatible.append("--cpu-offload-gb")
-        if self.disaggregation_decode_enable_offload_kvcache:
+        if cfg.disaggregation_decode_enable_offload_kvcache:
             incompatible.append("decode KV offload")
-        if self.enable_hierarchical_cache and self.hicache_storage_backend is not None:
+        if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
             incompatible.append("HiCache L3 storage (--hicache-storage-backend)")
         if (
-            self.enable_hierarchical_cache
-            and self.hicache_storage_backend is None
-            and self.hicache_mem_layout != "layer_first"
+            cfg.enable_hierarchical_cache
+            and cfg.hicache_storage_backend is None
+            and cfg.hicache_mem_layout != "layer_first"
         ):
             logger.warning(
                 "Remnant HiCache L2 currently requires layer_first layout; "
                 "switching hicache_mem_layout from %s to layer_first.",
-                self.hicache_mem_layout,
+                cfg.hicache_mem_layout,
             )
-            resolving_view(self).hicache_mem_layout = "layer_first"
-        if self.enable_prefill_context_parallel:
-            incompatible.append("--enable-prefill-context-parallel")
-        if self.enable_dsa_prefill_context_parallel:
-            incompatible.append("--enable-dsa-prefill-context-parallel")
+            declare_resolution(
+                self,
+                "_configure_dsv4_c4_cache_format",
+                hicache_mem_layout="layer_first",
+            )
+        if cfg.enable_prefill_cp:
+            incompatible.append("--enable-prefill-cp")
         if incompatible:
             raise ValueError(
                 "--dsv4-c4-cache-format remnant is incompatible with "
                 + ", ".join(incompatible)
             )
 
-        remnant.configure_from_args(self, compression_ratios=ratios)
         self._dsv4_c4_cache_compression_ratios = (
             None if ratios is None else tuple(ratios)
         )

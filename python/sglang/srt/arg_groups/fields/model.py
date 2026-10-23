@@ -36,6 +36,23 @@ class Model(msgspec.Struct):
 
     _NS_PATH = "model"
 
+
+    # ---- derived: computed at publish from the leaves below.
+    is_startup_weight_load_overlap = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.startup_weight_load_overlap_of",
+        doc="Whether weight loading overlaps startup.",
+    )
+
+    # -------------------------------------------------------------------------
+    # Model and tokenizer
+    # -------------------------------------------------------------------------
+    model_path: A[
+        str,
+        Arg(
+            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+            aliases=["--model"],
+        ),
+    ]
     dsv4_c4_cache_format: A[
         str,
         Arg(
@@ -82,22 +99,6 @@ class Model(msgspec.Struct):
         ),
     ] = None
 
-    # ---- derived: computed at publish from the leaves below.
-    is_startup_weight_load_overlap = Derived(
-        fn="sglang.srt.arg_groups.model_override_base.startup_weight_load_overlap_of",
-        doc="Whether weight loading overlaps startup.",
-    )
-
-    # -------------------------------------------------------------------------
-    # Model and tokenizer
-    # -------------------------------------------------------------------------
-    model_path: A[
-        str,
-        Arg(
-            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-            aliases=["--model"],
-        ),
-    ]
     load_format: A[
         str,
         Arg(

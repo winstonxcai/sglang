@@ -965,6 +965,7 @@ class RuntimeContext:
         "_config_bags",
         "_overrides_log",
         "_publish_role",
+        "_remnant_state",
         "flags",
         "resources",
         "forward",
@@ -976,6 +977,7 @@ class RuntimeContext:
         self._config_bags: dict | None = None
         self._overrides_log: list = []
         self._publish_role: str | None = None
+        self._remnant_state = None
         self.flags = Flags()
         self.resources = Resources()
         self.forward = ForwardFlags()
@@ -1022,6 +1024,10 @@ class RuntimeContext:
 
     def set_server_args(self, server_args: ServerArgs) -> None:
         """Replace the raw input and rebuild resolved config bags, clearing override provenance."""
+        from sglang.srt.remnant import config as remnant_config
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        dispatch = remnant_config._dispatch_from_args(resolved_view(server_args))
         self.flags.capture.enable_torch_compile = bool(
             _resolved_or_field(server_args, "enable_torch_compile", False)
         )
@@ -1034,6 +1040,9 @@ class RuntimeContext:
             if "gpu_id" in fields:
                 stated["gpu_id"] = fields["gpu_id"]
         self._config_bags = _build_config_bags(server_args)
+        self._remnant_state = dispatch
+        if self is _CONTEXT:
+            remnant_config._restore_dispatch(dispatch)
         device = self._config_bags.get("device")
         if stated and device is not None:
             device._set("gpu_id", stated["gpu_id"])
@@ -1192,6 +1201,7 @@ class _ServerArgsOverride:
         "_prev_bags",
         "_prev_overrides_log",
         "_prev_publish_role",
+        "_prev_remnant_state",
         "_prev_parallel_config",
         "_prev_capture",
         "_installed",
@@ -1213,6 +1223,7 @@ class _ServerArgsOverride:
         self._prev_bags = ctx._config_bags
         self._prev_overrides_log = ctx._overrides_log
         self._prev_publish_role = ctx._publish_role
+        self._prev_remnant_state = ctx._remnant_state
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
@@ -1252,6 +1263,11 @@ class _ServerArgsOverride:
         ctx._config_bags = self._prev_bags
         ctx._overrides_log = self._prev_overrides_log
         ctx._publish_role = self._prev_publish_role
+        ctx._remnant_state = self._prev_remnant_state
+        if ctx is _CONTEXT:
+            from sglang.srt.remnant import config as remnant_config
+
+            remnant_config._restore_dispatch(ctx._remnant_state)
         ctx.parallel._config = self._prev_parallel_config
         ctx.flags.capture.enable_torch_compile = self._prev_capture
         self._prev_server_args = None
@@ -1524,12 +1540,24 @@ def use_context(context: RuntimeContext):
     The previous context is restored by identity without re-projecting its bags.
     """
     global _CONTEXT, _PARALLEL
+    from sglang.srt.remnant import config as remnant_config
+
+    previous_dispatch = remnant_config._snapshot_dispatch()
     previous_context, previous_parallel = _CONTEXT, _PARALLEL
+    previous_owned_dispatch = previous_context._remnant_state
     _CONTEXT, _PARALLEL = context, context.parallel
+    remnant_config._restore_dispatch(context._remnant_state)
     try:
         yield context
     finally:
         _CONTEXT, _PARALLEL = previous_context, previous_parallel
+        # Publication may update the returning context while this scope is active,
+        # including re-entry into the same context. Restore its latest owned state.
+        remnant_config._restore_dispatch(
+            previous_dispatch
+            if previous_context._remnant_state is previous_owned_dispatch
+            else previous_context._remnant_state
+        )
 
 
 def _configure_context(
@@ -1542,10 +1570,6 @@ def _configure_context(
             "its namespace set (None for the full tree)."
         )
     server_args.resolve_once()
-    # Author: Winston Cai. Restore process-local dispatch in spawned workers.
-    from sglang.srt import remnant
-
-    remnant.configure_from_args(server_args)
     discarded = context.overrides_log()
     context.set_server_args(server_args)
     if discarded:
@@ -1742,6 +1766,9 @@ def restore_context(state: dict[str, Any]) -> None:
     for name, value in state["__parallel__"].items():
         setattr(_CONTEXT.parallel, name, value)
     set_global_dwdp_manager(state["__dwdp__"])
+    from sglang.srt.remnant import config as remnant_config
+
+    remnant_config._restore_dispatch(_CONTEXT._remnant_state)
 
 
 def reset_context() -> None:
@@ -1753,6 +1780,10 @@ def reset_context() -> None:
     _CONTEXT._config_bags = None
     _CONTEXT._overrides_log = []
     _CONTEXT._publish_role = None
+    _CONTEXT._remnant_state = None
+    from sglang.srt.remnant import config as remnant_config
+
+    remnant_config._restore_dispatch(None)
     _CONTEXT.parallel._config = None
     _CONTEXT.parallel.clear_stamp()
     _CONTEXT.flags = Flags()

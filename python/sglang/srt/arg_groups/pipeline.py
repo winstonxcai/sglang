@@ -106,7 +106,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     remnant.configure_from_args(server_args, publish=False)
     if cfg.model_path.lower() in ["none", "dummy"]:
-        remnant.configure_from_args(server_args)
         from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
         run_post_process_pass(server_args, resolve_boundary_reduction)

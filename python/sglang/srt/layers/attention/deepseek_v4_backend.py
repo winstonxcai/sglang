@@ -1282,8 +1282,7 @@ class DeepseekV4AttnBackend(
                     "packed is incompatible with CPU or decode KV offload"
                 )
             if (
-                args.enable_prefill_context_parallel
-                or args.enable_dsa_prefill_context_parallel
+                get_parallel().enable_prefill_cp
                 or get_parallel().attn_cp_size != 1
             ):
                 raise RuntimeError("packed is incompatible with context parallelism")
