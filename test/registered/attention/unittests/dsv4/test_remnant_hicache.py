@@ -239,16 +239,40 @@ class TestRemnantHiCache(CustomTestCase):
         # HiCache can restore packed rows before any compressor write runs.
         # Exercise the same pool accessors used by that cache-hit path without
         # constructing or loading a model.
-        packed_pool = object.__new__(RemnantPackedKVPool)
-        packed_pool.start_layer = 0
-        packed_pool._remnant_rope_freqs = [None]
-        token_pool = object.__new__(DeepSeekV4TokenToKVPool)
-        token_pool.layer_mapping = [(4, 0, packed_pool)]
-        freqs_cis = torch.arange(16, dtype=torch.float32).to(torch.complex64)
+        from sglang.srt.runtime_context import get_context
 
-        token_pool.set_packed_rope_freqs(0, freqs_cis)
+        with get_context().override_server_args(
+            device="cuda",
+            dsv4_attn_backend="flashmla",
+            dsv4_c4_cache_format="remnant",
+            dsv4_c4_cache_implementation="kernel",
+        ):
+            token_pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=1,
+                swa_size=256,
+                c4_size=64,
+                c128_size=2,
+                c4_state_pool_size=8,
+                c128_state_pool_size=128,
+                page_size=256,
+                swa_page_size=256,
+                dtype=torch.float8_e4m3fn,
+                c4_state_dtype=torch.float32,
+                c128_state_dtype=torch.float32,
+                qk_nope_head_dim=448,
+                qk_rope_head_dim=64,
+                indexer_head_dim=128,
+                layer_num=1,
+                device="cuda",
+                enable_memory_saver=False,
+                compression_ratios=[4],
+                full_size=256,
+            )
+            self.assertIsInstance(token_pool.c4_kv_pool, RemnantPackedKVPool)
+            freqs_cis = torch.arange(16, dtype=torch.float32).to(torch.complex64)
+            token_pool.set_packed_rope_freqs(0, freqs_cis)
 
-        self.assertIs(token_pool.get_packed_freqs(0), freqs_cis)
+            self.assertIs(token_pool.get_packed_freqs(0), freqs_cis)
 
 
 if __name__ == "__main__":

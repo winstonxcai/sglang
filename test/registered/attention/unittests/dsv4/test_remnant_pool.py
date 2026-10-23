@@ -65,6 +65,12 @@ def _cuda_snapshot():
         "allocated": torch.cuda.memory_allocated(),
         "reserved": torch.cuda.memory_reserved(),
         "peak_allocated": torch.cuda.max_memory_allocated(),
+        "active_requested_bytes": sum(
+            block["requested_size"]
+            for segment in torch.cuda.memory_snapshot()
+            for block in segment["blocks"]
+            if block["state"] == "active_allocated"
+        ),
     }
 
 
@@ -138,8 +144,8 @@ def test_real_gpu_allocations(tmp_path):
                     else {"layouts": (config.PackedLayerLayout(2, count),)}
                 )
                 clean()
-                before = _cuda_snapshot()
                 torch.cuda.reset_peak_memory_stats()
+                before = _cuda_snapshot()
                 pool = cls(
                     rows,
                     64,
@@ -229,8 +235,8 @@ def test_real_gpu_allocations(tmp_path):
             sizes.max_running_requests = 32
             sizes = sizing.finalize_with_max_running_requests(sizes)
             clean()
-            before = _cuda_snapshot()
             torch.cuda.reset_peak_memory_stats()
+            before = _cuda_snapshot()
             pool = pool_module.DeepSeekV4TokenToKVPool(
                 max_num_reqs=32,
                 swa_size=sizes.swa_max_total_num_tokens,

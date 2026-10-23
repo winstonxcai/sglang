@@ -42,6 +42,34 @@ def test_established_matrix_and_profile_coverage():
     assert cases.MODES == ("native", "triton", "kernel")
 
 
+def test_prefill_fixture_matches_combine_keyword_contract():
+    """Catch upstream required-argument additions before paying for GPU setup."""
+    import ast
+
+    tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
+    call = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "combine_topk_swa_indices"
+    )
+    api = ast.parse(
+        (
+            ROOT / "python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py"
+        ).read_text()
+    )
+    function = next(
+        n
+        for n in api.body
+        if isinstance(n, ast.FunctionDef) and n.name == "combine_topk_swa_indices"
+    )
+    required = function.args.args[
+        : len(function.args.args) - len(function.args.defaults)
+    ]
+    assert {arg.arg for arg in required} <= {keyword.arg for keyword in call.keywords}
+
+
 def test_store_matrix_layouts_are_valid_and_reproducible():
     specs = cases.store_cases()
     assert len(specs) == 25 and len({c.name for c in specs}) == 25

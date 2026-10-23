@@ -734,7 +734,10 @@ def prefill_read_operations(
     swa_expected = decode_native(swa_source, case.swa_page_size)[:swa_rows]
     swa_ids = torch.arange(swa_rows, device="cuda", dtype=torch.int32)
     positions = torch.arange(
-        case.history_length - case.query_length, case.history_length, device="cuda"
+        case.history_length - case.query_length,
+        case.history_length,
+        device="cuda",
+        dtype=torch.int32,
     )
     available = ((positions + 1) // 4).clamp_max(rows)
     selected = torch.randint(
@@ -748,6 +751,7 @@ def prefill_read_operations(
     selected = (selected.long() % available[:, None]).to(torch.int32)
     combined, lengths = combine_topk_swa_indices(
         topk_indices=selected,
+        query_pos=positions,
         query_start_loc=torch.tensor(
             [0, case.query_length], device="cuda", dtype=torch.int32
         ),
