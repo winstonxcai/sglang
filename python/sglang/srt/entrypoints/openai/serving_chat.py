@@ -76,6 +76,7 @@ from sglang.srt.function_call.utils import (
     normalize_json_schema_types,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_time_stats import SGLANG_FRONTEND_DIAGNOSTICS
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -298,21 +299,27 @@ class OpenAIServingChat(OpenAIServingBase):
         self._init_input_preparation()
 
     def _init_input_preparation(self) -> None:
-        """Create one worker only for the explicitly enabled DSV4 text path."""
+        """Bound conversion concurrency for the opt-in DSV4 text path."""
+        workers = envs.SGLANG_DSV4_PREPARATION_WORKERS.get()
+        if workers not in (1, 2, 4):
+            raise ValueError("SGLANG_DSV4_PREPARATION_WORKERS must be 1, 2 or 4")
         enabled = (
             envs.SGLANG_DSV4_ASYNC_PREPARATION.get()
             and self.chat_encoding_spec == "dsv4"
             and not self.tokenizer_manager.model_config.is_multimodal
         )
         self._input_preparation_closed = False
-        self._input_preparation_gate = asyncio.Semaphore(1) if enabled else None
+        self._input_preparation_workers = workers if enabled else 0
+        self._input_preparation_gate = asyncio.Semaphore(workers) if enabled else None
         self._input_preparation_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv4-input")
+            ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dsv4-input")
             if enabled
             else None
         )
         if enabled:
-            logger.info("DSV4 asynchronous input preparation enabled: one CPU worker")
+            logger.info(
+                "DSV4 asynchronous input preparation enabled: %d CPU worker(s)", workers
+            )
 
     async def _convert_to_internal_request_async(
         self,
@@ -327,8 +334,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.input_ids is not None:
             return self._convert_to_internal_request(request, raw_request)
 
-        # Do not submit an unbounded executor queue. Only the admitted request
-        # may mutate its request-local inputs. The received timestamp was taken
+        queued_time = time.perf_counter() if SGLANG_FRONTEND_DIAGNOSTICS else 0.0
+        # Do not submit an unbounded executor queue. Only admitted requests
+        # may mutate their request-local inputs. The received timestamp was taken
         # before this wait, so queue time remains part of end-to-end TTFT.
         gate = self._input_preparation_gate
         assert gate is not None
@@ -339,9 +347,17 @@ class OpenAIServingChat(OpenAIServingBase):
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         try:
-            concurrent_result = executor.submit(
-                context.run, self._convert_to_internal_request, request, raw_request
-            )
+            if SGLANG_FRONTEND_DIAGNOSTICS:
+                concurrent_result = executor.submit(
+                    context.run,
+                    self._convert_to_internal_request_timed,
+                    request,
+                    raw_request,
+                )
+            else:
+                concurrent_result = executor.submit(
+                    context.run, self._convert_to_internal_request, request, raw_request
+                )
         except BaseException:
             gate.release()
             raise
@@ -359,9 +375,28 @@ class OpenAIServingChat(OpenAIServingBase):
             lambda completed: None if completed.cancelled() else completed.exception()
         )
         adapted = await asyncio.shield(result)
+        if SGLANG_FRONTEND_DIAGNOSTICS:
+            resumed_time = time.perf_counter()
+            adapted, started_time, finished_time = adapted
+            adapted[0].input_preparation_times = (
+                queued_time,
+                started_time,
+                finished_time,
+                resumed_time,
+            )
         if self._input_preparation_closed:
             raise HTTPException(status_code=503, detail="Input preparation is closed")
         return adapted
+
+    def _convert_to_internal_request_timed(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request = None,
+    ) -> tuple[tuple[GenerateReqInput, ChatCompletionRequest], float, float]:
+        """Measure conversion on its worker clock, without touching API state."""
+        started_time = time.perf_counter()
+        adapted = self._convert_to_internal_request(request, raw_request)
+        return adapted, started_time, time.perf_counter()
 
     async def aclose(self) -> None:
         """Drain the owned worker without blocking the output event loop."""

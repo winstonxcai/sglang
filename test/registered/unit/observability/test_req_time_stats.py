@@ -43,6 +43,32 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
 
 
 class TestFirstOutputMetadata(CustomTestCase):
+
+    def test_preparation_timestamps_use_api_clock_and_remain_opt_in(self):
+        stats = rts.APIServerReqTimeStats(
+            input_preparation_times=(100.0, 102.0, 103.0, 104.0)
+        )
+        with (
+            mock.patch.object(rts, "SGLANG_FRONTEND_DIAGNOSTICS", True),
+            mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0),
+        ):
+            metadata = stats.convert_to_output_meta_info()
+        self.assertEqual(
+            metadata,
+            {
+                "input_preparation_queued_ts": 1_000_100.0,
+                "input_preparation_start_ts": 1_000_102.0,
+                "input_preparation_finish_ts": 1_000_103.0,
+                "input_preparation_resume_ts": 1_000_104.0,
+            },
+        )
+        with mock.patch.object(rts, "SGLANG_FRONTEND_DIAGNOSTICS", False):
+            self.assertEqual(stats.convert_to_output_meta_info(), {})
+        with mock.patch.object(rts, "SGLANG_FRONTEND_DIAGNOSTICS", True):
+            self.assertEqual(
+                rts.APIServerReqTimeStats().convert_to_output_meta_info(), {}
+            )
+
     def test_first_output_uses_existing_stamp_for_single_token(self):
         stats = rts.APIServerReqTimeStats()
         stats.created_time = 100.0

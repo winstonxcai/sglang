@@ -311,6 +311,10 @@ class GenerateReqInput:
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict[str, Any]] = None
     received_time: Optional[float] = None
+    # Internal frontend diagnostics (Author: Winston Cai.). All four
+    # perf_counter stamps share the API process clock: queued, worker
+    # start, worker finish, API resume. Absent for bypassed conversions.
+    input_preparation_times: Optional[Tuple[float, float, float, float]] = None
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None

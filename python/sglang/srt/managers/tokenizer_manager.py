@@ -3436,6 +3436,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            if SGLANG_FRONTEND_DIAGNOSTICS:
+                time_stats.input_preparation_times = getattr(
+                    sub_obj, "input_preparation_times", None
+                )
 
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.

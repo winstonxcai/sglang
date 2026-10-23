@@ -14,7 +14,6 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
 import contextvars
-import copy
 import dataclasses
 import json
 import threading
@@ -3438,11 +3437,12 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
-
 class AsyncInputPreparationTests(unittest.IsolatedAsyncioTestCase):
     """Use the actual converter with independent tokenizer and thread fixtures."""
 
-    def make_serving(self, enabled=True, *, encoding="dsv4", multimodal=False):
+    def make_serving(
+        self, enabled=True, *, encoding="dsv4", multimodal=False, workers=1
+    ):
         class ByteTokenizer:
             bos_token_id = None
 
@@ -3467,7 +3467,10 @@ class AsyncInputPreparationTests(unittest.IsolatedAsyncioTestCase):
         serving._tokenizer_auto_adds_specials = False
         serving.allowed_custom_labels = None
         serving._validate_request = lambda request: None
-        with envs.SGLANG_DSV4_ASYNC_PREPARATION.override(enabled):
+        with (
+            envs.SGLANG_DSV4_ASYNC_PREPARATION.override(enabled),
+            envs.SGLANG_DSV4_PREPARATION_WORKERS.override(workers),
+        ):
             serving._init_input_preparation()
         self.addAsyncCleanup(serving.aclose)
         return serving
@@ -3645,6 +3648,182 @@ class AsyncInputPreparationTests(unittest.IsolatedAsyncioTestCase):
             serving._handle_non_streaming_request.assert_not_called()
         finally:
             release.set()
+
+    async def test_worker_count_validation(self):
+        for workers in (0, -1, 3, 5):
+            with self.subTest(workers=workers):
+                with self.assertRaisesRegex(ValueError, "must be 1, 2 or 4"):
+                    self.make_serving(workers=workers)
+        for workers in (1, 2, 4):
+            self.assertEqual(
+                self.make_serving(workers=workers)._input_preparation_workers, workers
+            )
+
+    async def test_two_workers_bound_parallelism_and_retain_cancelled_slots(self):
+        serving = self.make_serving(workers=2)
+        started = [threading.Event() for _ in range(3)]
+        release = threading.Event()
+
+        def convert(request, raw):
+            index = int(request.extra_key)
+            started[index].set()
+            if index < 2 and not release.wait(5):
+                raise TimeoutError("test failed to release conversions")
+            return GenerateReqInput(input_ids=[index]), request
+
+        serving._convert_to_internal_request = convert
+        first, second = [
+            asyncio.create_task(
+                serving._convert_to_internal_request_async(
+                    self.request(extra_key=str(i))
+                )
+            )
+            for i in range(2)
+        ]
+        tasks = [first, second]
+        try:
+            await self.wait_started(started[0])
+            await self.wait_started(started[1])
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            third = asyncio.create_task(
+                serving._convert_to_internal_request_async(self.request(extra_key="2"))
+            )
+            tasks.append(third)
+            await asyncio.sleep(0.02)
+            self.assertFalse(
+                started[2].is_set(), "cancelled caller released a running slot"
+            )
+            release.set()
+            self.assertEqual((await asyncio.wait_for(second, 2))[0].input_ids, [1])
+            self.assertEqual((await asyncio.wait_for(third, 2))[0].input_ids, [2])
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_two_worker_actual_converter_parity_and_request_isolation(self):
+        serving = self.make_serving(workers=2)
+        requests = [
+            self.request(
+                extra_key=str(i),
+                max_tokens=16 + i,
+                reasoning_effort="high" if i % 2 else "low",
+            )
+            for i in range(8)
+        ]
+        before = [r.model_dump() for r in requests]
+        expected = [
+            serving._convert_to_internal_request(r.model_copy(deep=True))
+            for r in requests
+        ]
+        actual = await asyncio.gather(
+            *(
+                serving._convert_to_internal_request_async(r.model_copy(deep=True))
+                for r in requests
+            )
+        )
+        for wanted, got in zip(expected, actual):
+            self.assertEqual(dataclasses.asdict(wanted[0]), dataclasses.asdict(got[0]))
+            self.assertEqual(wanted[1].model_dump(), got[1].model_dump())
+        self.assertEqual(before, [r.model_dump() for r in requests])
+
+    async def test_shared_fast_tokenizer_parallel_conversion_matches_serial(self):
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        serving = self.make_serving(workers=2)
+        backend = Tokenizer(
+            models.WordLevel(
+                {
+                    "[UNK]": 0,
+                    "hello": 1,
+                    "world": 2,
+                    **{str(i): i + 3 for i in range(8)},
+                },
+                unk_token="[UNK]",
+            )
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        serving.tokenizer_manager.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, unk_token="[UNK]"
+        )
+        requests = [
+            ChatCompletionRequest(
+                model="test",
+                messages=[{"role": "user", "content": "hello world " * 4096 + str(i)}],
+                max_tokens=i + 10,
+            )
+            for i in range(8)
+        ]
+        expected = [
+            serving._convert_to_internal_request(r.model_copy(deep=True))
+            for r in requests
+        ]
+        convert = serving._convert_to_internal_request
+        barrier = threading.Barrier(2)
+
+        def concurrent_convert(request, raw):
+            barrier.wait(timeout=5)
+            return convert(request, raw)
+
+        serving._convert_to_internal_request = concurrent_convert
+        results = await asyncio.gather(
+            *(
+                serving._convert_to_internal_request_async(r.model_copy(deep=True))
+                for r in requests
+            )
+        )
+        for wanted, got in zip(expected, results):
+            self.assertEqual(dataclasses.asdict(wanted[0]), dataclasses.asdict(got[0]))
+
+    async def test_preparation_timestamps_partition_wait_and_execution(self):
+        serving = self.make_serving()
+        started, release = threading.Event(), threading.Event()
+
+        def convert(request, raw):
+            if request.extra_key == "first":
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("test failed to release conversion")
+            return GenerateReqInput(input_ids=[7]), request
+
+        serving._convert_to_internal_request = convert
+        namespace = OpenAIServingChat._convert_to_internal_request_async.__globals__
+        with patch.dict(namespace, SGLANG_FRONTEND_DIAGNOSTICS=True):
+            first = asyncio.create_task(
+                serving._convert_to_internal_request_async(
+                    self.request(extra_key="first")
+                )
+            )
+            second = None
+            try:
+                await self.wait_started(started)
+                second = asyncio.create_task(
+                    serving._convert_to_internal_request_async(
+                        self.request(extra_key="second")
+                    )
+                )
+                await asyncio.sleep(0.02)
+                released = time.perf_counter()
+                release.set()
+                a, b = await asyncio.gather(first, second)
+                queued, begin, finish, resumed = b[0].input_preparation_times
+                self.assertLess(queued, released)
+                self.assertGreaterEqual(begin, released)
+                self.assertLessEqual(begin, finish)
+                self.assertLessEqual(finish, resumed)
+                self.assertGreater(begin - queued, 0)
+                self.assertNotEqual(
+                    a[0].input_preparation_times, b[0].input_preparation_times
+                )
+            finally:
+                release.set()
+                await asyncio.gather(
+                    *(t for t in (first, second) if t), return_exceptions=True
+                )
+        result, _ = await serving._convert_to_internal_request_async(self.request())
+        self.assertIsNone(result.input_preparation_times)
 
 
 if __name__ == "__main__":

@@ -1204,6 +1204,7 @@ class Envs:
     SGLANG_DEFAULT_THINKING = EnvBool(False)
     # Scoped DSV4 input preparation candidate. Author: Winston Cai.
     SGLANG_DSV4_ASYNC_PREPARATION = EnvBool(False)
+    SGLANG_DSV4_PREPARATION_WORKERS = EnvInt(1)
 
     # ===================================================================
     # Encoder pipeline and disaggregation

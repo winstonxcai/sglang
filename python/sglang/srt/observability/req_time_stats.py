@@ -22,7 +22,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from typing_extensions import Self
 
@@ -394,6 +394,8 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
+    # API-local queued/start/finish/resume stamps; never sent to the GPU.
+    input_preparation_times: Optional[Tuple[float, float, float, float]] = None
 
     # First output-batch diagnostics, on this process's perf_counter clock.
     # Copy the first packet's stages because later scheduler snapshots do not
@@ -551,6 +553,14 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             )
 
         if SGLANG_FRONTEND_DIAGNOSTICS:
+            if self.input_preparation_times is not None:
+                for name, timestamp in zip(
+                    ("queued", "start", "finish", "resume"),
+                    self.input_preparation_times,
+                ):
+                    meta_info[f"input_preparation_{name}_ts"] = (
+                        convert_time_to_realtime(timestamp)
+                    )
             for name in (
                 "first_output_send",
                 "detokenizer_recv",
