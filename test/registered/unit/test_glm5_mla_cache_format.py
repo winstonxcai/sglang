@@ -69,3 +69,10 @@ def test_rejects_unqualified_combinations(name, value):
 def test_rejects_other_models():
     with pytest.raises(ValueError, match="GLM-5.3"):
         config.validate(args(), SimpleNamespace(model_type="deepseek_v4"))
+
+
+def test_multimodal_checkpoint_requires_text_only_launch():
+    multimodal = SimpleNamespace(text_config=MODEL, vision_config=object())
+    with pytest.raises(ValueError, match="language-model-only"):
+        config.validate(args(), multimodal)
+    config.validate(args(language_model_only=True), multimodal)

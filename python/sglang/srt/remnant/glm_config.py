@@ -31,11 +31,20 @@ def validate(args, hf_config) -> None:
     ) != (512, 0):
         raise ValueError("GLM Packed requires latent dimension 512 and no RoPE tail")
     unsupported = []
+    if hasattr(hf_config, "vision_config") and not getattr(
+        args, "language_model_only", False
+    ):
+        unsupported.append(
+            "multimodal GLM configuration requires --language-model-only"
+        )
     for name in (
         "enable_two_batch_overlap",
         "enable_hisparse",
         "enable_hierarchical_cache",
         "enable_unified_memory",
+        "enable_page_major_kv_layout",
+        "enable_unified_cache_external_linker",
+        "disaggregation_decode_enable_offload_kvcache",
         "enable_multimodal",
         "enable_prefill_cp",
         "enable_cp_decode_attn_tp",
