@@ -27,7 +27,18 @@ def args(**changes):
 
 
 MODEL = SimpleNamespace(
-    model_type="glm5_next_text", kv_lora_rank=512, qk_rope_head_dim=0
+    model_type="glm5_next_text",
+    kv_lora_rank=512,
+    qk_rope_head_dim=0,
+    qk_nope_head_dim=256,
+    v_head_dim=256,
+    index_topk=2048,
+    index_kpool=4,
+    index_head_dim=128,
+    num_hidden_layers=45,
+    num_attention_heads=64,
+    index_kpool_compress=True,
+    index_kpool_always_select_tail=True,
 )
 
 
@@ -76,3 +87,20 @@ def test_multimodal_checkpoint_requires_text_only_launch():
     with pytest.raises(ValueError, match="language-model-only"):
         config.validate(args(), multimodal)
     config.validate(args(language_model_only=True), multimodal)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("qk_nope_head_dim", 128),
+        ("index_topk", 1024),
+        ("index_kpool", 1),
+        ("num_hidden_layers", 44),
+        ("num_attention_heads", 128),
+    ],
+)
+def test_rejects_unqualified_geometry(name, value):
+    fields = vars(MODEL).copy()
+    fields[name] = value
+    with pytest.raises(ValueError, match="unqualified geometry"):
+        config.validate(args(), SimpleNamespace(**fields))

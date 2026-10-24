@@ -32,7 +32,30 @@ def validate(args: Any, hf_config: Any) -> None:
         getattr(text, "qk_rope_head_dim", None),
     ) != (512, 0):
         raise ValueError("GLM Packed requires latent dimension 512 and no RoPE tail")
+    geometry = {
+        "qk_nope_head_dim": 256,
+        "v_head_dim": 256,
+        "index_topk": 2048,
+        "index_kpool": 4,
+        "index_head_dim": 128,
+        "num_hidden_layers": 45,
+        "num_attention_heads": 64,
+        "index_kpool_compress": True,
+        "index_kpool_always_select_tail": True,
+    }
+    mismatched = [
+        f"{name}={getattr(text, name, None)!r} (expected {value!r})"
+        for name, value in geometry.items()
+        if getattr(text, name, None) != value
+    ]
+    if mismatched:
+        raise ValueError("GLM Packed unqualified geometry: " + ", ".join(mismatched))
     unsupported = []
+    if (
+        getattr(args, "tp_size", 1) not in (1, 2, 4, 8)
+        or getattr(args, "pp_size", 1) != 1
+    ):
+        unsupported.append("requires TP1/2/4/8 and PP1")
     if hasattr(hf_config, "vision_config") and not getattr(
         args, "language_model_only", False
     ):

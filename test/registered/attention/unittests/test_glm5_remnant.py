@@ -27,6 +27,8 @@ from sglang.srt.remnant.reference import topmag_keep_mask
 from sglang.srt.runtime_context import get_context
 from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
+ATTENTION_SCALE = 256**-0.5  # Native scales the original head, before 512-D absorption.
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="H100 required")
 
 
@@ -119,14 +121,14 @@ def test_invalid_attention():
         dense.masked_fill_(~mask, 0)
         valid = torch.where(indices < len(raw), indices, -1)
         ref = tilelang_sparse_fwd(
-            q, dense.view(torch.float8_e4m3fn).unsqueeze(1), valid, 512**-0.5
+            q, dense.view(torch.float8_e4m3fn).unsqueeze(1), valid, ATTENTION_SCALE
         )
         for impl in ("adapter", "direct"):
             actual = attention(
                 q,
                 PackedCache(cache.values, cache.bitmaps, cache.workspace, impl),
                 indices,
-                512**-0.5,
+                ATTENTION_SCALE,
             )
             torch.testing.assert_close(actual, ref, atol=0.02, rtol=0.02)
 
@@ -185,7 +187,7 @@ def test_partial_outputs():
                         0,
                         2112,
                         packed=mode,
-                        sm_scale=512**-0.5,
+                        sm_scale=ATTENTION_SCALE,
                         block_I=32,
                         inner_iter=inner,
                         threads=128,
@@ -222,12 +224,12 @@ def test_attention(heads, batch, tails):
         dense = dense.view(torch.float8_e4m3fn).unsqueeze(1)
         indices = selection(batch, tails)
         q = torch.randn(batch, heads, 512, dtype=torch.bfloat16, device="cuda")
-        reference = tilelang_sparse_fwd(q, dense, indices, 512**-0.5)
+        reference = tilelang_sparse_fwd(q, dense, indices, ATTENTION_SCALE)
         for implementation in ("adapter", "direct"):
             candidate = PackedCache(
                 cache.values, cache.bitmaps, cache.workspace, implementation
             )
-            out = attention(q, candidate, indices, 512**-0.5)
+            out = attention(q, candidate, indices, ATTENTION_SCALE)
             torch.testing.assert_close(out, reference, atol=0.02, rtol=0.02)
 
 
@@ -241,7 +243,7 @@ def test_changing_input_graph(implementation):
 
         def run():
             normalize_and_store(raw, norm, loc, cache.values, cache.bitmaps)
-            return attention(q, cache, indices, 512**-0.5)
+            return attention(q, cache, indices, ATTENTION_SCALE)
 
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -393,9 +395,9 @@ def test_production_backend_constructor():
         q = torch.randn(8, 8, 512, dtype=torch.bfloat16, device="cuda")
         cache = pool.get_glm_packed_buffer(3)
         out = backend._forward_tilelang(
-            q, cache, 512, selection(8, 3)[:, 0, :2051], 512**-0.5
+            q, cache, 512, selection(8, 3)[:, 0, :2051], ATTENTION_SCALE
         )
-        ref = attention(q, cache, selection(8, 3), 512**-0.5)
+        ref = attention(q, cache, selection(8, 3), ATTENTION_SCALE)
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
@@ -415,6 +417,14 @@ def test_real_gpu_allocations(tmp_path):
     )
     text = json.loads(source.read_text())["text_config"]
     assert text["num_hidden_layers"] == 45 and text["index_kpool"] == 4
+    assert text["qk_nope_head_dim"] == 256 and text["qk_rope_head_dim"] == 0
+    assert text["rms_norm_eps"] == 1e-5
+    assert [
+        i
+        for i, kind in enumerate(text["layer_types"])
+        if kind == "deepseek_sparse_attention"
+    ] == list(range(3, 44, 4))
+    request_context = text["max_position_embeddings"] + 4
     report = {
         "status": "running",
         "modes": [],
@@ -422,6 +432,8 @@ def test_real_gpu_allocations(tmp_path):
         "tokens": 131072,
         "requests": 32,
         "tp": 8,
+        "context_length": text["max_position_embeddings"],
+        "extra_context_rows": 4,
     }
     output = Path(
         os.environ.get("REMNANT_ALLOCATION_REPORT", tmp_path / "allocation.json")
@@ -433,6 +445,7 @@ def test_real_gpu_allocations(tmp_path):
             ):
                 row_bytes = 512 if mode == "native" else 320
                 for size in (0, 1, 255, 256, 257, 131072):
+                    torch.cuda.synchronize()
                     mamba = None
                     request_pool = None
                     if size == 131072:
@@ -449,8 +462,8 @@ def test_real_gpu_allocations(tmp_path):
                         request_pool = HybridReqToTokenPool(
                             size=32,
                             mamba_size=160,
-                            mamba_spec_state_size=0,
-                            max_context_len=131072,
+                            mamba_spec_state_size=32,
+                            max_context_len=request_context,
                             device="cuda",
                             enable_memory_saver=False,
                             cache_params=params,
@@ -463,6 +476,29 @@ def test_real_gpu_allocations(tmp_path):
                     if mamba is not None:
                         owned.update(_gpu_storages(request_pool))
                     measured = sum(owned.values())
+                    # Reconcile actual active CUDA blocks as well as requested
+                    # tensor storages. Allocator reservation remains diagnostic.
+                    wanted = {
+                        address: nbytes
+                        for (_, address), nbytes in owned.items()
+                        if nbytes
+                    }
+                    blocks = {}
+                    for segment in torch.cuda.memory_snapshot():
+                        address = segment["address"]
+                        for block in segment["blocks"]:
+                            block_address = block.get("address", address)
+                            if (
+                                block["state"] == "active_allocated"
+                                and block_address in wanted
+                            ):
+                                assert block["requested_size"] == wanted[block_address]
+                                blocks[block_address] = block["size"]
+                            address += block["size"]
+                    assert (
+                        blocks.keys() == wanted.keys()
+                    ), "Some pool backing blocks were not reconciled"
+                    physical_bytes = sum(blocks.values())
                     workspace = 128 * 2112 * 512 if mode == "adapter" else 0
                     latent = 11 * (size + 256) * row_bytes
                     indexer = 11 * ((size + 257) // 256) * 64 * 132
@@ -472,7 +508,7 @@ def test_real_gpu_allocations(tmp_path):
                         161 * 18452480 + 32 if mamba is not None else 0
                     )  # four one-conv descriptor arrays
                     request_metadata = (
-                        33 * 131072 * 4 + 160 * 8 + 33 * 4 + 33 * 2 * 8
+                        33 * request_context * 4 + 160 * 8 + 33 * 4 + 33 * 2 * 8
                         if request_pool is not None
                         else 0
                     )
@@ -495,6 +531,9 @@ def test_real_gpu_allocations(tmp_path):
                         mode=mode,
                         tokens=size,
                         backing_bytes=measured,
+                        active_block_bytes=physical_bytes,
+                        allocator_padding_bytes=physical_bytes - measured,
+                        allocator_reserved_bytes=torch.cuda.memory_reserved(),
                         latent=latent,
                         indexer=indexer,
                         tails=tails,
@@ -521,7 +560,11 @@ def precompile_sm90():
     )
 
     store, unpack = compile_kernels()
-    artifacts = {"triton": [store.hash, unpack.hash], "tilelang": []}
+    artifacts = {
+        "attention_scale": ATTENTION_SCALE,
+        "triton": [store.hash, unpack.hash],
+        "tilelang": [],
+    }
     for heads in (8, 16, 32, 64):
         for inner in (1, 2, 33, 66):
             for packed in (False, True):
@@ -531,7 +574,7 @@ def precompile_sm90():
                     0,
                     2112,
                     packed=packed,
-                    sm_scale=512**-0.5,
+                    sm_scale=ATTENTION_SCALE,
                     block_I=32,
                     inner_iter=inner,
                     threads=128,
