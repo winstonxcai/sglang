@@ -326,6 +326,11 @@ def test_fp4_direct(packed, heads, page):
     combined = torch.cat(
         (t.indices, torch.where(valid, t.extra + t.swa_values.shape[0], -1)), dim=-1
     )
+    # Stock SM90 sparse prefill consumes two 64-entry tiles per iteration
+    # (phase1.cuh: 2 * B_TOPK). Invalid padding preserves the selected set.
+    combined = torch.nn.functional.pad(
+        combined, (0, -combined.shape[-1] % 128), value=-1
+    )
     adapter = flash_mla_sparse_fwd(
         t.q[:, 0],
         torch.cat((t.swa_values[:, None, :], reconstructed)),
