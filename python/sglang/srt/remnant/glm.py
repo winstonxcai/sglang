@@ -29,7 +29,7 @@ def _store(X, M, L, V, B, SX: tl.constexpr, SM: tl.constexpr, SLOTS):
     loc = tl.load(L + row)
     keep = tl.load(M + row * SM + c)
     rank = tl.cumsum(keep.to(tl.int32)) - 1
-    x = tl.load(X + row * SX + c).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    x = tl.load(X + row * SX + c)
     valid = (loc >= 0) & (loc < SLOTS)
     tl.store(V + loc * 256 + rank, x, valid & keep)
     lanes = tl.arange(0, 64)
@@ -59,7 +59,7 @@ def compile_kernels() -> (
     """CPU-buildable SM90 artifacts; identical AST signatures at build and load.
 
     Explicit target avoids device discovery on CPU builders. Packed currently
-    admits only contiguous BF16 Native norm output, bool masks and int64 write
+    admits only contiguous uint8 Native FP8 codes, bool masks and int64 write
     locations. Read indices are contiguous int32. The Modal preflight records
     these hashes and image cache files before any H100 is requested.
     """
@@ -71,7 +71,7 @@ def compile_kernels() -> (
         ASTSource(
             _store,
             signature={
-                "X": "*bf16",
+                "X": "*u8",
                 "M": "*i1",
                 "L": "*i64",
                 "V": "*u8",
@@ -127,7 +127,9 @@ def normalize_and_store(
         )
     if raw.shape[0]:
         store, _ = compile_kernels()
-        store[(raw.shape[0],)](normalized, keep, loc, values, bitmaps, values.shape[0])
+        # Preserve Native overflow and signed-zero conversion exactly.
+        codes = normalized.to(torch.float8_e4m3fn).view(torch.uint8)
+        store[(raw.shape[0],)](codes, keep, loc, values, bitmaps, values.shape[0])
     return normalized
 
 

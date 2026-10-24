@@ -100,6 +100,18 @@ def test_producer_reconstruction():
         assert torch.equal(cache.bitmaps.view(torch.int64), before_b.view(torch.int64))
 
 
+def test_native_fp8_conversion():
+    with get_context().override_server_args(device="cuda"):
+        raw, norm, cache = fixture()
+        norm.weight.data.fill_(1024)
+        _, values, words, _ = expected(raw[:4], norm)
+        normalize_and_store(
+            raw[:4], norm, torch.arange(4, device="cuda"), cache.values, cache.bitmaps
+        )
+        assert torch.equal(cache.values[:4], values)
+        assert torch.equal(cache.bitmaps[:4].cpu().view(torch.int64), words)
+
+
 def test_invalid_attention():
     with get_context().override_server_args(device="cuda"):
         raw, norm, cache = fixture(implementation="adapter")
