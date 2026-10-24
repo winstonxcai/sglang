@@ -64,6 +64,9 @@ def test_fp4_startup_contract():
     validate_v41_cache_args(SimpleNamespace())
     for mode in ("fp4", "remnant"):
         validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format=mode))
+        validate_v41_cache_args(
+            SimpleNamespace(dsv41_main_kv_cache_format=mode, dsv4_attn_backend="auto")
+        )
         for key, value in [
             ("enable_hierarchical_cache", True),
             ("speculative_algorithm", "DSpark"),
@@ -171,13 +174,17 @@ def _attention_case(packed: bool, heads: int, page: int):
     store_fp4_cache(x_gpu, cache, loc, page, packed=packed)
     swa = _make_swa_cache(2, 128, torch.device("cuda"))
     swa_raw = swa.view(torch.uint8).as_strided((2, swa.stride(0)), (swa.stride(0), 1))
+    # Balance SWA and global contributions so loader faults cannot hide behind
+    # a large SWA output or the relative-tolerance allowance. UE8M0 120 = 2^-7.
+    swa_raw[:, 128 * 576 : 128 * 584].fill_(120)
     swa_values = torch.cat(
         (
             swa_raw[:, : 128 * 576]
             .reshape(2, 128, 576)[:, :, :448]
             .contiguous()
             .view(torch.float8_e4m3fn)
-            .bfloat16(),
+            .bfloat16()
+            * 2.0**-7,
             swa_raw[:, : 128 * 576]
             .reshape(2, 128, 576)[:, :, 448:]
             .contiguous()
@@ -186,7 +193,7 @@ def _attention_case(packed: bool, heads: int, page: int):
         dim=-1,
     ).reshape(-1, 512)
     b = 8
-    q = (torch.randn((b, 1, heads, 512), device="cuda") * 0.02).bfloat16()
+    q = torch.randn((b, 1, heads, 512), device="cuda").bfloat16()
     indices = (
         torch.arange(64, device="cuda", dtype=torch.int32)
         .reshape(1, 1, 64)
@@ -263,7 +270,25 @@ def test_fp4_direct(packed, heads, page):
         extra_topk_length=t.lengths,
         attn_sink=t.sink,
     )
-    for a, e in zip(actual, _attention_reference(t)):
+    expected = _attention_reference(t)
+    original = t.values
+    try:
+        for fault in ("missing-global", "missing-global-tail"):
+            t.values = original.clone()
+            if fault == "missing-global":
+                t.values.zero_()
+            else:
+                t.values[:, 448:].zero_()
+            faulty_output = _attention_reference(t)[0]
+            assert not torch.allclose(
+                expected[0], faulty_output, atol=0.02, rtol=0.02
+            ), (
+                f"Insensitive attention fixture: {fault}, packed={packed}, "
+                f"heads={heads}, page={page}"
+            )
+    finally:
+        t.values = original
+    for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e, atol=0.02, rtol=0.02)
     # Adapter reconstructs the same pruned values, then uses stock BF16 attention.
     from sglang.kernels.ops.attention.dsv4.fp4_cache import read_fp4_cache

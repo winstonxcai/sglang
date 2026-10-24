@@ -320,7 +320,7 @@ def validate_v41_cache_args(args: Any) -> None:
         conflicts.append("speculative_algorithm")
     if getattr(args, "cpu_offload_gb", 0) > 0:
         conflicts.append("cpu_offload_gb")
-    if getattr(args, "dsv4_attn_backend", "flashmla") != "flashmla":
+    if getattr(args, "dsv4_attn_backend", "auto") not in ("auto", "flashmla"):
         conflicts.append("dsv4_attn_backend (requires flashmla)")
     if getattr(args, "dsv4_prefill_backend", "auto") not in ("auto", "flashmla_sparse"):
         conflicts.append("dsv4_prefill_backend (requires BF16 sparse prefill)")

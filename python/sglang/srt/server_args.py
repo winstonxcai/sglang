@@ -249,7 +249,7 @@ class ServerArgs:
 
         cfg = resolving_view(self)
         remnant.configure_from_args(cfg, publish=False)
-        if cfg.dsv41_main_kv_cache_format != "auto":
+        if getattr(cfg, "dsv41_main_kv_cache_format", "auto") != "auto":
             from sglang.srt.runtime_context import get_platform
 
             hf_config = model_config_of(self).hf_config
