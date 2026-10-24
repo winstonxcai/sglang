@@ -30,6 +30,7 @@ SOURCES = (2,8,14,20)
 def _oracle(x: torch.Tensor, packed: bool) -> tuple[torch.Tensor, torch.Tensor]:
     """CPU-only oracle: dense quantization precedes independent stable selection."""
     assert x.device.type == 'cpu' and x.ndim == 3
+    x = x.detach()
     dense = quantize_k_cache_v41_fp4(x)
     p = x.shape[1]
     values = dequantize_k_cache_v41_fp4(dense,p)
@@ -68,6 +69,15 @@ def test_fp4_startup_contract():
                 validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format=mode,**{key:value}))
     with pytest.raises(ValueError):
         validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format='fp8'))
+    import argparse
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.runtime_context import get_context,get_model
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    args = ServerArgs.from_cli_args(parser.parse_args(['--model','dummy','--dsv41-main-kv-cache-format','remnant']))
+    assert args.dsv41_main_kv_cache_format == 'remnant'
+    with get_context().override_server_args(dsv41_main_kv_cache_format='remnant'):
+        assert get_model().dsv41_main_kv_cache_format == 'remnant'
     assert KVLayout.V41_FP4.bytes_per_token == 288
     assert KVLayout.V41_FP4_REMNANT.bytes_per_token == 224
     for p in (128,256):
@@ -242,7 +252,7 @@ def test_fp4_pool_allocations(tmp_path):
                     del pool
     for mode in ('fp4','remnant'):
         with get_context().override_server_args(device='cuda',dsv4_attn_backend='flashmla',page_size=256,
-                max_running_requests=8,dsv41_main_kv_cache_format=mode):
+                max_running_requests=8,chunked_prefill_size=512,dsv41_main_kv_cache_format=mode):
             metadata = SimpleNamespace(qk_nope_head_dim=448,qk_rope_head_dim=64,index_head_dim=128,
                 context_len=131072,compress_ratios=RATIOS,window_size=128,
                 hf_config=SimpleNamespace(kv_source_layer_ids=SOURCES))
@@ -252,12 +262,17 @@ def test_fp4_pool_allocations(tmp_path):
             record_bytes = 288 if mode == 'fp4' else 224
             assert sizing._compressed_bytes_per_full_token(1) == record_bytes+68
             assert sizing._compressed_bytes_per_full_token(2) == (record_bytes+68)/2
-            pool = DeepSeekV4TokenToKVPool(max_num_reqs=8,swa_size=1024,c4_size=0,c128_size=0,
-                c4_state_pool_size=0,c128_state_pool_size=0,page_size=256,swa_page_size=128,
+            workspace_bytes = 1024*512*2
+            byte_budget = 1 << 30
+            sizes = sizing.calculate_pool_sizes(byte_budget-workspace_bytes,256)
+            full = sizes.full_max_total_num_tokens
+            assert sizing.swa_cap_tokens is not None
+            pool = DeepSeekV4TokenToKVPool(max_num_reqs=8,swa_size=sizes.swa_max_total_num_tokens,c4_size=0,c128_size=0,
+                c4_state_pool_size=0,c128_state_pool_size=0,page_size=256,swa_page_size=256,
                 dtype=torch.float8_e4m3fn,c4_state_dtype=torch.float32,c128_state_dtype=torch.float32,
                 qk_nope_head_dim=448,qk_rope_head_dim=64,indexer_head_dim=128,layer_num=40,
                 device='cuda',enable_memory_saver=False,compression_ratios=RATIOS,
-                kv_source_layers=SOURCES,full_size=4096,kv_layout=KVLayout.V4,
+                kv_source_layers=SOURCES,full_size=full,kv_layout=KVLayout.V4,
                 compressed_kv_layout='sm90_fp4' if mode == 'fp4' else 'sm90_remnant')
             assert pool.kv_pools[2].layer_num == 3 and pool.kv_pools[1].layer_num == 1
             assert pool.get_extra_key_page_size(2) == 128 and pool.get_extra_key_page_size(20) == 256
@@ -265,17 +280,27 @@ def test_fp4_pool_allocations(tmp_path):
             groups = {name:sum(_gpu_storages(obj).values()) for name,obj in dict(
                 swa=pool.swa_kv_pool,global_kv=pool.kv_pools,indexer=pool.index_pools,
                 compressor_state=pool.compress_state_pools).items()}
-            expected_global = (math.ceil((4096/2+256)/128)*128*3 + math.ceil((4096+256)/256)*256)*record_bytes
+            expected_global = (math.ceil((full/2+256)/128)*128*3 + math.ceil((full+256)/256)*256)*record_bytes
             assert groups['global_kv'] == expected_global
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
+            ip = DSV41_INDEX_PAGE_SIZE
+            expected_index = (math.ceil(((full+256)//2+ip)/ip)*ip*3 + math.ceil((full+256+ip)/ip)*ip)*68
+            assert groups['indexer'] == expected_index
             # Explicit prefill workspace is identical in both configurations.
             workspace = torch.empty((1024,1,512),device='cuda',dtype=torch.bfloat16)
+            total_bytes = sum(groups.values())+workspace.nbytes
+            assert total_bytes <= byte_budget
+            assert total_bytes + 256*sizing.bytes_per_full_token > byte_budget
             report['modes'].append(dict(mode='Native' if mode == 'fp4' else 'Packed',
-                groups=groups,prefill_workspace_bytes=workspace.nbytes,total_bytes=sum(groups.values())+workspace.nbytes))
+                groups=groups,prefill_workspace_bytes=workspace.nbytes,total_bytes=total_bytes,
+                byte_budget=byte_budget,full_tokens=full,swa_tokens=sizes.swa_max_total_num_tokens,
+                reserved_page_bytes=sizing._get_v41_reserved_page_bytes()))
             del pool,workspace
             gc.collect()
     a,b = report['modes']
-    for group in ('swa','indexer','compressor_state'):
+    for group in ('swa','compressor_state'):
         assert a['groups'][group] == b['groups'][group]
+    report['capacity_gain_percent'] = (b['full_tokens']/a['full_tokens']-1)*100
     report['status']='passed'
     Path(os.environ.get('REMNANT_ALLOCATION_REPORT',str(tmp_path/'allocation.json'))).write_text(json.dumps(report,indent=2)+'\n')
 

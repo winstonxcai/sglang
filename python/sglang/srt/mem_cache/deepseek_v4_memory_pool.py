@@ -150,8 +150,13 @@ def resolve_compressed_kv_layout(
     The ratio-1/2 latents are already e2m1 with per-16 e4m3 scales, so ``V41_FP4``
     is lossless for them; ratios 4 / 128 are not fp4-rounded and stay fp8."""
     if option in ("sm90_fp4", "sm90_remnant"):
-        if kv_layout is not KVLayout.V4 or compress_ratio not in (1, 2):
-            raise ValueError("SM90 FP4 requires V4 SWA and ratio-1/2 global caches")
+        if kv_layout is not KVLayout.V4:
+            raise ValueError("SM90 FP4 requires V4 SWA")
+        # Empty C4/C128 placeholder pools are still constructed by V4.1.
+        if compress_ratio in (4, 128):
+            return KVLayout.V4
+        if compress_ratio not in (1, 2):
+            raise ValueError("SM90 FP4 global caches require ratio 1 or 2")
         return KVLayout.V41_FP4_REMNANT if option == "sm90_remnant" else KVLayout.V41_FP4
     if option is not None:
         option = option.lower()
