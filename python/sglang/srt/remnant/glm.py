@@ -129,7 +129,7 @@ def normalize_and_store(
         store, _ = compile_kernels()
         # Preserve Native overflow and signed-zero conversion exactly.
         codes = normalized.to(torch.float8_e4m3fn).view(torch.uint8)
-        store[(raw.shape[0],)](codes, keep, loc, values, bitmaps, values.shape[0])
+        store[(raw.shape[0], 1, 1)](codes, keep, loc, values, bitmaps, values.shape[0])
     return normalized
 
 
@@ -139,7 +139,7 @@ def reconstruct(
     """Fill caller-owned contiguous uint8 rows; handles duplicate/invalid indices."""
     if indices.numel():
         _, unpack = compile_kernels()
-        unpack[(indices.numel(),)](
+        unpack[(indices.numel(), 1, 1)](
             cache.values, cache.bitmaps, indices, output, cache.values.shape[0]
         )
     return output.view(torch.float8_e4m3fn).reshape(-1, 1, 512)

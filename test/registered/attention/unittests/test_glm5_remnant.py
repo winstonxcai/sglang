@@ -32,6 +32,43 @@ ATTENTION_SCALE = 256**-0.5  # Native scales the original head, before 512-D abs
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="H100 required")
 
 
+@pytest.fixture(autouse=True)
+def model_free_rank_context():
+    from sglang.srt.runtime_context import get_parallel
+
+    with torch.inference_mode(), get_parallel().override(
+        attn_dcp_rank=0, attn_cp_rank=0, attn_tp_rank=0
+    ):
+        yield
+
+
+def test_compiled_launch_contract():
+    from sglang.srt.remnant import glm
+
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            assert len(grid) == 3
+
+            def launch(*args):
+                calls.append((grid, args))
+
+            return launch
+
+    raw = torch.ones(4, 512, dtype=torch.bfloat16)
+    values = torch.zeros(8, 256, dtype=torch.uint8)
+    bitmap = torch.zeros(8, 8, dtype=torch.uint64)
+    indices = torch.arange(4, dtype=torch.int32)
+    output = torch.empty(4, 512, dtype=torch.uint8)
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(glm, "compile_kernels", lambda: (Kernel(), Kernel()))
+        glm.normalize_and_store(raw, lambda x: x, indices.long(), values, bitmap)
+        glm.reconstruct(PackedCache(values, bitmap, None, "direct"), indices, output)
+    assert [grid for grid, _ in calls] == [(4, 1, 1), (4, 1, 1)]
+    assert [len(args) for _, args in calls] == [6, 5]
+
+
 def fixture(rows=513, implementation="direct"):
     torch.manual_seed(20261024)
     raw = torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16)
