@@ -60,13 +60,30 @@ def _oracle(x: torch.Tensor, packed: bool) -> tuple[torch.Tensor, torch.Tensor]:
     return out, values
 
 
-def test_fp4_startup_contract():
+def test_fp4_startup_contract(monkeypatch):
+    from sglang.srt.environ import envs
+
+    for field in (envs.SGLANG_DSV4_KV_LAYOUT, envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT):
+        monkeypatch.delenv(field.name, raising=False)
     validate_v41_cache_args(SimpleNamespace())
     for mode in ("fp4", "remnant"):
         validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format=mode))
         validate_v41_cache_args(
             SimpleNamespace(dsv41_main_kv_cache_format=mode, dsv4_attn_backend="auto")
         )
+        for field in (
+            envs.SGLANG_DSV4_KV_LAYOUT,
+            envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT,
+        ):
+            with field.override("auto"):
+                validate_v41_cache_args(
+                    SimpleNamespace(dsv41_main_kv_cache_format=mode)
+                )
+            with field.override("v4"):
+                with pytest.raises(ValueError, match="legacy SGLANG_DSV4"):
+                    validate_v41_cache_args(
+                        SimpleNamespace(dsv41_main_kv_cache_format=mode)
+                    )
         for key, value in [
             ("enable_hierarchical_cache", True),
             ("speculative_algorithm", "DSpark"),

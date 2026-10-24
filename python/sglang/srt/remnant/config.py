@@ -326,9 +326,14 @@ def validate_v41_cache_args(args: Any) -> None:
         conflicts.append("dsv4_prefill_backend (requires BF16 sparse prefill)")
     from sglang.srt.environ import envs
 
-    if (
-        envs.SGLANG_DSV4_KV_LAYOUT.get().lower() != "auto"
-        or envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower() != "auto"
+    # The upstream default is v4, even when unset. Only explicit legacy
+    # overrides can conflict with the new mode; auto is neutral.
+    if any(
+        field.is_set() and field.get().lower() != "auto"
+        for field in (
+            envs.SGLANG_DSV4_KV_LAYOUT,
+            envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT,
+        )
     ):
         conflicts.append("legacy SGLANG_DSV4_*KV_LAYOUT settings")
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
