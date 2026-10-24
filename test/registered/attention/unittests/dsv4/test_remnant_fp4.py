@@ -252,11 +252,28 @@ def _attention_case(packed: bool, heads: int, page: int):
 
 
 def _attention_reference(t):
+    # Author: Winston Cai. Keep independent FP32 oracle work on CPU so strict
+    # sanitizers instrument production GPU paths rather than reference cuBLAS.
+    # Copies occur outside graph capture on the active stream after replay.
+    t = SimpleNamespace(
+        **{
+            key: getattr(t, key).cpu()
+            for key in (
+                "q",
+                "extra",
+                "lengths",
+                "values",
+                "swa_values",
+                "indices",
+                "sink",
+            )
+        }
+    )
     idx = t.extra.long()
     mask = (
         (idx >= 0)
         & (idx < t.values.shape[0])
-        & (torch.arange(512, device="cuda")[None, None, :] < t.lengths[:, None, None])
+        & (torch.arange(512)[None, None, :] < t.lengths[:, None, None])
     )
     gathered = t.values[idx.clamp(0, t.values.shape[0] - 1)]
     kv = torch.cat((t.swa_values[t.indices.long()], gathered), dim=2).float()
@@ -293,7 +310,7 @@ def test_fp4_direct(packed, heads, page):
     original = t.values
     try:
         for fault in ("missing-global", "missing-global-tail"):
-            t.values = original.clone()
+            t.values = original.cpu().clone()
             if fault == "missing-global":
                 t.values.zero_()
             else:
@@ -308,7 +325,7 @@ def test_fp4_direct(packed, heads, page):
     finally:
         t.values = original
     for a, e in zip(actual, expected):
-        torch.testing.assert_close(a, e, atol=0.02, rtol=0.02)
+        torch.testing.assert_close(a.cpu(), e, atol=0.02, rtol=0.02)
     for use_lengths in (False, True):
         adapter = _fp4_adapter(t, use_lengths=use_lengths)
         torch.testing.assert_close(actual[0][:, 0], adapter, atol=0.02, rtol=0.02)
@@ -393,13 +410,14 @@ def test_fp4_graph_and_stream(packed, heads):
             expected_pages, expected_values = _oracle(
                 torch.cat((torch.zeros_like(t.x.cpu())[None], t.x.cpu()[None])), packed
             )
-            t.values = expected_values.reshape(-1, 512).cuda()
-            for a, e in zip(captured[0], _attention_reference(t)):
-                torch.testing.assert_close(a, e, atol=0.02, rtol=0.02)
+            t.values = expected_values.reshape(-1, 512)
+            expected_attention = _attention_reference(t)
+            for a, e in zip(captured[0], expected_attention):
+                torch.testing.assert_close(a.cpu(), e, atol=0.02, rtol=0.02)
             torch.testing.assert_close(
-                captured[1], _attention_reference(t)[0][:, 0], atol=0.02, rtol=0.02
+                captured[1].cpu(), expected_attention[0][:, 0], atol=0.02, rtol=0.02
             )
-            torch.testing.assert_close(out[:, 0], t.values[128:], rtol=0, atol=0)
+            torch.testing.assert_close(out[:, 0].cpu(), t.values[128:], rtol=0, atol=0)
     torch.cuda.current_stream().wait_stream(stream)
 
 
