@@ -23,6 +23,9 @@ from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
     quantize_k_cache_v41_fp4,
 )
 
+from .test_remnant_flashmla_direct import _make_swa_cache
+from .test_remnant_pool import _gpu_storages
+
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Modal H100")
 RATIOS = [0] * 2 + [2] * 18 + [1] * 20
 SOURCES = (2, 8, 14, 20)
@@ -177,7 +180,6 @@ def test_fp4_store_and_reader(packed, page, pattern):
 
 
 def _attention_case(packed: bool, heads: int, page: int):
-    from test_remnant_flashmla_direct import _make_swa_cache
     from sglang.kernels.ops.attention.dsv4.fp4_cache import store_fp4_cache
 
     torch.manual_seed(37)
@@ -393,7 +395,6 @@ def test_fp4_pool_allocations(tmp_path):
         DeepSeekV4TokenToKVPool,
     )
     from sglang.srt.runtime_context import get_context
-    from test_remnant_pool import _gpu_storages
     from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
