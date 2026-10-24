@@ -3438,7 +3438,7 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-        if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
+        if pool.get_extra_key_layout(layer.layer_id).is_fp4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
             # rounds once, with no fake quantization in between.
             pool.set_extra_key_buffer_fused(
@@ -3902,7 +3902,15 @@ class DeepseekV4AttnBackend(
                 )
                 extra_indices = extra_indices.unsqueeze(1)
 
-            if get_platform().is_sm120:
+            if compress_ratio in (1, 2) and token_to_kv_pool.get_extra_key_layout(layer_id).is_fp4 and get_platform().is_sm90:
+                from sgl_kernel.flash_mla import flash_mla_with_fp4_kvcache
+                attention_result = flash_mla_with_fp4_kvcache(
+                    q, swa_k_cache, swa_page_indices, extra_k_cache, extra_indices,
+                    packed=token_to_kv_pool.get_extra_key_layout(layer_id) is KVLayout.V41_FP4_REMNANT,
+                    topk_length=swa_topk_lengths, extra_topk_length=extra_topk_lengths,
+                    attn_sink=attn_sink, softmax_scale=self.softmax_scale)
+                o = attention_result[0]
+            elif get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,

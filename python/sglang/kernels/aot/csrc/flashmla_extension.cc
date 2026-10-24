@@ -176,7 +176,26 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       static_cast<float>(sm_scale));
 }
 
+// Author: Winston Cai. Separate opt-in FP4 Direct op.
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_fp4_interface(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const std::optional<at::Tensor>&, const std::optional<at::Tensor>&,
+    const at::Tensor&, const at::Tensor&, const std::optional<at::Tensor>&,
+    bool, float);
+
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_fp4_sparse_decode_fwd(
+    const at::Tensor& q, const at::Tensor& kv, const at::Tensor& indices,
+    const std::optional<at::Tensor>& lengths, const std::optional<at::Tensor>& sink,
+    const at::Tensor& extra, const at::Tensor& extra_indices,
+    const std::optional<at::Tensor>& extra_lengths, bool packed, double scale) {
+  return sparse_attn_decode_fp4_interface(q, kv, indices, lengths, sink,
+      extra, extra_indices, extra_lengths, packed, static_cast<float>(scale));
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("fp4_sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, Tensor extra_kv, Tensor extra_indices, Tensor? extra_topk_length, bool packed, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("fp4_sparse_decode_fwd", torch::kCUDA, &sgl_fp4_sparse_decode_fwd);
   /*
    * From FlashMLA
    */

@@ -37,7 +37,7 @@ from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backe
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import get_exec, get_model, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
@@ -149,6 +149,10 @@ def resolve_compressed_kv_layout(
     """Layout of one compress ratio's cache next to a ``kv_layout`` main cache.
     The ratio-1/2 latents are already e2m1 with per-16 e4m3 scales, so ``V41_FP4``
     is lossless for them; ratios 4 / 128 are not fp4-rounded and stay fp8."""
+    if option in ("sm90_fp4", "sm90_remnant"):
+        if kv_layout is not KVLayout.V4 or compress_ratio not in (1, 2):
+            raise ValueError("SM90 FP4 requires V4 SWA and ratio-1/2 global caches")
+        return KVLayout.V41_FP4_REMNANT if option == "sm90_remnant" else KVLayout.V41_FP4
     if option is not None:
         option = option.lower()
         assert option in (
@@ -173,6 +177,11 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
     AITER attention."""
+    fp4_mode = get_model().dsv41_main_kv_cache_format
+    if fp4_mode != "auto":
+        if not get_platform().is_sm90 or get_exec().kernel.dsv4_attn_backend != "flashmla":
+            raise ValueError("Explicit V4.1 FP4 requires SM90 FlashMLA")
+        return KVLayout.V4, "sm90_remnant" if fp4_mode == "remnant" else "sm90_fp4"
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
@@ -326,6 +335,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         """Quantize ``cache_k`` ``[n, 512]`` bf16 into this pool's layout at ``loc``.
         ``freqs_cis`` (V4.1 only) rotates the RoPE tail in-kernel, so the input is
         the un-rotated latent and the fp4 / fp8 rounding happens once."""
+        if self.kv_layout is KVLayout.V41_FP4_REMNANT or (self.kv_layout is KVLayout.V41_FP4 and get_platform().is_sm90):
+            from sglang.kernels.ops.attention.dsv4.fp4_cache import store_fp4_cache
+            return store_fp4_cache(cache_k, self.kv_buffer[layer_id], loc, self.page_size,
+                packed=self.kv_layout is KVLayout.V41_FP4_REMNANT, freqs_cis=freqs_cis)
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -2329,7 +2342,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert compress_kv_pool is not None
         if freqs_cis is not None:
             assert (
-                compress_kv_pool.kv_layout is KVLayout.V41_FP4
+                compress_kv_pool.kv_layout.is_fp4
             ), "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
