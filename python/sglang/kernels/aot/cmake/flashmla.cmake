@@ -126,6 +126,8 @@ set(FlashMLA_SOURCES
 
     # sm90 sparse prefill.
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/fp4_prefill_k512.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/fp4_prefill_k512_topklen.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu

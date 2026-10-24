@@ -423,6 +423,28 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_fp4_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """BF16 D512 SM90 prefill for explicit FP4 caches, including SWA-only layers.
+
+    Author: Winston Cai. Inputs use the stock sparse prefill tensor contract;
+    separate instantiations allow role-divergent named-barrier participation.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
+    return torch.ops.sgl_kernel.fp4_sparse_prefill_fwd.default(
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )
+
+
 def flash_mla_with_fp4_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,

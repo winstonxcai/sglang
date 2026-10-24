@@ -115,6 +115,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_model,
     get_parallel,
     get_platform,
     get_spec,
@@ -4026,6 +4027,14 @@ class DeepseekV4AttnBackend(
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
+        elif (
+            get_platform().is_sm90 and get_model().dsv41_main_kv_cache_format != "auto"
+        ):
+            # Author: Winston Cai. All explicit-FP4 layers, including C0/SWA,
+            # share the role-divergent prefill synchronization specialization.
+            from sgl_kernel.flash_mla import (
+                flash_mla_fp4_sparse_fwd as flash_mla_sparse_fwd,
+            )
         else:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 

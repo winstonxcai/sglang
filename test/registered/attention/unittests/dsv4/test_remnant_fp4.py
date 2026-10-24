@@ -309,15 +309,21 @@ def test_fp4_direct(packed, heads, page):
         t.values = original
     for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e, atol=0.02, rtol=0.02)
-    # Adapter reconstructs the same pruned values, then uses stock BF16 attention.
+    for use_lengths in (False, True):
+        adapter = _fp4_adapter(t, use_lengths=use_lengths)
+        torch.testing.assert_close(actual[0][:, 0], adapter, atol=0.02, rtol=0.02)
+
+
+def _fp4_adapter(t, *, use_lengths):
+    """Exercise production reconstruction and FP4-only BF16 prefill."""
     from sglang.kernels.ops.attention.dsv4.fp4_cache import read_fp4_cache
-    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+    from sgl_kernel.flash_mla import flash_mla_fp4_sparse_fwd
 
     ids = torch.arange(t.values.shape[0], device="cuda", dtype=torch.int32)
     reconstructed = torch.empty(
         (ids.numel(), 1, 512), device="cuda", dtype=torch.bfloat16
     )
-    read_fp4_cache(t.cache, ids, page, packed=packed, out=reconstructed)
+    read_fp4_cache(t.cache, ids, t.page, packed=t.packed, out=reconstructed)
     valid = (
         (t.extra >= 0)
         & (t.extra < ids.numel())
@@ -326,19 +332,19 @@ def test_fp4_direct(packed, heads, page):
     combined = torch.cat(
         (t.indices, torch.where(valid, t.extra + t.swa_values.shape[0], -1)), dim=-1
     )
-    # Stock SM90 sparse prefill consumes two 64-entry tiles per iteration
+    # SM90 sparse prefill consumes two 64-entry tiles per iteration
     # (phase1.cuh: 2 * B_TOPK). Invalid padding preserves the selected set.
     combined = torch.nn.functional.pad(
         combined, (0, -combined.shape[-1] % 128), value=-1
     )
-    adapter = flash_mla_sparse_fwd(
+    return flash_mla_fp4_sparse_fwd(
         t.q[:, 0],
         torch.cat((t.swa_values[:, None, :], reconstructed)),
         combined,
         512**-0.5,
         attn_sink=t.sink,
+        topk_length=64 + t.lengths if use_lengths else None,
     )[0]
-    torch.testing.assert_close(actual[0][:, 0], adapter, atol=0.02, rtol=0.02)
 
 
 @GPU
@@ -360,7 +366,7 @@ def test_fp4_graph_and_stream(packed, heads):
         def run():
             store_fp4_cache(t.x, t.cache, t.loc, t.page, packed=packed)
             read_fp4_cache(t.cache, t.loc, t.page, packed=packed, out=out)
-            return flash_mla_with_fp4_kvcache(
+            direct = flash_mla_with_fp4_kvcache(
                 t.q,
                 t.swa,
                 t.indices,
@@ -370,6 +376,7 @@ def test_fp4_graph_and_stream(packed, heads):
                 extra_topk_length=t.lengths,
                 attn_sink=t.sink,
             )
+            return direct, _fp4_adapter(t, use_lengths=True)
 
         for _ in range(2):
             run()
@@ -387,8 +394,11 @@ def test_fp4_graph_and_stream(packed, heads):
                 torch.cat((torch.zeros_like(t.x.cpu())[None], t.x.cpu()[None])), packed
             )
             t.values = expected_values.reshape(-1, 512).cuda()
-            for a, e in zip(captured, _attention_reference(t)):
+            for a, e in zip(captured[0], _attention_reference(t)):
                 torch.testing.assert_close(a, e, atol=0.02, rtol=0.02)
+            torch.testing.assert_close(
+                captured[1], _attention_reference(t)[0][:, 0], atol=0.02, rtol=0.02
+            )
             torch.testing.assert_close(out[:, 0], t.values[128:], rtol=0, atol=0)
     torch.cuda.current_stream().wait_stream(stream)
 
@@ -852,3 +862,62 @@ def test_fp4_backend_dispatch():
                 layout is KVLayout.V41_FP4_REMNANT
             )
             assert direct.call_args.args[3].shape[-1] == layout.bytes_per_token
+
+    for mode in ("auto", "fp4", "remnant"):
+        for ratio in (0, 1, 2):
+            q = torch.ones((1, 1, 64, 512), dtype=torch.bfloat16)
+            workspace = torch.zeros((2, 1, 512), dtype=torch.bfloat16)
+            indices = torch.zeros((1, 128), dtype=torch.int32)
+            lengths = torch.ones(1, dtype=torch.int32)
+            cache = SimpleNamespace(
+                swa_token_ids=torch.zeros(1, dtype=torch.int32),
+                swa_page_size=128,
+                c0_combined_indices=indices,
+                c0_combined_lens=lengths,
+                layer_inputs=lambda *a: (
+                    torch.zeros(1, dtype=torch.int32),
+                    indices,
+                    lengths,
+                ),
+            )
+            backend = SimpleNamespace(
+                forward_metadata=SimpleNamespace(sparse_prefill_cache=cache),
+                sparse_prefill_workspace=SimpleNamespace(get=lambda n: workspace[:n]),
+                softmax_scale=512**-0.5,
+                head_dim_v=512,
+            )
+            pool = mock.Mock(spec=module.DeepSeekV4TokenToKVPool)
+            pool.get_extra_key_page_size.return_value = 128
+            stock = mock.Mock(return_value=(q[:, 0], None, None))
+            fp4 = mock.Mock(return_value=(q[:, 0], None, None))
+            with (
+                mock.patch.object(
+                    module, "get_platform", return_value=SimpleNamespace(is_sm90=True)
+                ),
+                mock.patch.object(
+                    module,
+                    "get_model",
+                    return_value=SimpleNamespace(dsv41_main_kv_cache_format=mode),
+                ),
+                mock.patch.object(module, "dequantize_k_cache_paged"),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "sgl_kernel.flash_mla": SimpleNamespace(
+                            flash_mla_sparse_fwd=stock, flash_mla_fp4_sparse_fwd=fp4
+                        )
+                    },
+                ),
+            ):
+                module.DeepseekV4AttnBackend._forward_prefill_sparse(
+                    backend,
+                    q,
+                    2,
+                    ratio,
+                    SimpleNamespace(),
+                    pool,
+                    SimpleNamespace(),
+                    torch.zeros(64),
+                )
+            (stock if mode == "auto" else fp4).assert_called_once()
+            (fp4 if mode == "auto" else stock).assert_not_called()
