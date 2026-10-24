@@ -5,6 +5,8 @@ Author: Winston Cai.
 
 from __future__ import annotations
 
+from typing import Any
+
 LATENT_DIM = 512
 KEEP_COUNT = 256
 BITMAP_WORDS = 8
@@ -19,7 +21,7 @@ def enabled() -> bool:
     return get_model().glm5_mla_cache_format == "remnant"
 
 
-def validate(args, hf_config) -> None:
+def validate(args: Any, hf_config: Any) -> None:
     if args.glm5_mla_cache_format == "native":
         return
     text = getattr(hf_config, "text_config", hf_config)

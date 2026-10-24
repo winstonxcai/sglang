@@ -20,7 +20,7 @@ from .glm_config import MAX_QUERY_CHUNK, SELECTION_COLUMNS
 class GLMPackedTokenToKVPool(DSATokenToKVPool):
     glm_packed = True
 
-    def _create_buffers(self):
+    def _create_buffers(self) -> None:
         if (self.dtype, self.kv_lora_rank, self.qk_rope_head_dim) != (
             torch.float8_e4m3fn,
             512,
@@ -65,7 +65,7 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
                     else None
                 )
 
-    def get_glm_packed_buffer(self, layer_id):
+    def get_glm_packed_buffer(self, layer_id: int) -> PackedCache:
         i = layer_id - self.start_layer
         return PackedCache(
             self.kv_buffer[i],
@@ -74,7 +74,13 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
             self.implementation,
         )
 
-    def normalize_and_store_glm(self, layer_id, raw, norm, loc):
+    def normalize_and_store_glm(
+        self,
+        layer_id: int,
+        raw: torch.Tensor,
+        norm: torch.nn.Module,
+        loc: torch.Tensor,
+    ) -> torch.Tensor:
         cache = self.get_glm_packed_buffer(layer_id)
         # Native reserves slot zero for padded tokens. Several padded rows may
         # share it; suppress their writes rather than racing on bitmap words.
@@ -93,10 +99,10 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
 
     set_kv_buffer = set_mla_kv_buffer
 
-    def get_kv_size_bytes(self):
+    def get_kv_size_bytes(self) -> int:
         return super().get_kv_size_bytes() + sum(x.nbytes for x in self.bitmap_buffer)
 
-    def move_kv_cache(self, tgt_loc, src_loc):
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         # Copy complete logical pages: pooled indexer entries belong to pages,
         # whereas the two latent planes are indexed by physical token slots.
         if tgt_loc.numel() % self.page_size or src_loc.numel() != tgt_loc.numel():
@@ -143,7 +149,7 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
     def get_contiguous_buf_infos(self):
         raise ValueError("GLM Packed disaggregation is not qualified")
 
-    def _clear_buffers(self):
+    def _clear_buffers(self) -> None:
         super()._clear_buffers()
         del self.bitmap_buffer
         self.adapter_workspace = None

@@ -31,6 +31,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="H100 requ
 
 
 def fixture(rows=513, implementation="direct"):
+    torch.manual_seed(20261024)
     raw = torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16)
     raw[0] = 0
     raw[1] = 1  # exact cutoff ties; preserve the original producer mask
@@ -141,6 +142,59 @@ def selection(batch, tails):
             510, 510 + tails, device="cuda", dtype=torch.int32
         )
     return indices
+
+
+def test_partial_outputs():
+    from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+        sparse_mla_fwd_decode_partial_fp8,
+    )
+
+    with get_context().override_server_args(device="cuda"):
+        raw, norm, cache = fixture()
+        normalize_and_store(
+            raw,
+            norm,
+            torch.arange(len(raw), device="cuda"),
+            cache.values,
+            cache.bitmaps,
+        )
+        mask = topmag_keep_mask(raw, 0.5)
+        dense = (
+            norm(raw.masked_fill(~mask, 0)).to(torch.float8_e4m3fn).view(torch.uint8)
+        )
+        dense.masked_fill_(~mask, 0)
+        native = dense.view(torch.float8_e4m3fn).unsqueeze(0).unsqueeze(2)
+        packed = cache.values.view(torch.float8_e4m3fn).unsqueeze(0).unsqueeze(2)
+        dummy = dense.view(torch.uint64).reshape(-1)[:1].reshape(1, 1)
+        for heads in (8, 64):
+            for batch, inner in ((1, 1), (8, 2), (128, 33)):
+                q = (
+                    torch.randn(batch, heads, 512, device="cuda")
+                    .to(torch.float8_e4m3fn)
+                    .unsqueeze(0)
+                )
+                indices = selection(batch, 3).unsqueeze(0)
+                outputs = []
+                for mode, kv, bitmap in (
+                    (False, native, dummy),
+                    (True, packed, cache.bitmaps),
+                ):
+                    kernel = sparse_mla_fwd_decode_partial_fp8(
+                        heads,
+                        512,
+                        0,
+                        2112,
+                        packed=mode,
+                        sm_scale=512**-0.5,
+                        block_I=32,
+                        inner_iter=inner,
+                        threads=128,
+                    )
+                    outputs.append(kernel(q, kv, bitmap, indices))
+                for actual, reference in zip(outputs[1], outputs[0]):
+                    torch.testing.assert_close(actual, reference, atol=0.02, rtol=0.02)
+                inactive = outputs[0][1] == -(2**30)
+                assert torch.equal(outputs[1][1][inactive], outputs[0][1][inactive])
 
 
 def test_adapter_chunk_boundary():

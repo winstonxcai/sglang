@@ -53,7 +53,9 @@ def _reconstruct(V, B, I, O, SLOTS):
 
 
 @cache
-def compile_kernels():
+def compile_kernels() -> (
+    tuple[triton.compiler.CompiledKernel, triton.compiler.CompiledKernel]
+):
     """CPU-buildable SM90 artifacts; identical AST signatures at build and load.
 
     Explicit target avoids device discovery on CPU builders. Packed currently
@@ -104,7 +106,13 @@ class PackedCache:
     implementation: str
 
 
-def normalize_and_store(raw, norm, loc, values, bitmaps):
+def normalize_and_store(
+    raw: torch.Tensor,
+    norm: torch.nn.Module,
+    loc: torch.Tensor,
+    values: torch.Tensor,
+    bitmaps: torch.Tensor,
+) -> torch.Tensor:
     """Compose original Native norm/conversion with one raw-latent selection."""
     raw = raw.reshape(-1, 512)
     keep = topmag_keep_mask(raw, 0.5)
@@ -123,7 +131,9 @@ def normalize_and_store(raw, norm, loc, values, bitmaps):
     return normalized
 
 
-def reconstruct(cache: PackedCache, indices: torch.Tensor, output: torch.Tensor):
+def reconstruct(
+    cache: PackedCache, indices: torch.Tensor, output: torch.Tensor
+) -> torch.Tensor:
     """Fill caller-owned contiguous uint8 rows; handles duplicate/invalid indices."""
     if indices.numel():
         _, unpack = compile_kernels()
@@ -133,7 +143,9 @@ def reconstruct(cache: PackedCache, indices: torch.Tensor, output: torch.Tensor)
     return output.view(torch.float8_e4m3fn).reshape(-1, 1, 512)
 
 
-def attention(q, cache: PackedCache, indices, sm_scale):
+def attention(
+    q: torch.Tensor, cache: PackedCache, indices: torch.Tensor, sm_scale: float
+) -> torch.Tensor:
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
     if indices.shape[-1] != SELECTION_COLUMNS:
