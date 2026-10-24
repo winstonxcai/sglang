@@ -101,4 +101,8 @@ class KVLayout(str, enum.Enum):
 def is_valid_kv_layout_pair(kv: KVLayout, extra_kv: KVLayout) -> bool:
     """The (main, extra) cache pairs the decode kernel accepts: identical layouts,
     or the fp4 extra cache next to a V4.1 fp8 main cache."""
-    return extra_kv is kv or (kv is KVLayout.V41 and extra_kv is KVLayout.V41_FP4) or (kv is KVLayout.V4 and extra_kv.is_fp4)
+    return (
+        extra_kv is kv
+        or (kv is KVLayout.V41 and extra_kv is KVLayout.V41_FP4)
+        or (kv is KVLayout.V4 and extra_kv.is_fp4)
+    )

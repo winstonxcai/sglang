@@ -55,8 +55,13 @@ class Model(msgspec.Struct):
     ]
     dsv41_main_kv_cache_format: A[
         str,
-        Arg(help="Experimental H100 V4.1 global KV storage: auto keeps upstream; fp4 is Native E2M1; remnant retains 256 FP4 coordinates.",
-            choices=["auto", "fp4", "remnant"]),
+        Arg(
+            help=(
+                "Experimental H100 V4.1 global KV storage: auto keeps upstream; "
+                "fp4 is Native E2M1; remnant retains 256 FP4 coordinates."
+            ),
+            choices=["auto", "fp4", "remnant"],
+        ),
     ] = "auto"
     dsv4_c4_cache_format: A[
         str,

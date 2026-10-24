@@ -157,7 +157,9 @@ def resolve_compressed_kv_layout(
             return KVLayout.V4
         if compress_ratio not in (1, 2):
             raise ValueError("SM90 FP4 global caches require ratio 1 or 2")
-        return KVLayout.V41_FP4_REMNANT if option == "sm90_remnant" else KVLayout.V41_FP4
+        return (
+            KVLayout.V41_FP4_REMNANT if option == "sm90_remnant" else KVLayout.V41_FP4
+        )
     if option is not None:
         option = option.lower()
         assert option in (
@@ -184,7 +186,10 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     fp4_mode = get_model().dsv41_main_kv_cache_format
     if fp4_mode != "auto":
-        if not get_platform().is_sm90 or get_exec().kernel.dsv4_attn_backend != "flashmla":
+        if (
+            not get_platform().is_sm90
+            or get_exec().kernel.dsv4_attn_backend != "flashmla"
+        ):
             raise ValueError("Explicit V4.1 FP4 requires SM90 FlashMLA")
         return KVLayout.V4, "sm90_remnant" if fp4_mode == "remnant" else "sm90_fp4"
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
@@ -340,10 +345,19 @@ class DeepSeekV4SingleKVPool(KVCache):
         """Quantize ``cache_k`` ``[n, 512]`` bf16 into this pool's layout at ``loc``.
         ``freqs_cis`` (V4.1 only) rotates the RoPE tail in-kernel, so the input is
         the un-rotated latent and the fp4 / fp8 rounding happens once."""
-        if self.kv_layout is KVLayout.V41_FP4_REMNANT or (self.kv_layout is KVLayout.V41_FP4 and get_platform().is_sm90):
+        if self.kv_layout is KVLayout.V41_FP4_REMNANT or (
+            self.kv_layout is KVLayout.V41_FP4 and get_platform().is_sm90
+        ):
             from sglang.kernels.ops.attention.dsv4.fp4_cache import store_fp4_cache
-            return store_fp4_cache(cache_k, self.kv_buffer[layer_id], loc, self.page_size,
-                packed=self.kv_layout is KVLayout.V41_FP4_REMNANT, freqs_cis=freqs_cis)
+
+            return store_fp4_cache(
+                cache_k,
+                self.kv_buffer[layer_id],
+                loc,
+                self.page_size,
+                packed=self.kv_layout is KVLayout.V41_FP4_REMNANT,
+                freqs_cis=freqs_cis,
+            )
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -2346,9 +2360,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert (
-                compress_kv_pool.kv_layout.is_fp4
-            ), "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
+            assert compress_kv_pool.kv_layout.is_fp4, (
+                "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
+            )
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
         )

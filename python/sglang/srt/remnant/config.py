@@ -295,16 +295,23 @@ def validate_v41_cache_args(args: Any) -> None:
     if mode == "auto":
         return
     conflicts = []
-    for name, default in (("dsv4_c4_cache_format", "native"),
-                          ("dsv4_c4_cache_keep_count", 256),
-                          ("dsv4_c4_cache_layer_keep_counts", None),
-                          ("dsv4_c4_cache_implementation", "kernel"),
-                          ("dsv4_c4_cache_store_implementation", None)):
+    for name, default in (
+        ("dsv4_c4_cache_format", "native"),
+        ("dsv4_c4_cache_keep_count", 256),
+        ("dsv4_c4_cache_layer_keep_counts", None),
+        ("dsv4_c4_cache_implementation", "kernel"),
+        ("dsv4_c4_cache_store_implementation", None),
+    ):
         if getattr(args, name, default) != default:
             conflicts.append(name)
-    for name in ("enable_hierarchical_cache", "enable_hisparse", "enable_prefill_cp",
-                 "enable_encoder_swa_bounded_replay", "enable_decoder_swa_bounded_replay",
-                 "disaggregation_decode_enable_offload_kvcache"):
+    for name in (
+        "enable_hierarchical_cache",
+        "enable_hisparse",
+        "enable_prefill_cp",
+        "enable_encoder_swa_bounded_replay",
+        "enable_decoder_swa_bounded_replay",
+        "disaggregation_decode_enable_offload_kvcache",
+    ):
         if getattr(args, name, False):
             conflicts.append(name)
     if getattr(args, "disaggregation_mode", "null") not in (None, "null"):
@@ -318,10 +325,22 @@ def validate_v41_cache_args(args: Any) -> None:
     if getattr(args, "dsv4_prefill_backend", "auto") not in ("auto", "flashmla_sparse"):
         conflicts.append("dsv4_prefill_backend (requires BF16 sparse prefill)")
     from sglang.srt.environ import envs
-    if envs.SGLANG_DSV4_KV_LAYOUT.get().lower() != "auto" or envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower() != "auto":
+
+    if (
+        envs.SGLANG_DSV4_KV_LAYOUT.get().lower() != "auto"
+        or envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower() != "auto"
+    ):
         conflicts.append("legacy SGLANG_DSV4_*KV_LAYOUT settings")
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import is_unified_kv_triton
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+
     if is_unified_kv_triton():
         conflicts.append("unified KV storage")
     if conflicts:
-        raise ValueError("--dsv41-main-kv-cache-format " + mode + " is incompatible with " + ", ".join(conflicts))
+        raise ValueError(
+            "--dsv41-main-kv-cache-format "
+            + mode
+            + " is incompatible with "
+            + ", ".join(conflicts)
+        )

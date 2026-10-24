@@ -1361,7 +1361,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
         compress state is priced per SWA slot (c4) or as fixed bytes (c128, ratio 2)."""
         if ratio in (1, 2):
-            return (self._get_paged_kv_bytes_per_token(ratio) + self.low_ratio_index_bytes) / ratio
+            return (
+                self._get_paged_kv_bytes_per_token(ratio) + self.low_ratio_index_bytes
+            ) / ratio
         if ratio == 4:
             c4_frac = 1 / (4 * self.c4_shrink_factor)
             return (
@@ -1460,8 +1462,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         for ratio in (1, 2):
             layers = self.num_layers(ratio)
             total += layers * self.page_size * self._get_paged_kv_bytes_per_token(ratio)
-            index_rows = ceil_div(self.page_size // ratio + DSV41_INDEX_PAGE_SIZE,
-                                  DSV41_INDEX_PAGE_SIZE) * DSV41_INDEX_PAGE_SIZE
+            index_rows = (
+                ceil_div(
+                    self.page_size // ratio + DSV41_INDEX_PAGE_SIZE,
+                    DSV41_INDEX_PAGE_SIZE,
+                )
+                * DSV41_INDEX_PAGE_SIZE
+            )
             total += layers * index_rows * self.low_ratio_index_bytes
         return int(total)
 
