@@ -523,7 +523,7 @@ def precompile_sm90():
     store, unpack = compile_kernels()
     artifacts = {"triton": [store.hash, unpack.hash], "tilelang": []}
     for heads in (8, 16, 32, 64):
-        for inner in (1, 2, 33):
+        for inner in (1, 2, 33, 66):
             for packed in (False, True):
                 kernel = sparse_mla_fwd_decode_partial_fp8(
                     heads,
@@ -554,6 +554,15 @@ def precompile_sm90():
                 block_I=32,
                 threads=128,
             )
+    artifacts["cache_files"] = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for root in (
+            Path(os.environ["TRITON_CACHE_DIR"]),
+            Path(os.environ["TILELANG_CACHE_DIR"]),
+        )
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
     Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).write_text(
         json.dumps(artifacts, indent=2) + "\n"
     )
