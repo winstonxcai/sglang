@@ -451,6 +451,10 @@ def test_allocator_accounting():
     ):
         for mode, cell in (("native", 5995), ("adapter", 3883), ("direct", 3883)):
             with get_context().override_server_args(
+                device="cuda",
+                tp_size=8,
+                dsa_prefill_backend="tilelang",
+                dsa_decode_backend="tilelang",
                 glm5_mla_cache_format="native" if mode == "native" else "remnant",
                 glm5_mla_cache_implementation=(
                     "adapter" if mode == "adapter" else "direct"
@@ -458,7 +462,7 @@ def test_allocator_accounting():
             ):
                 profile = DefaultPoolConfigurator(kvc)
                 overhead = 128 * 2112 * 512 if mode == "adapter" else 0
-                assert profile._cell_size == cell
+                assert profile._cell_size == cell, (mode, profile._cell_size, cell)
                 assert profile._fixed_overhead_bytes == overhead
                 assert (
                     profile.calculate_pool_sizes(
@@ -519,6 +523,10 @@ def test_real_gpu_allocations(tmp_path):
     ):
         for mode in ("native", "adapter", "direct"):
             with get_context().override_server_args(
+                device="cuda",
+                tp_size=8,
+                dsa_prefill_backend="tilelang",
+                dsa_decode_backend="tilelang",
                 glm5_mla_cache_implementation=mode if mode != "native" else "direct",
                 glm5_mla_cache_format="native" if mode == "native" else "remnant",
             ):
@@ -630,51 +638,68 @@ def test_real_gpu_allocations(tmp_path):
     output.write_text(json.dumps(report, indent=2) + "\n")
 
 
-def precompile_sm90():
-    """Build exact CPU artifacts without allocating a CUDA tensor or context."""
-    from sglang.srt.remnant.glm import compile_kernels
+def _compile_sm90_variant(case: tuple[int, int]) -> list[dict]:
+    """One independent head/split pair, owned by a CPU compiler process."""
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         sparse_mla_fwd_decode_partial_fp8,
         sparse_mla_fwd_decode_combine,
     )
 
+    heads, inner = case
+    variants = []
+    for packed in (False, True):
+        kernel = sparse_mla_fwd_decode_partial_fp8(
+            heads,
+            512,
+            0,
+            2112,
+            packed=packed,
+            sm_scale=ATTENTION_SCALE,
+            block_I=32,
+            inner_iter=inner,
+            threads=128,
+        )
+        variants.append(
+            dict(
+                heads=heads,
+                inner=inner,
+                packed=packed,
+                source_sha256=hashlib.sha256(
+                    kernel.get_kernel_source().encode()
+                ).hexdigest(),
+            )
+        )
+    sparse_mla_fwd_decode_combine(
+        heads, 512, (66 // inner) * 32, head_per_block=4, block_I=32, threads=128
+    )
+    return variants
+
+
+def precompile_sm90():
+    """Build exact CPU artifacts without allocating a CUDA tensor or context."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    from sglang.srt.remnant.glm import compile_kernels
+
     store, unpack = compile_kernels()
     artifacts = {
         "attention_scale": ATTENTION_SCALE,
+        "precompile_workers": 4,
         "triton": [store.hash, unpack.hash],
         "tilelang": [],
     }
-    for heads in (8, 16, 32, 64):
-        for inner in (1, 2, 33, 66):
-            for packed in (False, True):
-                kernel = sparse_mla_fwd_decode_partial_fp8(
-                    heads,
-                    512,
-                    0,
-                    2112,
-                    packed=packed,
-                    sm_scale=ATTENTION_SCALE,
-                    block_I=32,
-                    inner_iter=inner,
-                    threads=128,
-                )
-                artifacts["tilelang"].append(
-                    dict(
-                        heads=heads,
-                        inner=inner,
-                        packed=packed,
-                        source_sha256=hashlib.sha256(
-                            kernel.get_kernel_source().encode()
-                        ).hexdigest(),
-                    )
-                )
-            sparse_mla_fwd_decode_combine(
-                heads,
-                512,
-                (66 // inner) * 32,
-                head_per_block=4,
-                block_I=32,
-                threads=128,
+    cases = [(heads, inner) for heads in (8, 16, 32, 64) for inner in (1, 2, 33, 66)]
+    # Separate processes isolate TVM compiler state; each pair owns its combine
+    # variant. The maintained runner supplies the overall bounded subprocess.
+    with ProcessPoolExecutor(
+        max_workers=4, mp_context=multiprocessing.get_context("spawn")
+    ) as executor:
+        for variants in executor.map(_compile_sm90_variant, cases):
+            artifacts["tilelang"].extend(variants)
+            print(
+                "Compiled GLM variants",
+                [(v["heads"], v["inner"], v["packed"]) for v in variants],
+                flush=True,
             )
     artifacts["cache_files"] = {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()
