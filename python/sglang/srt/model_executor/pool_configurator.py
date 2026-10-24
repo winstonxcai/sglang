@@ -382,6 +382,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
+            # Author: Winston Cai. Indexer accounting below remains unchanged.
+            from sglang.srt.remnant.glm_config import enabled as glm_packed_enabled
+
+            if glm_packed_enabled():
+                cell_size = 320 * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

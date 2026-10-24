@@ -357,4 +357,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
 
+    # Author: Winston Cai. Validate final backend/configuration declarations.
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.remnant.glm_config import validate as validate_glm_packed
+
+    validate_glm_packed(
+        resolving_view(server_args), model_config_of(server_args).hf_config
+    )
     server_args._resolution_finished = True

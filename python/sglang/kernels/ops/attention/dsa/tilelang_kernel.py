@@ -1,3 +1,4 @@
+# Remnant GLM changes. Author: Winston Cai.
 import functools
 from functools import lru_cache
 from typing import Any, Optional, Tuple
@@ -1087,11 +1088,13 @@ def sparse_mla_fwd_decode_partial_fp8(
     d_tail: int,
     topk: int,
     *,
+    packed: bool = False,
     sm_scale=None,
     block_I=64,
     inner_iter=1,
     threads=256,
 ):
+    assert not packed or (d_v == 512 and d_tail == 0)
     assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
     assert topk % block_I == 0, (
         "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -1134,7 +1137,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     num_pages = T.symbolic("num_pages")
 
     q_fp8_shape = [batch, seq_len, num_heads, d_v + d_tail]
-    kv_fp8_shape = [batch, num_pages, kv_group, dim_quant_fp8]
+    kv_fp8_shape = [batch, num_pages, kv_group, 256 if packed else dim_quant_fp8]
     idx_shape = [batch, seq_len, kv_group, topk]
     partial_o_shape = [batch, seq_len, n_groups, num_heads, d_v]
     partial_lse_shape = [batch, seq_len, n_groups, num_heads]
@@ -1142,10 +1145,34 @@ def sparse_mla_fwd_decode_partial_fp8(
     accum_dtype = T.float32
     dtype_bf16 = T.bfloat16
 
+    # Author: Winston Cai. Expand raw codes directly into the existing GEMM tiles.
+    # Coordinate 64*w+lane uses bit 63-lane; compact rank counts preceding bits.
+    @T.macro
+    def load_packed_tile(kv, bitmap, pages, tile, offset):
+        for bi, j in T.Parallel(BI, group_size):
+            page = pages[bi]
+            coord = offset + j
+            word_id = coord // 64
+            lane = coord % 64
+            word = bitmap[page, word_id]
+            rank = T.alloc_var(T.int32)
+            rank = 0
+            for w in T.unroll(8):
+                if w < word_id:
+                    rank += T.call_extern("int32", "__popcll", bitmap[page, w])
+            # Avoid a shift by 64 even when the conditional is vectorized.
+            prefix = T.if_then_else(lane == 0, T.uint64(0), word >> ((64 - lane) % 64))
+            rank += T.call_extern("int32", "__popcll", prefix)
+            if ((word >> (63 - lane)) & T.uint64(1)) != T.uint64(0):
+                tile[bi, j] = kv[0, page, 0, rank]
+            else:
+                tile[bi, j] = 0
+
     @T.prim_func
     def main(
         q_fp8: T.Tensor(q_fp8_shape, fp8_dtype),
         kv_fp8: T.Tensor(kv_fp8_shape, fp8_dtype),
+        bitmap: T.Tensor([num_pages, 8] if packed else [1, 1], T.uint64),
         indices: T.Tensor(idx_shape, T.int32),
         partial_o: T.Tensor(partial_o_shape, dtype_bf16),
         partial_lse: T.Tensor(partial_lse_shape, accum_dtype),
@@ -1222,17 +1249,27 @@ def sparse_mla_fwd_decode_partial_fp8(
 
                 for bi_i in T.Parallel(BI):
                     idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    valid = idx >= 0
+                    valid = (idx >= 0) & (idx < num_pages) if packed else idx >= 0
                     page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
                     mask[bi_i] = valid
 
-                for bi_i, j in T.Parallel(BI, group_size):
-                    page = page_idx_shared[bi_i]
-                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, j]
-                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, group_size + j]
-                    if num_main_tiles == 4:
-                        kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
-                        kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
+                if packed:
+                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile0, 0)
+                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile1, 128)
+                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile2, 256)
+                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile3, 384)
+                else:
+                    for bi_i, j in T.Parallel(BI, group_size):
+                        page = page_idx_shared[bi_i]
+                        kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, j]
+                        kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, group_size + j]
+                        if num_main_tiles == 4:
+                            kv_tile2[bi_i, j] = kv_fp8[
+                                b_i, page, g_i, 2 * group_size + j
+                            ]
+                            kv_tile3[bi_i, j] = kv_fp8[
+                                b_i, page, g_i, 3 * group_size + j
+                            ]
 
                 if has_tail:
                     for bi_i, j in T.Parallel(BI, d_tail):
@@ -1363,6 +1400,8 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    *,
+    packed_bitmap: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1390,6 +1429,7 @@ def tilelang_sparse_fwd(
                 d_v,
                 tail_dim,
                 topk,
+                packed=packed_bitmap is not None,
                 sm_scale=sm_scale,
                 block_I=block_I,
                 inner_iter=inner_iter,
@@ -1412,9 +1452,20 @@ def tilelang_sparse_fwd(
                 inner_iter=inner_iter,
                 threads=threads,
             )
-        partial_o_batched, partial_lse_batched = kernel_partial(
-            q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
-        )
+        if is_fp8_kv:
+            # Native uses an aliased dummy parameter eliminated by specialization.
+            bitmap = (
+                packed_bitmap
+                if packed_bitmap is not None
+                else kv.view(torch.uint64).reshape(-1)[:1].reshape(1, 1)
+            )
+            partial_o_batched, partial_lse_batched = kernel_partial(
+                q.unsqueeze(0), kv.unsqueeze(0), bitmap, indices.unsqueeze(0)
+            )
+        else:
+            partial_o_batched, partial_lse_batched = kernel_partial(
+                q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+            )
         n_groups = ni // inner_iter
         kernel_combine = sparse_mla_fwd_decode_combine(
             num_heads,
