@@ -76,7 +76,10 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
 
     def normalize_and_store_glm(self, layer_id, raw, norm, loc):
         cache = self.get_glm_packed_buffer(layer_id)
-        return normalize_and_store(raw, norm, loc, cache.values, cache.bitmaps)
+        # Native reserves slot zero for padded tokens. Several padded rows may
+        # share it; suppress their writes rather than racing on bitmap words.
+        write_loc = loc.masked_fill(loc == 0, -1)
+        return normalize_and_store(raw, norm, write_loc, cache.values, cache.bitmaps)
 
     def get_key_buffer(self, layer_id):
         raise RuntimeError(

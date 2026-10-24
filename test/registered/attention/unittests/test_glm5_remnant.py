@@ -246,6 +246,11 @@ def test_pool_lifecycle():
             3, raw, norm, torch.arange(len(raw), device="cuda")
         )
         cache = pool.get_glm_packed_buffer(3)
+        pool.normalize_and_store_glm(
+            3, raw[:2], norm, torch.zeros(2, dtype=torch.int64, device="cuda")
+        )
+        assert not bool(cache.values[0].any())
+        assert not bool(cache.bitmaps[0].view(torch.int64).any())
         source = torch.arange(256, 512, device="cuda")
         target = torch.arange(512, 768, device="cuda")
         pool.full_kv_pool.index_key_cache.buffer[0][1].fill_(123)
