@@ -143,6 +143,10 @@ def selection(batch, tails):
     return indices
 
 
+def test_adapter_chunk_boundary():
+    test_attention(8, 129, 3)
+
+
 @pytest.mark.parametrize("heads", [8, 16, 32, 64])
 @pytest.mark.parametrize("batch", [1, 8, 24, 32, 128])
 @pytest.mark.parametrize("tails", [0, 1, 2, 3])

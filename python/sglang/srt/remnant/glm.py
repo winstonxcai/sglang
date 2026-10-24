@@ -165,4 +165,4 @@ def attention(q, cache: PackedCache, indices, sm_scale):
             (selected >= 0) & (selected < cache.values.shape[0]), local, -1
         )
         chunks.append(tilelang_sparse_fwd(q[start:end], kv, local, sm_scale, 512))
-    return torch.cat(chunks, dim=0)
+    return torch.cat(chunks, dim=1)
