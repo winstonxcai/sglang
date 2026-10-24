@@ -229,7 +229,7 @@ def make_pool(size, implementation="native", layers=11, mamba=None):
         kv_cache_dim=512,
         index_kpool=4,
         index_kpool_compress=True,
-        max_running_requests=32,
+        max_running_requests=33,  # req_to_token.shape[0], including its dummy row
         full_kv_pool_class=(
             DSATokenToKVPool if implementation == "native" else GLMPackedTokenToKVPool
         ),
@@ -327,7 +327,7 @@ def test_production_backend_constructor():
             hisparse_coordinator=None,
             is_draft_worker=False,
             kv_cache_dtype=torch.float8_e4m3fn,
-            max_running_requests=32,
+            max_running_requests=33,  # req_to_token.shape[0], including its dummy row
         )
         backend = DeepseekSparseAttnBackend(runner)
         assert backend.num_q_heads == 8
@@ -351,7 +351,7 @@ def test_real_gpu_allocations(tmp_path):
         KimiLinearStateShape,
         Mamba2StateDType,
     )
-    from sglang.srt.mem_cache.memory_pool import MambaPool
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from dsv4.test_remnant_pool import _gpu_storages
 
     source = Path(os.environ["REMNANT_GLM_MODEL_CONFIG"])
@@ -380,6 +380,7 @@ def test_real_gpu_allocations(tmp_path):
                 row_bytes = 512 if mode == "native" else 320
                 for size in (0, 1, 255, 256, 257, 131072):
                     mamba = None
+                    request_pool = None
                     if size == 131072:
                         linear = [i for i in range(45) if i % 4 != 3]
                         params = KimiLinearCacheParams(
@@ -391,28 +392,44 @@ def test_real_gpu_allocations(tmp_path):
                                 conv=torch.bfloat16, temporal=torch.float32
                             ),
                         )
-                        mamba = MambaPool(
-                            size=160,
-                            spec_state_size=0,
+                        request_pool = HybridReqToTokenPool(
+                            size=32,
+                            mamba_size=160,
+                            mamba_spec_state_size=0,
+                            max_context_len=131072,
+                            device="cuda",
+                            enable_memory_saver=False,
                             cache_params=params,
                             mamba_layer_ids=linear,
-                            device="cuda",
+                            enable_mamba_extra_buffer=True,
                         )
+                        mamba = request_pool.mamba_pool
                     pool = make_pool(size, mode, mamba=mamba)
                     owned = _gpu_storages(vars(pool.full_kv_pool))
                     if mamba is not None:
-                        owned.update(_gpu_storages(mamba))
+                        owned.update(_gpu_storages(request_pool))
                     measured = sum(owned.values())
                     workspace = 128 * 2112 * 512 if mode == "adapter" else 0
                     latent = 11 * (size + 256) * row_bytes
                     indexer = 11 * ((size + 257) // 256) * 64 * 132
-                    tails = 11 * 2 * 33 * 4 * 128 * 2
+                    tails = 11 * 2 * 34 * 4 * 128 * 2
                     pointers = 11 * 8
                     kda = (
                         161 * 18452480 + 32 if mamba is not None else 0
                     )  # four one-conv descriptor arrays
+                    request_metadata = (
+                        33 * 131072 * 4 + 160 * 8 + 33 * 4 + 33 * 2 * 8
+                        if request_pool is not None
+                        else 0
+                    )
                     expected_bytes = (
-                        latent + indexer + tails + pointers + workspace + kda
+                        latent
+                        + indexer
+                        + tails
+                        + pointers
+                        + workspace
+                        + kda
+                        + request_metadata
                     )
                     assert measured == expected_bytes, (
                         mode,
@@ -430,10 +447,11 @@ def test_real_gpu_allocations(tmp_path):
                         kda=kda,
                         workspace=workspace,
                         pointers=pointers,
+                        request_metadata=request_metadata,
                     )
                     report["modes" if size == 131072 else "edges"].append(entry)
                     output.write_text(json.dumps(report, indent=2) + "\n")
-                    del pool, mamba
+                    del pool, mamba, request_pool
                     gc.collect()
                     torch.cuda.empty_cache()
     report["status"] = "passed"

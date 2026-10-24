@@ -253,6 +253,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
         self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        # Author: Winston Cai. Adapter scratch is shared by all MLA layers,
+        # so charge it once before token sizing rather than per cache row.
+        from sglang.srt.remnant.glm_config import enabled as glm_packed_enabled
+        if glm_packed_enabled() and num_layers and get_model().glm5_mla_cache_implementation == "adapter":
+            from sglang.srt.remnant.glm_config import MAX_QUERY_CHUNK, SELECTION_COLUMNS
+            self._fixed_overhead_bytes += MAX_QUERY_CHUNK * SELECTION_COLUMNS * 512
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
