@@ -401,6 +401,67 @@ def test_production_backend_constructor():
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
+def test_allocator_accounting():
+    from types import SimpleNamespace
+    from sglang.srt.configs.glm5_next import Glm5NextConfig
+    from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    hf = Glm5NextConfig(
+        **json.loads(Path(os.environ["REMNANT_GLM_MODEL_CONFIG"]).read_text())
+    )
+    model = SimpleNamespace(
+        hf_config=hf,
+        is_draft_model=False,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        context_len=1048576,
+    )
+    kvc = SimpleNamespace(
+        model_config=model,
+        kv_cache_dtype_str="fp8_e4m3",
+        kv_cache_dtype=torch.float8_e4m3fn,
+        use_mla_backend=True,
+        layer_info=SimpleNamespace(
+            start_layer=0, end_layer=45, num_effective_layers=45
+        ),
+        server_args=SimpleNamespace(enable_hisparse=False),
+        is_draft_worker=False,
+        mambaish_config=hf.get_text_config(),
+        pp_size=1,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+    )
+    with get_context().override_server_args(
+        device="cuda",
+        tp_size=8,
+        dsa_prefill_backend="tilelang",
+        dsa_decode_backend="tilelang",
+    ):
+        for mode, cell in (("native", 5995), ("adapter", 3883), ("direct", 3883)):
+            with get_context().override_server_args(
+                glm5_mla_cache_format="native" if mode == "native" else "remnant",
+                glm5_mla_cache_implementation=(
+                    "adapter" if mode == "adapter" else "direct"
+                ),
+            ):
+                profile = DefaultPoolConfigurator(kvc)
+                overhead = 128 * 2112 * 512 if mode == "adapter" else 0
+                assert profile._cell_size == cell
+                assert profile._fixed_overhead_bytes == overhead
+                assert (
+                    profile.calculate_pool_sizes(
+                        overhead + cell * 131072, 256
+                    ).max_total_num_tokens
+                    == 131072
+                )
+                assert (
+                    profile.calculate_pool_sizes(
+                        overhead + cell * 131072 - 1, 256
+                    ).max_total_num_tokens
+                    == 131072 - 256
+                )
+
+
 def test_real_gpu_allocations(tmp_path):
     from sglang.srt.configs.mamba_utils import (
         KimiLinearCacheParams,
@@ -438,10 +499,16 @@ def test_real_gpu_allocations(tmp_path):
     output = Path(
         os.environ.get("REMNANT_ALLOCATION_REPORT", tmp_path / "allocation.json")
     )
-    with get_context().override_server_args(device="cuda"):
+    with get_context().override_server_args(
+        device="cuda",
+        tp_size=8,
+        dsa_prefill_backend="tilelang",
+        dsa_decode_backend="tilelang",
+    ):
         for mode in ("native", "adapter", "direct"):
             with get_context().override_server_args(
-                glm5_mla_cache_implementation=mode if mode != "native" else "direct"
+                glm5_mla_cache_implementation=mode if mode != "native" else "direct",
+                glm5_mla_cache_format="native" if mode == "native" else "remnant",
             ):
                 row_bytes = 512 if mode == "native" else 320
                 for size in (0, 1, 255, 256, 257, 131072):

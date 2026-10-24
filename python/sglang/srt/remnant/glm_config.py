@@ -64,6 +64,7 @@ def validate(args: Any, hf_config: Any) -> None:
         )
     for name in (
         "enable_two_batch_overlap",
+        "enable_kv_cache_sharding",
         "enable_hisparse",
         "enable_hierarchical_cache",
         "enable_unified_memory",
