@@ -435,7 +435,7 @@ class Fixture:
                 output = self.call(mode, i % self.banks)
                 del output
             torch.cuda.synchronize()
-            before = torch.cuda.memory_allocated()
+            before = torch.cuda.memory_reserved()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 for bank in range(self.banks):
@@ -445,7 +445,7 @@ class Fixture:
             self.graphs[mode], self.outputs[mode] = graph, output
             graph.replay()
             torch.cuda.synchronize()
-            graph_bytes = torch.cuda.memory_allocated() - before
+            graph_bytes = torch.cuda.memory_reserved() - before
             # Constant per-call bound, independent of bank count; includes all
             # split partials, Q conversion, and allocator padding.
             bound = (
@@ -459,7 +459,7 @@ class Fixture:
             )
             if (
                 graph_bytes > bound
-                or torch.cuda.memory_allocated() >= self.memory_limit
+                or torch.cuda.memory_reserved() >= self.memory_limit
             ):
                 raise RuntimeError(
                     f"{self.case.name}/{mode}: graph allocation {graph_bytes} exceeds bounded liveness {bound} or fixture memory cap"
