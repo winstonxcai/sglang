@@ -205,7 +205,7 @@ def packed_reference(raw, norm):
     return keep, codes[keep].reshape(-1, KEEP), words, dense
 
 
-def attention_reference(q, dense, indices):
+def attention_reference(q, dense, indices, *, device=None):
     """Independent FP32 attention on selected queries, with Native FP8 Q rounding.
 
     Mirrors the Native primitive's FP8 probabilities before PV, BF16 partials
@@ -214,7 +214,13 @@ def attention_reference(q, dense, indices):
     """
     import torch
 
+    output_device = q.device
     rows = dense.view(torch.float8_e4m3fn).reshape(-1, DIM)
+    if device is not None:
+        # Focused sanitizers instrument production CUDA, not the independent
+        # oracle's cuBLAS kernels. Math and FP8 Q rounding remain identical.
+        q, indices = q.to(device), indices.to(device)
+        rows = rows.to(device=device, dtype=torch.float32)
     out = []
     for query, selected in zip(q, indices):
         valid = selected >= 0
@@ -224,7 +230,7 @@ def attention_reference(q, dense, indices):
             continue
         score = query.to(torch.float8_e4m3fn).float() @ kv.T * SCALE
         out.append((score.softmax(-1) @ kv).to(torch.bfloat16))
-    return torch.stack(out).unsqueeze(0)
+    return torch.stack(out).unsqueeze(0).to(output_device)
 
 
 def _hash_tensor(digest, tensor) -> None:
@@ -414,7 +420,7 @@ class Fixture:
             raise ValueError(f"Unsupported GLM path {mode}")
         return attention(self.q, self.packed[bank], self.ids[bank], SCALE)
 
-    def validate(self) -> None:
+    def validate(self, *, reference_device=None) -> None:
         import torch
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
@@ -435,9 +441,11 @@ class Fixture:
             local = torch.full_like(selected, -1)
             local[selected >= 0] = inverse.to(local.dtype)
             native_ref = attention_reference(
-                self.q[sample], self.native[bank], selected
+                self.q[sample], self.native[bank], selected, device=reference_device
             )
-            direct_ref = attention_reference(self.q[sample], dense, local)
+            direct_ref = attention_reference(
+                self.q[sample], dense, local, device=reference_device
+            )
             for mode, reference in (("native", native_ref), ("direct", direct_ref)):
                 output = self.call(mode, bank)
                 if not bool(torch.isfinite(output).all()):

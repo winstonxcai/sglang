@@ -1487,3 +1487,18 @@ def test_glm_resume_requires_identical_valid_ordered_prefix():
 def test_glm_measured_capture_preserves_ten_warmups():
     import inspect
     assert inspect.signature(glm.Fixture.capture).parameters['warmup_calls'].default == 10
+
+
+def test_glm_cpu_oracle_preserves_fp8_rounding_and_empty_rows():
+    import torch
+    q = torch.zeros(2, 1, 512, dtype=torch.bfloat16)
+    q[0, 0, 0] = 1.0625  # midpoint: E4M3 RNE rounds to 1.0
+    rows = torch.zeros(2, 512)
+    rows[:, 0] = torch.tensor([1.0, -1.0])
+    codes = rows.to(torch.float8_e4m3fn).view(torch.uint8)
+    ids = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32)
+    expected = torch.zeros(1, 2, 1, 512, dtype=torch.bfloat16)
+    expected[0, 0, 0, 0] = torch.tanh(torch.tensor(glm.SCALE))
+    actual = glm.attention_reference(q, codes, ids, device='cpu')
+    assert actual.device.type == 'cpu'
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -671,7 +671,7 @@ def test_benchmark_bank_graph_ownership(heads, banks):
     _benchmark_bank_graph(heads, banks, 128 if heads == 8 else 512)
 
 
-def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10):
+def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10, reference_device=None):
     import time
     from sglang.benchmark.remnant.glm_attention import Fixture, Case
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_inner_iter
@@ -694,19 +694,28 @@ def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10):
         f.native.append(native)
         f.packed.append(PackedCache(values, bitmaps, None, "direct"))
         f.ids.append(selection(queries, bank % 4))
-    f.validate()
+    if reference_device is None:
+        # Unprofiled full-size smoke establishes CPU/GPU oracle parity on actual
+        # probe inputs; focused tools then keep cuBLAS oracle work off the GPU.
+        from sglang.benchmark.remnant.glm_attention import attention_reference
+        sample = min(8, queries)
+        args = (f.q[:sample], f.native[0], f.ids[0][:sample, 0])
+        torch.testing.assert_close(attention_reference(*args),
+                                   attention_reference(*args, device="cpu"),
+                                   atol=0.02, rtol=0.02)
+    f.validate(reference_device=reference_device)
     f.capture(warmup_calls=warmup_calls)
     f.q.normal_()
     for ids in f.ids:
         ids[1] = -1
     f.validate_replay()
-    f.validate()
+    f.validate(reference_device=reference_device)
     assert f.identity['native_graph_bytes'] > 0
     assert f.identity['direct_graph_bytes'] > 0
     return f.identity
 
 
-@pytest.mark.parametrize("heads,banks,queries,inner", [(8, 2, 2, 33), (16, 4, 8, 66)])
+@pytest.mark.parametrize("heads,banks,queries,inner", [(8, 2, 2, 33), (16, 4, 2, 66)])
 def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_property):
     """Instrument identical compiled variants at explicit representative grids.
 
@@ -716,12 +725,12 @@ def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_pro
     """
     target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
     with patch(target, return_value=inner) as dispatch:
-        identity = _benchmark_bank_graph(heads, banks, queries, warmup_calls=1)
+        identity = _benchmark_bank_graph(heads, banks, queries, warmup_calls=1, reference_device="cpu")
         assert identity["inner_iter"] == inner
         assert dispatch.call_count > 1
     record_property("probe_geometry", json.dumps(dict(probe="focused-bank-graph", heads=heads, banks=banks,
                           queries=queries, forced_inner=inner, warmup_calls=1,
-                          actual_warmup_calls_per_mode=banks,
+                          actual_warmup_calls_per_mode=banks, reference_device="cpu",
                           measured_warmup_calls=10)))
 
 

@@ -340,3 +340,12 @@ warmup calls per mode. They retain every bank, independent references, alternati
 and changing-input replay. Full Q128/Q512 numerical/ownership smoke stays intact;
 the probes do not establish sanitizer coverage for those full allocation/grid
 sizes. Measured captures keep the default ten warmups and the full128 matrix.
+
+
+The maintained focused sanitizer probes now use Q2 for both head geometries,
+with inner33/66 and banks2/4 unchanged. Their independent oracle executes the
+same FP8-rounded/FP32 attention formula on CPU and returns BF16 to CUDA. Every
+production CUDA path remains instrumented; no kernel filters apply. Unprofiled
+full-size smoke verifies CPU/GPU oracle parity on actual inputs at unchanged
+0.02 tolerances before these probes, while full-size/timing validation retains
+its GPU oracle. JUnit records reference device and exact representative geometry.
