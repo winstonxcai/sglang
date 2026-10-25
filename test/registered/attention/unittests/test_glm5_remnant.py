@@ -672,14 +672,15 @@ def test_benchmark_bank_graph_ownership(heads, banks):
     from sglang.benchmark.remnant.glm_attention import Fixture, Case
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_inner_iter
 
+    queries = 128 if heads == 8 else 512
     raw, norm, cache = fixture()
     f = Fixture.__new__(Fixture)
-    f.case = Case("decode", heads, 8, 3, "independent", "rotating")
+    f.case = Case("prefill", heads, queries, 3, "independent", "rotating")
     f.deadline = time.monotonic() + 1200
     f.banks, f.memory_limit = banks, int(torch.cuda.get_device_properties(0).total_memory * 0.7)
-    f.q = torch.randn(8, heads, 512, dtype=torch.bfloat16, device="cuda")
+    f.q = torch.randn(queries, heads, 512, dtype=torch.bfloat16, device="cuda")
     f.native, f.packed, f.ids, f.graphs, f.outputs = [], [], [], {}, {}
-    inner = _pick_inner_iter(8, 66, torch.cuda.get_device_properties(0).multi_processor_count, 1)
+    inner = _pick_inner_iter(queries, 66, torch.cuda.get_device_properties(0).multi_processor_count, 1)
     f.identity = {"inner_iter": inner}
     for bank in range(banks):
         changed = raw.roll(bank, 0).contiguous()
@@ -689,7 +690,7 @@ def test_benchmark_bank_graph_ownership(heads, banks):
         native[:len(raw)] = norm(changed).to(torch.float8_e4m3fn).view(torch.uint8)
         f.native.append(native)
         f.packed.append(PackedCache(values, bitmaps, None, "direct"))
-        f.ids.append(selection(8, bank % 4))
+        f.ids.append(selection(queries, bank % 4))
     f.validate()
     f.capture()
     f.q.normal_()
