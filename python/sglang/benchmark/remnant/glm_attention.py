@@ -142,6 +142,24 @@ def rotation_count(selected_rows: int, l2_bytes: int) -> int:
     return (2 * l2_bytes) // (selected_rows * 320) + 1
 
 
+def graph_reserved_bytes(cuda, graph) -> int:
+    """Count graph-pool segments, including inactive storage, exactly once.
+
+    Global reserved-memory deltas are invalid: capture may release unrelated
+    cached segments. The public pool-filtered snapshot isolates graph ownership.
+    """
+    segments = cuda.memory_snapshot(graph.pool())
+    addresses = [segment["address"] for segment in segments]
+    if not segments or len(set(addresses)) != len(addresses):
+        raise RuntimeError(
+            "Graph pool snapshot is empty or contains duplicate segments"
+        )
+    sizes = [segment["total_size"] for segment in segments]
+    if any(size <= 0 for size in sizes):
+        raise RuntimeError("Graph pool snapshot contains a nonpositive segment size")
+    return sum(sizes)
+
+
 def cycles_per_sample(banks: int) -> int:
     if banks < 1:
         raise ValueError("A sample must contain at least one bank")
@@ -435,7 +453,6 @@ class Fixture:
                 output = self.call(mode, i % self.banks)
                 del output
             torch.cuda.synchronize()
-            before = torch.cuda.memory_reserved()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 for bank in range(self.banks):
@@ -445,7 +462,7 @@ class Fixture:
             self.graphs[mode], self.outputs[mode] = graph, output
             graph.replay()
             torch.cuda.synchronize()
-            graph_bytes = torch.cuda.memory_reserved() - before
+            graph_bytes = graph_reserved_bytes(torch.cuda, graph)
             # Constant per-call bound, independent of bank count; includes all
             # split partials, Q conversion, and allocator padding.
             bound = (
@@ -457,10 +474,7 @@ class Fixture:
                 * (66 // self.identity["inner_iter"])
                 + 64 * 1024**2
             )
-            if (
-                graph_bytes > bound
-                or torch.cuda.memory_reserved() >= self.memory_limit
-            ):
+            if graph_bytes > bound or torch.cuda.memory_reserved() >= self.memory_limit:
                 raise RuntimeError(
                     f"{self.case.name}/{mode}: graph allocation {graph_bytes} exceeds bounded liveness {bound} or fixture memory cap"
                 )

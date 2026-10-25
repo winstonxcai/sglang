@@ -1413,3 +1413,27 @@ def test_glm_full_timing_coverage_rejects_sample_and_cache_corruption():
     changed['cases'][0]['paths']['direct']['samples'] = [1.0]*29
     with pytest.raises(RuntimeError, match='rounds'):
         glm.validate_timing(changed)
+
+
+def test_glm_graph_pool_accounting_ignores_global_cache_changes():
+    from types import SimpleNamespace
+
+    pool = (7, 3)
+    graph = SimpleNamespace(pool=lambda: pool)
+    calls = []
+
+    def snapshot(pool_id):
+        calls.append(pool_id)
+        # total_size includes inactive bytes, which also belong to this graph.
+        return [dict(address=4096, total_size=8192, active_size=1024),
+                dict(address=16384, total_size=4096, active_size=0)]
+
+    # No global memory_reserved query is available: its delta can be negative.
+    cuda = SimpleNamespace(memory_snapshot=snapshot)
+    assert glm.graph_reserved_bytes(cuda, graph) == 12288
+    assert calls == [pool]
+    for segments in ([], [dict(address=1, total_size=0)],
+                     [dict(address=1, total_size=2)] * 2):
+        cuda.memory_snapshot = lambda pool_id: segments
+        with pytest.raises(RuntimeError, match="Graph pool snapshot"):
+            glm.graph_reserved_bytes(cuda, graph)
