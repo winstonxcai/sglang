@@ -29,6 +29,7 @@ from sglang.benchmark.remnant.cases import (
     PROTOCOL,
     PREFILL_PROTOCOL,
     DecodeCase,
+    FP4DecodeCase,
     PrefillReadCase,
     StoreCase,
     benchmark_modes,
@@ -280,6 +281,7 @@ class Operation:
     expected_kernels: tuple[str, ...]
     keep_count: int = 256
     label: str | None = None
+    validate_output: Callable | None = None
 
     @property
     def key(self) -> str:
@@ -328,6 +330,152 @@ def check_packed_bytes(left, right, name: str) -> None:
             )
     if differences:
         raise AssertionError(f"{name}: Packed producer bytes differ: {differences}")
+
+
+def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
+    """Paired production FP4 APIs; fixture/reference work is outside timing.
+
+    Author: Winston Cai. CPU oracle independently quantizes and selects; Native
+    is dense FP4, never V4 FP8 or a pruned matched control.
+    """
+    from sglang.kernels.ops.attention.dsv4.fp4_cache import store_fp4_cache
+    from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
+        quantize_k_cache_v41_fp4,
+        dequantize_k_cache_v41_fp4,
+    )
+
+    page, rows = case.global_page_size, case.batch * 512
+    rng = torch.Generator().manual_seed(case_seed(case, seed))
+    # Post-normalization/post-RoPE BF16 producer boundary, shared by both paths.
+    x = torch.randn((rows, 512), generator=rng).bfloat16()
+    dense_bytes = quantize_k_cache_v41_fp4(x.reshape(-1, page, 512))
+    native_values = dequantize_k_cache_v41_fp4(dense_bytes, page).reshape(rows, 512)
+    selected = torch.argsort(native_values.abs(), dim=-1, descending=True, stable=True)[
+        :, :256
+    ]
+    packed_values = torch.zeros_like(native_values).scatter_(
+        1, selected, native_values.gather(1, selected)
+    )
+    q_cpu = torch.randn((case.batch, 1, case.heads, 512), generator=rng).bfloat16()
+    q = q_cpu.cuda()
+    physical_cpu = torch.randperm(rows, generator=rng).reshape(case.batch, 1, 512)
+    physical = (physical_cpu + page).to(device="cuda", dtype=torch.int32)
+    lengths = torch.full((case.batch,), 512, device="cuda", dtype=torch.int32)
+    # Existing production V4 writer is also the unchanged H100 SWA writer.
+    swa_x = torch.randn(
+        (case.batch * case.swa_length, 512),
+        device="cuda",
+        generator=torch.Generator(device="cuda").manual_seed(case_seed(case, seed)),
+    )
+    weight = torch.ones(512, device="cuda", dtype=torch.float32)
+    freqs = frequencies(len(swa_x) * 4 + 1)
+    swa_plan = plan([4] * len(swa_x), list(range(len(swa_x))), "prefill")
+    swa_storage = native_storage(len(swa_x))
+    native_write(
+        swa_x,
+        weight,
+        swa_plan,
+        torch.arange(len(swa_x), device="cuda", dtype=torch.int64),
+        freqs,
+        swa_storage,
+    )
+    swa_values = (
+        decode_native(swa_storage)[: len(swa_x)]
+        .cpu()
+        .reshape(case.batch, case.swa_length, 512)
+    )
+    swa_cache = repage_native(swa_storage, len(swa_x), case.swa_page_size)
+    swa_view = swa_cache.as_strided(
+        (len(swa_cache), case.swa_page_size, 1, 584), (swa_cache.stride(0), 584, 584, 1)
+    )
+    swa_indices = torch.arange(len(swa_x), device="cuda", dtype=torch.int32).reshape(
+        case.batch, 1, case.swa_length
+    )
+    swa_lengths = torch.full_like(lengths, case.swa_length)
+    sink_cpu = torch.linspace(-1, 1, case.heads)
+    sink = sink_cpu.cuda()
+    loc = torch.arange(page, page + rows, device="cuda", dtype=torch.int64)
+    x_gpu = x.cuda()
+    operations = []
+    for mode, values, record_bytes in (
+        ("native", native_values, 288),
+        ("kernel", packed_values, 224),
+    ):
+        packed = mode == "kernel"
+        cache = torch.zeros(
+            (rows // page + 1, page * record_bytes), device="cuda", dtype=torch.uint8
+        )
+        store_fp4_cache(x_gpu, cache, loc, page, packed=packed)
+        cache_view = cache.view(-1, page, 1, record_bytes)
+        gathered = values[physical_cpu.long()]
+        kv = torch.cat((swa_values[:, None], gathered), dim=2).float()
+        scores = torch.einsum("bshd,bskd->bshk", q_cpu.float(), kv) * 512**-0.5
+        lse = scores.logsumexp(-1)
+        probabilities = torch.exp(
+            scores - torch.logaddexp(lse, sink_cpu[None, None, :])[:, :, :, None]
+        )
+        expected = (
+            torch.einsum("bshk,bskd->bshd", probabilities, kv).bfloat16(),
+            lse.transpose(1, 2),
+        )
+
+        def call(cache_view=cache_view, packed=packed):
+            return flash_mla.flash_mla_with_fp4_kvcache(
+                q,
+                swa_view,
+                swa_indices,
+                cache_view,
+                physical,
+                packed=packed,
+                topk_length=swa_lengths,
+                extra_topk_length=lengths,
+                attn_sink=sink,
+            )
+
+        def validate_output(output, expected=expected, mode=mode):
+            for actual, target in zip(output, expected):
+                torch.testing.assert_close(actual.cpu(), target, atol=ATOL, rtol=RTOL,
+                                           msg=f"{case.name}/{mode}")
+
+        def validate(call=call, validate_output=validate_output):
+            validate_output(call())
+
+        operations.append(
+            Operation(
+                mode=mode,
+                call=call,
+                owned=(cache, q, physical, swa_cache, sink, lengths, swa_lengths),
+                validate=validate,
+                expected_kernels=(),
+                keep_count=256,
+                validate_output=validate_output,
+            )
+        )
+    return operations, {
+        "common_inputs_sha256": tensor_hash(
+            {
+                "x": x,
+                "q": q_cpu,
+                "physical": physical_cpu,
+                "swa": swa_values,
+                "sink": sink_cpu,
+            }
+        ),
+        "path_layouts": {
+            "native": {
+                "implementation": "Native FP4 Direct",
+                "record_bytes": 288,
+                "packed_keep_count": 512,
+            },
+            "kernel": {
+                "implementation": "Packed FP4 Direct",
+                "record_bytes": 224,
+                "packed_keep_count": 256,
+            },
+        },
+        "global_page_size": page,
+        "baseline": "unpruned dense Native FP4",
+    }
 
 
 def decode_operations(
@@ -1030,7 +1178,10 @@ def capture(op: Operation, warmup: int) -> tuple[torch.cuda.CUDAGraph, object]:
         output = op.call()
     graph.replay()
     torch.cuda.synchronize()
-    op.validate()
+    if op.validate_output is not None:
+        op.validate_output(output)
+    else:
+        op.validate()
     return graph, output
 
 
@@ -1073,6 +1224,9 @@ def time_case(case, operations: list[Operation], args) -> dict:
             samples[key].append(measure(calls[key], repeats))
     for op in operations:
         op.validate()
+    for _, output, op in retained:
+        if op.validate_output is not None:
+            op.validate_output(output)
     return {
         "execution": "cuda_graph" if graph_mode else "eager",
         "repeats": repeats,
@@ -1188,6 +1342,9 @@ def main() -> None:
     args = parser().parse_args()
     cases = selected_cases(args)
     is_prefill = args.suite == "prefill-read"
+    is_fp4 = args.suite == "v41-fp4-decode"
+    if is_fp4:
+        args.modes = "native,kernel"
     modes = () if is_prefill else benchmark_modes(args.keep_count, args.modes)
     if not is_prefill:
         args.modes = ",".join(modes)
@@ -1253,7 +1410,9 @@ def main() -> None:
     can_write = replay_payload is None
     payload = {
         "schema_version": 2,
-        "protocol": PREFILL_PROTOCOL if is_prefill else PROTOCOL,
+        "protocol": "remnant-v41-fp4-decode-v1"
+        if is_fp4
+        else (PREFILL_PROTOCOL if is_prefill else PROTOCOL),
         "config": vars(args),
         "matrix_sha256": matrix_digest(cases),
         "environment": {
@@ -1281,7 +1440,11 @@ def main() -> None:
                     prefill_read_operations
                     if isinstance(case, PrefillReadCase)
                     else (
-                        decode_operations
+                        (
+                            fp4_decode_operations
+                            if isinstance(case, FP4DecodeCase)
+                            else decode_operations
+                        )
                         if isinstance(case, DecodeCase)
                         else store_operations
                     )

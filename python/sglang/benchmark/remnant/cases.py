@@ -44,6 +44,27 @@ class DecodeCase:
 
 
 @dataclass(frozen=True)
+class FP4DecodeCase(DecodeCase):
+    """V4 decode shapes, with explicit V4.1 page and SWA identities."""
+
+    global_page_size: int = 256
+    swa_page_size: int = 128
+
+    @property
+    def name(self) -> str:
+        return f"v41_{super().name}_swa{self.swa_length}_p{self.swa_page_size}_g{self.global_page_size}"
+
+
+def fp4_decode_cases() -> list[FP4DecodeCase]:
+    return [
+        FP4DecodeCase(h, b, 512, swa_length=w, swa_page_size=w)
+        for w in (64, 128)
+        for h in (64, 128)
+        for b in DEFAULT_DECODE_BATCHES
+    ]
+
+
+@dataclass(frozen=True)
 class StoreCase:
     phase: str
     rows: int
@@ -340,7 +361,9 @@ def write_results(payload: dict, base: Path) -> None:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--suite", choices=("all", "decode", "store", "prefill-read"), default="all"
+        "--suite",
+        choices=("all", "decode", "store", "prefill-read", "v41-fp4-decode"),
+        default="all",
     )
     p.add_argument("--modes", help="Default: all modes at 256, native,triton otherwise")
     p.add_argument(
@@ -416,6 +439,12 @@ def selected_cases(args) -> list:
             tuple(positive_ints(args.histories, "--histories")),
             tuple(positive_ints(args.query_chunks, "--query-chunks")),
         )
+    if args.suite == "v41-fp4-decode":
+        if args.modes not in (None, "native,kernel") or args.keep_count != 256:
+            raise ValueError("V4.1 FP4 compares dense Native and Packed Direct keep256")
+        if args.profile_mode or args.profile_path:
+            raise ValueError("V4.1 FP4 profiling is deferred")
+        cases = fp4_decode_cases()
     if args.case:
         requested = args.case.split(",")
         if len(set(requested)) != len(requested) or set(requested) - {
@@ -466,6 +495,49 @@ def validate_timing(
     prefill_reader: str = "split",
 ) -> None:
     """Require the full default matrix and all measured rounds before promotion."""
+    if suite == "v41-fp4-decode":
+        definitions = {c.name: asdict(c) for c in fp4_decode_cases()}
+        records = payload.get("cases", [])
+        if (
+            payload.get("status") != "passed"
+            or payload.get("protocol") != "remnant-v41-fp4-decode-v1"
+            or len(records) != len(definitions)
+            or {r["name"] for r in records} != set(definitions)
+            or payload.get("config", {}).get("warmup") != 10
+            or payload["config"].get("rounds") != 30
+            or payload["config"].get("repeats") != 100
+        ):
+            raise RuntimeError("Incomplete V4.1 FP4 timing matrix/protocol")
+        for record in records:
+            if (
+                not record.get("valid")
+                or record.get("case") != definitions[record["name"]]
+                or record.get("execution") != "cuda_graph"
+                or record.get("repeats") != 100
+                or set(record.get("paths", {})) != {"native", "kernel"}
+                or not re.fullmatch(
+                    r"[a-f0-9]{64}", record.get("common_inputs_sha256", "")
+                )
+                or record.get("path_layouts")
+                != {
+                    "native": {
+                        "implementation": "Native FP4 Direct",
+                        "record_bytes": 288,
+                        "packed_keep_count": 512,
+                    },
+                    "kernel": {
+                        "implementation": "Packed FP4 Direct",
+                        "record_bytes": 224,
+                        "packed_keep_count": 256,
+                    },
+                }
+            ):
+                raise RuntimeError(f"Invalid V4.1 FP4 case: {record['name']}")
+            for path in record["paths"].values():
+                if len(path.get("samples", [])) != 30:
+                    raise RuntimeError(f"Missing FP4 rounds: {record['name']}")
+                summary(path["samples"])
+        return
     if suite not in ("all", "prefill-read"):
         raise ValueError(f"unsupported timing judge suite: {suite}")
     if prefill_reader not in ("split", "fused") or (

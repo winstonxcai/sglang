@@ -14,6 +14,35 @@ than a matched Packed control. The old ≤2% Native gate remains with the archiv
 benchmark; current timing is descriptive. Microbenchmarks do not establish
 serving TPOT, TTFT, SLO capacity, or task quality.
 
+## V4.1 FP4 Native / Packed Direct follow-up
+
+Author: Winston Cai. `--suite v41-fp4-decode` uses the same V4 default decode
+heads64/128 and batches8/16/24/28/32, Q1/K512, repeated for SWA64/page64 and
+SWA128/page128. Global pages are256 rows, from the V4.1 configuration. These20
+cases are synthetic FP4 comparisons, not renamed historical V4 measurements.
+Native uses dense288-byte FP4; Packed Direct uses224-byte keep256 records.
+An independent CPU quantization/pruning/attention oracle validates each path.
+Shared post-normalization/post-RoPE BF16 rows, query/indices/SWA/sink hashes bind
+both paths. Selection/store, setup, allocation, references and capture are
+untimed. Complete Direct, including scheduling/split/combine, is timed in CUDA
+graphs with10 warmups,30 randomized paired rounds and100 replays per sample.
+Existing JSON/CSV retain raw samples and per-case ratios; p95 is a round-average
+graph timing statistic. No minimum speedup or serving claim is implied.
+
+From the parent, after identical source/binary/tool-qualified strict checks:
+
+```bash
+REMNANT_INTEGRATION=v0.5.22 REMNANT_VALIDATION_SUITE=v41-fp4 \
+  modal run scripts/modal/kernels.py::benchmark_kernels \
+  --run-id <unique-id> --suite v41-fp4-decode \
+  --qualification-runs <validation-run-id>[,<validation-run-id>]
+```
+
+The runner rejects incomplete memcheck/racecheck/synccheck receipts, changed
+identities, missing cases and skipped checks. H100 only; no model volumes,
+weights, serving or profiling. Budget authorization is owned by the parent
+experiment README. Default V4 suites are unchanged. Rollback omits this suite.
+
 ## Prefill-read experiment
 
 Question: does compact C4 storage save enough historical-KV preparation and

@@ -1275,3 +1275,73 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
     assert record.dsv4_c4_cache_format == "native"
     assert record.dsv4_c4_cache_keep_count == 256
     assert record.dsv4_c4_cache_store_implementation is None
+
+
+def test_v41_fp4_matrix_and_timing_gate():
+    """All V4 decode shapes survive; missing/invalid timing never qualifies."""
+    import copy
+    from dataclasses import asdict
+
+    args = cases.parser().parse_args(["--suite", "v41-fp4-decode"])
+    matrix = cases.selected_cases(args)
+    assert len(matrix) == len({c.name for c in matrix}) == 20
+    assert {(c.heads, c.batch, c.topk_length) for c in matrix} == {
+        (h, b, 512) for h in (64, 128) for b in (8, 16, 24, 28, 32)
+    }
+    assert {(c.swa_length, c.swa_page_size, c.global_page_size) for c in matrix} == {
+        (64, 64, 256),
+        (128, 128, 256),
+    }
+    payload = {
+        "status": "passed",
+        "protocol": "remnant-v41-fp4-decode-v1",
+        "config": vars(args),
+        "cases": [],
+    }
+    for c in matrix:
+        payload["cases"].append(
+            {
+                "name": c.name,
+                "case": asdict(c),
+                "valid": True,
+                "execution": "cuda_graph",
+                "repeats": 100,
+                "common_inputs_sha256": "a" * 64,
+                "paths": {
+                    mode: {"samples": [1.0] * 30} for mode in ("native", "kernel")
+                },
+                "path_layouts": {
+                    "native": {
+                        "implementation": "Native FP4 Direct",
+                        "record_bytes": 288,
+                        "packed_keep_count": 512,
+                    },
+                    "kernel": {
+                        "implementation": "Packed FP4 Direct",
+                        "record_bytes": 224,
+                        "packed_keep_count": 256,
+                    },
+                },
+            }
+        )
+    cases.validate_timing(payload, suite="v41-fp4-decode")
+    for fault in (
+        "missing-case",
+        "missing-mode",
+        "bad-sample",
+        "wrong-layout",
+        "wrong-geometry",
+    ):
+        broken = copy.deepcopy(payload)
+        if fault == "missing-case":
+            broken["cases"].pop()
+        elif fault == "missing-mode":
+            broken["cases"][0]["paths"].pop("kernel")
+        elif fault == "bad-sample":
+            broken["cases"][0]["paths"]["native"]["samples"][0] = float("nan")
+        elif fault == "wrong-layout":
+            broken["cases"][0]["path_layouts"]["native"]["record_bytes"] = 584
+        else:
+            broken["cases"][0]["case"]["swa_page_size"] = 64 + 128
+        with pytest.raises((RuntimeError, ValueError)):
+            cases.validate_timing(broken, suite="v41-fp4-decode")

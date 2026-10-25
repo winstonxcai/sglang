@@ -939,3 +939,65 @@ def test_fp4_backend_dispatch():
                 )
             (stock if mode == "auto" else fp4).assert_called_once()
             (fp4 if mode == "auto" else stock).assert_not_called()
+
+
+@GPU
+@pytest.mark.parametrize("heads", [64, 128])
+def test_fp4_fragment_masks(heads):
+    """Independent records expose every byte mask directly through one-key PV.
+
+    Author: Winston Cai. No pruning/production rank algorithm generates expected
+    values. All256 masks, rank parity, terminal windows and original scale groups
+    are covered by coordinate-based scatter and a literal E2M1 table.
+    """
+    from sgl_kernel.flash_mla import flash_mla_with_fp4_kvcache
+
+    page = 256
+    records = torch.zeros((2, page * 224), dtype=torch.uint8)
+    data = records[1, : page * 192].reshape(page, 192)
+    scales = records[1, page * 192 :].reshape(page, 32)
+    scales[:] = torch.tensor([40, 48, 56, 64] * 8, dtype=torch.uint8)
+    expected = torch.zeros((page, 512), dtype=torch.bfloat16)
+    magnitudes = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    for mask in range(256):
+        start = (mask % 64) * 8
+        keep = torch.zeros(512, dtype=torch.bool)
+        for bit in range(8):
+            keep[start + bit] = bool(mask & (128 >> bit))
+        # Alternate filling low/high coordinates to vary prefixes/rank parity.
+        remaining = [i for i in range(512) if not start <= i < start + 8]
+        if mask & 1:
+            remaining.reverse()
+        keep[remaining[: 256 - int(keep.sum())]] = True
+        coords = keep.nonzero().flatten()
+        codes = (torch.arange(256) + mask).to(torch.uint8) % 16
+        data[mask, :128] = codes[0::2] | (codes[1::2] << 4)
+        for word in range(8):
+            value = sum(int(keep[word * 64 + bit]) << (63 - bit) for bit in range(64))
+            data[mask, 128 + word * 8 : 136 + word * 8] = torch.tensor(
+                list(value.to_bytes(8, "little")), dtype=torch.uint8
+            )
+        scale_values = scales[mask].view(torch.float8_e4m3fn).float()
+        vals = magnitudes[(codes & 7).long()]
+        vals = torch.where((codes & 8) != 0, -vals, vals)
+        expected[mask, coords] = (vals * scale_values[coords // 16]).bfloat16()
+    cache = records.cuda().view(2, page, 1, 224)
+    q = torch.zeros((page, 1, heads, 512), dtype=torch.bfloat16, device="cuda")
+    swa = _make_swa_cache(1, 128, torch.device("cuda"))
+    swa_ids = torch.full((page, 1, 64), -1, device="cuda", dtype=torch.int32)
+    ids = torch.full((page, 1, 512), -1, device="cuda", dtype=torch.int32)
+    ids[:, 0, 0] = torch.arange(page, page * 2, device="cuda", dtype=torch.int32)
+    output, lse = flash_mla_with_fp4_kvcache(
+        q,
+        swa,
+        swa_ids,
+        cache,
+        ids,
+        packed=True,
+        topk_length=torch.zeros(page, device="cuda", dtype=torch.int32),
+        extra_topk_length=torch.ones(page, device="cuda", dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        output.cpu(), expected[:, None, None, :].expand_as(output), atol=0, rtol=0
+    )
+    torch.testing.assert_close(lse.cpu(), torch.zeros_like(lse.cpu()), atol=0, rtol=0)
