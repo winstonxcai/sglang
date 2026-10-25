@@ -1383,8 +1383,7 @@ def test_glm_rejects_incomplete_timing():
         glm.validate_timing({'protocol': glm.PROTOCOL, 'status': 'passed', 'cases': []})
 
 
-def test_glm_full_timing_coverage_rejects_sample_and_cache_corruption():
-    import copy
+def _glm_complete_timing_payload():
     from dataclasses import asdict
     records = []
     for definition in glm.cases():
@@ -1398,7 +1397,12 @@ def test_glm_full_timing_coverage_rejects_sample_and_cache_corruption():
                             execution='cuda_graph', cycles_per_sample=100//banks,
                             calls_per_sample=100,
                             paired_ratios={'direct_over_native': {'samples': [1.0]*30}}))
-    payload = dict(protocol=glm.PROTOCOL, status='passed', cases=records)
+    return dict(protocol=glm.PROTOCOL, status='passed', cases=records)
+
+
+def test_glm_full_timing_coverage_rejects_sample_and_cache_corruption():
+    import copy
+    payload = _glm_complete_timing_payload()
     glm.validate_timing(payload)
     for field, value in [('calls_per_sample', 99), ('round_orders', [['native','direct']]*30)]:
         changed = copy.deepcopy(payload)
@@ -1437,3 +1441,44 @@ def test_glm_graph_pool_accounting_ignores_global_cache_changes():
         cuda.memory_snapshot = lambda pool_id: segments
         with pytest.raises(RuntimeError, match="Graph pool snapshot"):
             glm.graph_reserved_bytes(cuda, graph)
+
+
+def test_glm_selected_initialization_covers_real_backing_locations():
+    import numpy as np
+    case = glm.Case('prefill', 16, 128, 3, 'independent', 'warm')
+    ids = glm.physical_selection(case)
+    locations = glm.selected_physical_rows(ids)
+    assert len(locations) == len(set(ids[ids >= 0].tolist()))
+    assert np.all(locations >= glm.PAGE)
+    # Independent expected gather/scatter on shuffled pages and duplicated,
+    # invalid, tail and request-offset positions. Unselected storage stays zero.
+    native = np.zeros((locations.max()+1, 2), dtype=np.int64)
+    dense = np.arange(len(native)*2, dtype=np.int64).reshape(-1, 2)
+    native[locations] = dense[locations]
+    np.testing.assert_array_equal(native[ids[ids >= 0]], dense[ids[ids >= 0]])
+    assert not native[0].any()
+    np.testing.assert_array_equal(glm.selected_physical_rows(np.array([-1, 257, 256, 257, -1, 1024])), [256,257,1024])
+
+
+def test_glm_resume_requires_identical_valid_ordered_prefix():
+    import copy
+    source = dict(sources={'fixture': 'hash'}, compiled_build={'artifact': 'hash'})
+    previous = _glm_complete_timing_payload()
+    previous.update(source=source, seed=glm.SEED, rounds=glm.ROUNDS, status='incomplete')
+    previous['cases'] = previous['cases'][:3] + [dict(valid=False)]
+    accepted = glm.resume_prefix(previous, source)
+    assert len(accepted) == 3
+    assert previous['cases'][-1] == dict(valid=False)  # input retained as evidence
+    for key, value in [('source', {}), ('seed', 0), ('rounds', 29)]:
+        changed = copy.deepcopy(previous); changed[key] = value
+        with pytest.raises(RuntimeError, match='identity'):
+            glm.resume_prefix(changed, source)
+    changed = copy.deepcopy(previous); changed['cases'][1]['valid'] = False
+    with pytest.raises(RuntimeError, match='Incomplete GLM case'):
+        glm.resume_prefix(changed, source)
+    changed = copy.deepcopy(previous); changed['cases'][:2] = changed['cases'][1::-1]
+    with pytest.raises(RuntimeError, match='128-case'):
+        glm.resume_prefix(changed, source)
+    changed = copy.deepcopy(previous); changed['cases'][0]['paths']['native']['samples'] = [1.0]*29
+    with pytest.raises(RuntimeError, match='rounds'):
+        glm.resume_prefix(changed, source)

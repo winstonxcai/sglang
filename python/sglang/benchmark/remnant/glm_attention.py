@@ -133,6 +133,13 @@ def physical_selection(case: Case, bank: int = 0):
     return physical
 
 
+def selected_physical_rows(indices):
+    """Sorted distinct valid locations; padding is never initialized or loaded."""
+    import numpy as np
+
+    return np.unique(indices[indices >= 0])
+
+
 def rotation_count(selected_rows: int, l2_bytes: int) -> int:
     if min(selected_rows, l2_bytes) <= 0:
         raise ValueError(
@@ -171,6 +178,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--model-family", choices=("glm53",), default="glm53")
     p.add_argument("--suite", choices=("glm-attention",), default="glm-attention")
     p.add_argument("--modes", choices=("native,direct",), default="native,direct")
+    p.add_argument(
+        "--resume",
+        help="Prior timing JSON from identical source/artifacts; resume its valid ordered prefix",
+    )
     p.add_argument("--output")
     p.add_argument("--max-seconds", type=int, default=850)
     p.add_argument("--check-imports", action="store_true")
@@ -252,7 +263,6 @@ class Fixture:
     """
 
     def __init__(self, case: Case, deadline: float):
-        import numpy as np
         import torch
         from sglang.srt.layers.layernorm import RMSNorm
         from sglang.srt.remnant.glm import PackedCache, normalize_and_store
@@ -260,7 +270,7 @@ class Fixture:
         self.case, self.deadline = case, deadline
         self.l2, total = _device_contract()
         first = physical_selection(case)
-        selected_rows = len(np.unique(first[first >= 0]))
+        selected_rows = len(selected_physical_rows(first))
         self.banks = (
             1 if case.policy == "warm" else rotation_count(selected_rows, self.l2)
         )
@@ -273,13 +283,13 @@ class Fixture:
             self.check()
             ids = physical_selection(case, len(selections))
             selections.append(ids)
-            touched.append(len(np.unique(ids[ids >= 0])))
+            touched.append(len(selected_physical_rows(ids)))
         if case.policy == "rotating":
             while sum(touched) * 320 <= 2 * self.l2:
                 self.check()
                 ids = physical_selection(case, len(selections))
                 selections.append(ids)
-                touched.append(len(np.unique(ids[ids >= 0])))
+                touched.append(len(selected_physical_rows(ids)))
             # Remove a final unnecessary bank: smallest prefix exceeding 2*L2.
             while len(touched) > 1 and sum(touched[:-1]) * 320 > 2 * self.l2:
                 touched.pop()
@@ -330,27 +340,31 @@ class Fixture:
             values = torch.zeros(self.slots, KEEP, dtype=torch.uint8, device="cuda")
             bitmap = torch.zeros(self.slots, 8, dtype=torch.uint64, device="cuda")
             gen = torch.Generator(device="cuda").manual_seed(case_seed(case, bank))
-            for start in range(PAGE, self.slots, 65536):
+            locations = selected_physical_rows(selected)
+            for start in range(0, len(locations), 65536):
                 self.check()
-                end = min(start + 65536, self.slots)
+                end = min(start + 65536, len(locations))
                 raw = torch.randn(
                     (end - start, DIM),
                     generator=gen,
                     device="cuda",
                     dtype=torch.bfloat16,
                 )
-                loc = torch.arange(start, end, device="cuda", dtype=torch.int64)
-                native[start:end].copy_(
-                    norm(raw).to(torch.float8_e4m3fn).view(torch.uint8)
+                loc = torch.from_numpy(locations[start:end]).to(
+                    device="cuda", dtype=torch.int64
                 )
+                # Assignment scatters to backing storage; advanced-index copy_
+                # would mutate a temporary. Both paths consume identical raw rows.
+                native[loc] = norm(raw).to(torch.float8_e4m3fn).view(torch.uint8)
                 normalize_and_store(raw, norm, loc, values, bitmap)
                 mask, expected_values, words, dense = packed_reference(raw, norm)
-                if not torch.equal(
-                    values[start:end], expected_values
-                ) or not torch.equal(bitmap[start:end].view(torch.int64), words):
+                if not torch.equal(values[loc], expected_values) or not torch.equal(
+                    bitmap.view(torch.int64)[loc], words
+                ):
                     raise RuntimeError(
                         f"{case.name}/bank{bank}/rows{start}:{end}: Packed bytes/bitmap mismatch"
                     )
+                _hash_tensor(self.digest, loc)
                 _hash_tensor(self.digest, raw)
                 del raw, loc, mask, expected_values, words, dense
             self.ids.append(ids)
@@ -360,6 +374,8 @@ class Fixture:
         del selections, norm
         self.identity = dict(
             common_inputs_sha256=self.digest.hexdigest(),
+            initialization="selected-physical-union-v1; unselected backing rows zero",
+            initialized_rows_per_bank=touched,
             banks=self.banks,
             l2_bytes=self.l2,
             selected_rows_per_bank=touched,
@@ -593,10 +609,16 @@ def write_results(payload: dict, base: Path) -> None:
                 )
 
 
-def validate_timing(payload: dict) -> None:
-    if payload.get("protocol") != PROTOCOL or payload.get("status") != "passed":
+def validate_timing(payload: dict, *, prefix: bool = False) -> None:
+    if payload.get("protocol") != PROTOCOL or (
+        not prefix and payload.get("status") != "passed"
+    ):
         raise RuntimeError("GLM timing protocol incomplete")
     expected = cases()
+    if prefix:
+        if len(payload["cases"]) > len(expected):
+            raise RuntimeError("GLM checkpoint exceeds the required matrix")
+        expected = expected[: len(payload["cases"])]
     if [c["name"] for c in payload["cases"]] != [c.name for c in expected]:
         raise RuntimeError("GLM timing requires the full ordered 128-case matrix")
     for case, definition in zip(payload["cases"], expected):
@@ -656,6 +678,25 @@ def validate_timing(payload: dict) -> None:
             raise RuntimeError(f"Invalid GLM paired ratios {case['name']}")
 
 
+def resume_prefix(previous: dict, source: dict) -> list[dict]:
+    """Reuse only validated cases from an identical fixture/toolchain snapshot."""
+    if (
+        previous.get("source") != source
+        or previous.get("seed") != SEED
+        or previous.get("rounds") != ROUNDS
+    ):
+        raise RuntimeError(
+            "GLM checkpoint source/artifact/seed/round identity mismatch"
+        )
+    records = list(previous.get("cases", []))
+    # A killed/failed final case has no accepted measurement. Interior failures
+    # are never skipped or converted into coverage.
+    if records and not records[-1].get("valid"):
+        records.pop()
+    validate_timing({**previous, "cases": records}, prefix=True)
+    return records
+
+
 def main() -> None:
     args = parser().parse_args()
     if args.check_imports:
@@ -683,11 +724,21 @@ def main() -> None:
         source=source_manifest(),
         cases=[],
     )
+    if args.resume:
+        checkpoint = Path(args.resume)
+        payload["cases"] = resume_prefix(
+            json.loads(checkpoint.read_text()), payload["source"]
+        )
+        payload["resumed_from"] = dict(
+            path=str(checkpoint),
+            sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            accepted_cases=len(payload["cases"]),
+        )
     deadline = time.monotonic() + args.max_seconds
     fixture = None
     try:
         with torch.inference_mode():
-            for case in cases():
+            for case in cases()[len(payload["cases"]) :]:
                 record = dict(name=case.name, case=asdict(case), valid=False)
                 payload["cases"].append(record)
                 write_results(payload, base)

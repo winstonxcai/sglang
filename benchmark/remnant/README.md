@@ -322,3 +322,12 @@ qualification evidence. The maintained Modal entry point requires explicit
 compiled kernels and dependencies. A per-tool validation run never represents
 all-tool qualification. No output is overwritten and each completed case is
 checkpointed. Missing coverage is incomplete; there is no required speedup.
+
+
+GLM fixture initialization `selected-physical-union-v1` keeps full-size zeroed
+backing banks and populates every distinct valid selected physical row once.
+Native and Packed share those raw latents; all written Packed bytes are checked.
+This changes setup cost and fixture hashes, not rotation footprints or timed calls.
+`--resume <prior-timing.json>` accepts only a valid ordered prefix with identical
+source/artifact identity, seed, rounds and per-case coverage. It discards only an
+unfinished final case. A completed aggregate still requires all 128 cases.
