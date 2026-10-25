@@ -16,14 +16,27 @@ import importlib.metadata
 import json
 import math
 import os
-import random
 import sys
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+# Dispatch before importing DeepSeek/FlashMLA-only dependencies.
+if __name__ == "__main__":
+    import argparse
+
+    family_parser = argparse.ArgumentParser(add_help=False)
+    family_parser.add_argument("--model-family", choices=("dsv4", "glm53"), default="dsv4")
+    family, _ = family_parser.parse_known_args()
+    if family.model_family == "glm53":
+        from sglang.benchmark.remnant.glm_attention import main as glm_main
+
+        glm_main()
+        raise SystemExit(0)
+
 import torch
+from sglang.benchmark.remnant.timing import measure, paired_samples
 from sgl_kernel import flash_mla
 from sglang.benchmark.remnant.cases import (
     PROTOCOL,
@@ -1034,18 +1047,6 @@ def capture(op: Operation, warmup: int) -> tuple[torch.cuda.CUDAGraph, object]:
     return graph, output
 
 
-def measure(call: Callable, repeats: int) -> float:
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
-    )
-    start.record()
-    for _ in range(repeats):
-        call()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / repeats
-
-
 def time_case(case, operations: list[Operation], args) -> dict:
     graph_mode = isinstance(case, DecodeCase) or case.phase == "decode"
     repeats = args.repeats if graph_mode else args.prefill_repeats
@@ -1061,16 +1062,12 @@ def time_case(case, operations: list[Operation], args) -> dict:
             for _ in range(args.warmup):
                 op.call()
             calls[op.key] = op.call
-    samples = {op.key: [] for op in operations}
     by_key = {op.key: op for op in operations}
-    rng = random.Random(case_seed(case, args.seed))
-    for _ in range(args.rounds):
-        order = list(samples)
-        rng.shuffle(order)
-        for key in order:
-            op = by_key[key]
-            configure(op.mode, op.keep_count)
-            samples[key].append(measure(calls[key], repeats))
+    samples, _ = paired_samples(
+        calls, args.rounds, case_seed(case, args.seed), repeats,
+        before=lambda key: configure(by_key[key].mode, by_key[key].keep_count),
+        sample=measure,
+    )
     for op in operations:
         op.validate()
     return {

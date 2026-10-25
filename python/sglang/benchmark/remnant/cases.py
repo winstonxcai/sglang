@@ -339,6 +339,7 @@ def write_results(payload: dict, base: Path) -> None:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--model-family", choices=("dsv4",), default="dsv4")
     p.add_argument(
         "--suite", choices=("all", "decode", "store", "prefill-read"), default="all"
     )

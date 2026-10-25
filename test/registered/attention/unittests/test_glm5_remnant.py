@@ -90,20 +90,10 @@ def fixture(rows=513, implementation="direct"):
 
 
 def expected(raw, norm):
-    # Selection is the established shared primitive; codec expansion below is
-    # independent (boolean scatter, no rank/popcount implementation reuse).
-    mask = topmag_keep_mask(raw, 0.5)
-    codes = norm(raw.masked_fill(~mask, 0)).to(torch.float8_e4m3fn).view(torch.uint8)
-    dense = torch.where(mask, codes, 0)
-    words = torch.zeros(raw.shape[0], 8, dtype=torch.int64, device="cpu")
-    for row, indices in enumerate(mask.cpu().nonzero().split(256)):
-        for coord in indices[:, 1].tolist():
-            word, lane = divmod(coord, 64)
-            value = 1 << (63 - lane)
-            if value >= 1 << 63:
-                value -= 1 << 64
-            words[row, word] |= value
-    return mask, codes[mask].reshape(-1, 256), words, dense
+    from sglang.benchmark.remnant.glm_attention import packed_reference
+
+    mask, values, words, dense = packed_reference(raw, norm)
+    return mask, values, words.cpu(), dense
 
 
 def test_producer_reconstruction():
@@ -673,6 +663,42 @@ def test_real_gpu_allocations(tmp_path):
                     torch.cuda.empty_cache()
     report["status"] = "passed"
     output.write_text(json.dumps(report, indent=2) + "\n")
+
+
+@pytest.mark.parametrize("heads,banks", [(8, 2), (16, 4)])
+def test_benchmark_bank_graph_ownership(heads, banks):
+    """Small correctness fixture, not the 128K timing/cache-residency protocol."""
+    import time
+    from sglang.benchmark.remnant.glm_attention import Fixture, Case
+    from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_inner_iter
+
+    raw, norm, cache = fixture()
+    f = Fixture.__new__(Fixture)
+    f.case = Case("decode", heads, 8, 3, "independent", "rotating")
+    f.deadline = time.monotonic() + 1200
+    f.banks, f.memory_limit = banks, int(torch.cuda.get_device_properties(0).total_memory * 0.7)
+    f.q = torch.randn(8, heads, 512, dtype=torch.bfloat16, device="cuda")
+    f.native, f.packed, f.ids, f.graphs, f.outputs = [], [], [], {}, {}
+    inner = _pick_inner_iter(8, 66, torch.cuda.get_device_properties(0).multi_processor_count, 1)
+    f.identity = {"inner_iter": inner}
+    for bank in range(banks):
+        changed = raw.roll(bank, 0).contiguous()
+        values, bitmaps = torch.zeros_like(cache.values), torch.zeros_like(cache.bitmaps)
+        normalize_and_store(changed, norm, torch.arange(len(raw), device="cuda"), values, bitmaps)
+        native = torch.zeros(len(values), 512, dtype=torch.uint8, device="cuda")
+        native[:len(raw)] = norm(changed).to(torch.float8_e4m3fn).view(torch.uint8)
+        f.native.append(native)
+        f.packed.append(PackedCache(values, bitmaps, None, "direct"))
+        f.ids.append(selection(8, bank % 4))
+    f.validate()
+    f.capture()
+    f.q.normal_()
+    for ids in f.ids:
+        ids[1] = -1
+    f.validate_replay()
+    f.validate()
+    assert f.identity['native_graph_bytes'] > 0
+    assert f.identity['direct_graph_bytes'] > 0
 
 
 def _compile_sm90_variant(case: tuple[int, int]) -> list[dict]:

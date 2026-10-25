@@ -469,6 +469,7 @@ def test_prefill_timing_preserves_variant_configuration_and_pairing():
         "DecodeCase": cases.DecodeCase,
         "configure": configure,
         "measure": lambda call, repeats: call(),
+        "paired_samples": shared_timing.paired_samples,
         "case_seed": cases.case_seed,
         "random": random,
         "summary": cases.summary,
@@ -1275,3 +1276,140 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
     assert record.dsv4_c4_cache_format == "native"
     assert record.dsv4_c4_cache_keep_count == 256
     assert record.dsv4_c4_cache_store_implementation is None
+
+# GLM owns a separate protocol; importing it must not load torch/FlashMLA.
+glm = load_module("_glm_attention_contract", ROOT / "python/sglang/benchmark/remnant/glm_attention.py")
+shared_timing = load_module("_remnant_shared_timing", ROOT / "python/sglang/benchmark/remnant/timing.py")
+
+
+def test_glm_matrix_order_and_baseline_identity():
+    matrix = glm.cases()
+    assert len(matrix) == len({c.name for c in matrix}) == 128
+    assert sum(c.phase == 'decode' for c in matrix) == 48
+    assert sum(c.phase == 'prefill' for c in matrix) == 80
+    assert all(c.heads == 16 for c in matrix[:64])
+    assert all(c.heads == 8 for c in matrix[64:])
+    for heads in (16, 8):
+        subset = [c for c in matrix if c.heads == heads]
+        assert [c.phase for c in subset[:24]] == ['decode'] * 24
+    assert glm.MODES == ('native', 'direct')
+
+
+def test_glm_grouped_causal_prefill_and_shared_prefix():
+    import numpy as np
+    for phase in (0, 3):
+        for locality in ('independent', 'shared'):
+            case = glm.Case('prefill', 16, 8, phase, locality, 'warm')
+            ids = glm.logical_selection(case)
+            assert np.array_equal(ids, glm.logical_selection(case))
+            first = glm.HISTORY + (4 if phase == 0 else 3)
+            for q, row in enumerate(ids):
+                groups = row[:2048].reshape(512, 4)
+                assert len(np.unique(groups[:, 0])) == 512
+                assert np.all(groups[:, 0] % 4 == 0)
+                assert np.array_equal(groups - groups[:, :1], np.tile(np.arange(4), (512, 1)))
+                length = first + q
+                assert np.all(row[row >= 0] < length)
+                tail = length % 4
+                assert np.array_equal(row[2048:2048+tail], np.arange(length-tail, length))
+                assert np.all(row[2048+tail:] == -1)
+            if locality == 'shared':
+                assert np.all(ids[:, :2048] == ids[0, :2048])
+            else:
+                assert not np.array_equal(ids[0, :2048], ids[1, :2048])
+
+
+def test_glm_separate_decode_requests_and_page_mapping():
+    import numpy as np
+    case = glm.Case('decode', 8, 8, 3, 'independent', 'warm')
+    logical, physical = glm.logical_selection(case), glm.physical_selection(case)
+    valid = logical >= 0
+    assert np.array_equal(logical[valid] % 256, physical[valid] % 256)
+    assert np.all(physical[valid] >= 256)
+    for q in range(case.queries):
+        selected = physical[q][physical[q] >= 0]
+        assert np.all((selected - 256) // case.request_slots == q)
+    assert np.array_equal(physical, glm.physical_selection(case))
+    assert not np.array_equal(physical, glm.physical_selection(case, 1))
+
+
+def test_glm_rotation_and_call_normalization():
+    assert glm.rotation_count(2048, 50 * 1024**2) == 161
+    assert (161-1)*2048*320 <= 2*50*1024**2 < 161*2048*320
+    assert glm.cycles_per_sample(1) == 100
+    assert glm.cycles_per_sample(3) == 34
+    assert glm.cycles_per_sample(161) == 1
+    for value in (0, -1):
+        with pytest.raises(ValueError):
+            glm.cycles_per_sample(value)
+        with pytest.raises(ValueError):
+            glm.rotation_count(value, 1024)
+
+
+def test_glm_shared_round_schedule_and_preconditioning():
+    calls, before = [], []
+    values, order = shared_timing.paired_samples(
+        {m: lambda m=m: calls.append(m) for m in glm.MODES}, 30, 123, 34,
+        balanced=True, before=before.append,
+        sample=lambda call, repeat: (call(), float(repeat))[1],
+    )
+    assert order.count(['native', 'direct']) == order.count(['direct', 'native']) == 15
+    assert before == calls == [m for row in order for m in row]
+    assert values == {m: [34.0]*30 for m in glm.MODES}
+    assert shared_timing.round_orders(glm.MODES, 30, 123, balanced=True) == order
+    with pytest.raises(ValueError):
+        shared_timing.round_orders(glm.MODES, 3, 1, balanced=True)
+
+
+def test_glm_cli_rejects_adapter_and_deepseek_options():
+    for argv in (['--modes', 'native,adapter'], ['--keep-count', '256'],
+                 ['--native-library', '/tmp/native.so'], ['--suite', 'store'],
+                 ['--profile-mode', 'native']):
+        with pytest.raises(SystemExit):
+            glm.parser().parse_args(argv)
+    args = glm.parser().parse_args(['--model-family', 'glm53', '--suite', 'glm-attention'])
+    assert args.modes == 'native,direct'
+
+
+def test_glm_entrypoint_dispatches_before_deepseek_imports():
+    source = (ROOT / 'benchmark/remnant/microbench.py').read_text()
+    assert source.index('glm_main()') < source.index('from sgl_kernel import flash_mla')
+
+
+def test_glm_rejects_incomplete_timing():
+    with pytest.raises(RuntimeError, match='incomplete'):
+        glm.validate_timing({'protocol': glm.PROTOCOL, 'status': 'incomplete'})
+    with pytest.raises(RuntimeError, match='128-case'):
+        glm.validate_timing({'protocol': glm.PROTOCOL, 'status': 'passed', 'cases': []})
+
+
+def test_glm_full_timing_coverage_rejects_sample_and_cache_corruption():
+    import copy
+    from dataclasses import asdict
+    records = []
+    for definition in glm.cases():
+        banks = 1 if definition.policy == 'warm' else 2
+        records.append(dict(name=definition.name, case=asdict(definition), valid=True,
+                            fixture=dict(banks=banks, selected_rows_per_bank=[1]*banks,
+                                         l2_bytes=200, projected_bytes=1, memory_limit_bytes=2,
+                                         common_inputs_sha256='0'*64),
+                            paths={m: dict(samples=[1.0]*30) for m in glm.MODES},
+                            round_orders=[['native','direct'],['direct','native']]*15,
+                            execution='cuda_graph', cycles_per_sample=100//banks,
+                            calls_per_sample=100,
+                            paired_ratios={'direct_over_native': {'samples': [1.0]*30}}))
+    payload = dict(protocol=glm.PROTOCOL, status='passed', cases=records)
+    glm.validate_timing(payload)
+    for field, value in [('calls_per_sample', 99), ('round_orders', [['native','direct']]*30)]:
+        changed = copy.deepcopy(payload)
+        changed['cases'][0][field] = value
+        with pytest.raises(RuntimeError):
+            glm.validate_timing(changed)
+    changed = copy.deepcopy(payload)
+    changed['cases'][1]['fixture']['l2_bytes'] = 10000
+    with pytest.raises(RuntimeError, match='cache policy'):
+        glm.validate_timing(changed)
+    changed = copy.deepcopy(payload)
+    changed['cases'][0]['paths']['direct']['samples'] = [1.0]*29
+    with pytest.raises(RuntimeError, match='rounds'):
+        glm.validate_timing(changed)

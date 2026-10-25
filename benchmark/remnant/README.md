@@ -280,3 +280,45 @@ selection, reconstruction and combine; duration, DRAM traffic/bandwidth, L2,
 occupancy, registers, local spill traffic and warp stalls are required. Reports,
 commands, versions and exported summaries are separate from timing records.
 Profiling does not refresh or replace unprofiled timing.
+
+## GLM Native FP8 versus Packed Direct
+
+`--model-family glm53 --suite glm-attention` selects protocol
+`remnant-glm-attention-v1`, independent of the DeepSeek defaults above. Only
+`native,direct` is accepted. Native retains all 512 FP8 coordinates; Direct reads
+256 FP8 values plus eight bitmap words. Both calls include query conversion,
+partial attention and combine. No store, indexer, metadata preparation, Adapter,
+weights, KDA state, or TP communication is timed.
+
+The full matrix has 128 cases: heads16 then8; decode B1/8/16/24/32/64 then
+prefill Q128/512/1536/4096/8192; tail phases0/3; warm/rotating buffers; independent
+or shared prefill history. Decode histories are request-disjoint. Four-token
+KPool groups and 256-token page offsets are preserved; 2,048 history entries
+plus causal live tails are padded to2,112. The completed prefix is128K; phase0
+starts at sequence length131076 and phase3 at131075, then prefill advances
+contiguously. These lengths include the current query token.
+
+One fixed seed20261024, 30 balanced paired rounds and >=100 calls/sample use
+CUDA graphs for both phases. Rotation banks use the smallest distinct selected
+Packed footprint exceeding twice measured device L2, with identical bank counts
+in both modes. Fixture backing/inputs/graph liveness must remain under70% VRAM.
+Warm is a buffer-reuse policy, not a promise that all data resides in L2.
+Results are conditional synthetic measurements, not a model workload distribution.
+
+CPU contracts live in the existing `test_microbench.py`; small GPU graph-owner
+regressions live in the existing GLM integration tests. The dedicated GLM module
+owns numerical fixtures/references, and `timing.py` is shared with DeepSeek.
+The parent `benchmarks/microbench/glm53-packed/README.md` owns authorization,
+aggregate cost, gate identities and the canonical experiment ledger.
+
+```bash
+python benchmark/remnant/microbench.py --model-family glm53 --suite glm-attention \
+  --output /path/to/unique-run/timing --max-seconds 850
+```
+
+Direct CLI timing is diagnostic unless paired with the parent's sanitizer
+qualification evidence. The maintained Modal entry point requires explicit
+`--qualification-runs` covering all three sanitizer tools with matching runtime,
+compiled kernels and dependencies. A per-tool validation run never represents
+all-tool qualification. No output is overwritten and each completed case is
+checkpointed. Missing coverage is incomplete; there is no required speedup.
