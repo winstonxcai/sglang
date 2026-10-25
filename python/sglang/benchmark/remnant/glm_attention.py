@@ -460,12 +460,14 @@ class Fixture:
                     )
                 del output
 
-    def capture(self) -> None:
+    def capture(self, *, warmup_calls: int = 10) -> None:
         import torch
 
+        if warmup_calls < 1:
+            raise ValueError("Capture requires positive warmup count")
         for mode in MODES:
             self.check()
-            for i in range(max(10, self.banks)):
+            for i in range(max(warmup_calls, self.banks)):
                 output = self.call(mode, i % self.banks)
                 del output
             torch.cuda.synchronize()

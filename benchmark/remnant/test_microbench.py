@@ -1482,3 +1482,8 @@ def test_glm_resume_requires_identical_valid_ordered_prefix():
     changed = copy.deepcopy(previous); changed['cases'][0]['paths']['native']['samples'] = [1.0]*29
     with pytest.raises(RuntimeError, match='rounds'):
         glm.resume_prefix(changed, source)
+
+
+def test_glm_measured_capture_preserves_ten_warmups():
+    import inspect
+    assert inspect.signature(glm.Fixture.capture).parameters['warmup_calls'].default == 10

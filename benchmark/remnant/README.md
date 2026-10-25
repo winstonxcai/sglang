@@ -331,3 +331,12 @@ This changes setup cost and fixture hashes, not rotation footprints or timed cal
 `--resume <prior-timing.json>` accepts only a valid ordered prefix with identical
 source/artifact identity, seed, rounds and per-case coverage. It discards only an
 unfinished final case. A completed aggregate still requires all 128 cases.
+
+
+Focused sanitizer bank probes use Q2/Q8, banks2/4, heads8/16 and explicitly
+force inner33/66. These are the same compiled partial/combine specializations
+with representative launch grids. JUnit records exact geometry and actual 2/4
+warmup calls per mode. They retain every bank, independent references, alternating
+and changing-input replay. Full Q128/Q512 numerical/ownership smoke stays intact;
+the probes do not establish sanitizer coverage for those full allocation/grid
+sizes. Measured captures keep the default ten warmups and the full128 matrix.

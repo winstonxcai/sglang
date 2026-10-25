@@ -668,11 +668,14 @@ def test_real_gpu_allocations(tmp_path):
 @pytest.mark.parametrize("heads,banks", [(8, 2), (16, 4)])
 def test_benchmark_bank_graph_ownership(heads, banks):
     """Small correctness fixture, not the 128K timing/cache-residency protocol."""
+    _benchmark_bank_graph(heads, banks, 128 if heads == 8 else 512)
+
+
+def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10):
     import time
     from sglang.benchmark.remnant.glm_attention import Fixture, Case
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_inner_iter
 
-    queries = 128 if heads == 8 else 512
     raw, norm, cache = fixture()
     f = Fixture.__new__(Fixture)
     f.case = Case("prefill", heads, queries, 3, "independent", "rotating")
@@ -692,7 +695,7 @@ def test_benchmark_bank_graph_ownership(heads, banks):
         f.packed.append(PackedCache(values, bitmaps, None, "direct"))
         f.ids.append(selection(queries, bank % 4))
     f.validate()
-    f.capture()
+    f.capture(warmup_calls=warmup_calls)
     f.q.normal_()
     for ids in f.ids:
         ids[1] = -1
@@ -700,6 +703,26 @@ def test_benchmark_bank_graph_ownership(heads, banks):
     f.validate()
     assert f.identity['native_graph_bytes'] > 0
     assert f.identity['direct_graph_bytes'] > 0
+    return f.identity
+
+
+@pytest.mark.parametrize("heads,banks,queries,inner", [(8, 2, 2, 33), (16, 4, 8, 66)])
+def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_property):
+    """Instrument identical compiled variants at explicit representative grids.
+
+    Full Q128/Q512 ownership/dispatch smoke remains separate. Runtime query count
+    changes the launch grid, not the compiled partial/combine specialization.
+    This probe does not qualify full-size allocation/grid sanitizer coverage.
+    """
+    target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
+    with patch(target, return_value=inner) as dispatch:
+        identity = _benchmark_bank_graph(heads, banks, queries, warmup_calls=1)
+        assert identity["inner_iter"] == inner
+        assert dispatch.call_count > 1
+    record_property("probe_geometry", json.dumps(dict(probe="focused-bank-graph", heads=heads, banks=banks,
+                          queries=queries, forced_inner=inner, warmup_calls=1,
+                          actual_warmup_calls_per_mode=banks,
+                          measured_warmup_calls=10)))
 
 
 def _compile_sm90_variant(case: tuple[int, int]) -> list[dict]:
