@@ -822,12 +822,9 @@ def test_packed_loader_bytes():
         for w in range(8):
             host_words[row,w] = sum(int(mask[w*64+j]) << (63-j) for j in range(64))
     locations = [*range(15), slots-1]
-    # Four direct host-to-device transfers replace 32 temporary GPU allocations
-    # and row copies. Keep the real high address and identical raw-byte corpus.
-    values[:15].copy_(torch.from_numpy(host_values[:15]))
-    bitmap[:15].copy_(torch.from_numpy(host_words[:15]))
-    values[-1].copy_(torch.from_numpy(host_values[-1]))
-    bitmap[-1].copy_(torch.from_numpy(host_words[-1]))
+    for row, loc in enumerate(locations):
+        values[loc].copy_(torch.from_numpy(host_values[row]).cuda())
+        bitmap[loc].copy_(torch.from_numpy(host_words[row]).cuda())
     host_ids = np.array([*locations, -1, slots, -9, *locations[:13]],dtype=np.int32)
     expected = np.zeros((32,512),dtype=np.uint8)
     for row, loc in enumerate(host_ids):
@@ -924,36 +921,6 @@ def precompile_sm90():
     )
 
 
-def _essential_partial_rows(rng, slots=513):
-    """Seven selected rows cover page edges and bitmap ranks; other rows are zero.
-
-    Independent NumPy scatter/packbits creates the stock Native control. Empty,
-    partial and overfull masks cover loader bounds beyond the producer's 256-bit
-    contract. Initialization cost scales with selected rows, not backing slots.
-    """
-    import numpy as np
-
-    locations = np.array([0,1,255,256,510,511,512])
-    codes = rng.integers(0,112,(len(locations),256),dtype=np.uint8)
-    mask = np.zeros((len(locations),512),dtype=bool)
-    mask[0,:256] = True
-    mask[1,::2] = True
-    mask[3,:17] = True
-    mask[4,:] = True
-    for row in (5,6):
-        mask[row,rng.choice(512,256,replace=False)] = True
-    payload = np.zeros((slots,256),dtype=np.uint8)
-    words = np.zeros((slots,8),dtype=np.uint64)
-    dense = np.zeros((slots,512),dtype=np.uint8)
-    payload[locations] = codes
-    # MSB-first bit order, then numeric uint64 conversion, independent of host endian.
-    words[locations] = np.packbits(mask,axis=1,bitorder="big").view(">u8").astype(np.uint64)
-    for row,location in enumerate(locations):
-        coords = np.flatnonzero(mask[row])[:256]
-        dense[location,coords] = codes[row,:len(coords)]
-    return payload,words,dense
-
-
 class _CachedPartial:
     """Launch one partition of the exact CPU-built production cubin.
 
@@ -1032,7 +999,15 @@ def test_decode_partial_graph(heads, inner, record_property):
         with torch.cuda.stream(stream):
             banks = []
             for bank in range(2):
-                payload,words,dense = _essential_partial_rows(rng,slots)
+                payload = rng.integers(0, 112, (slots,256), dtype=np.uint8)
+                words = np.zeros((slots,8), dtype=np.uint64)
+                dense = np.zeros((slots,512), dtype=np.uint8)
+                for row in range(slots):
+                    coords = np.sort(rng.choice(512,256,replace=False))
+                    # Independent ascending-coordinate scatter; finite raw codes.
+                    dense[row,coords] = payload[row]
+                    for coord in coords:
+                        words[row,coord//64] |= np.uint64(1) << np.uint64(63-coord%64)
                 q = torch.from_numpy(rng.normal(0,.15,(1,1,heads,512)).astype(np.float32)).to(torch.float8_e4m3fn)
                 ids = np.full((1,1,1,2112),-1,dtype=np.int32)
                 # First partition contains duplicates, invalid and partial rows;
