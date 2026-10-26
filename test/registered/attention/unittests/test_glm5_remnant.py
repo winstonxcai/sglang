@@ -833,6 +833,10 @@ def test_packed_loader_bytes():
     actual = probe(slots)(values,bitmap,torch.from_numpy(host_ids).cuda())
     torch.cuda.synchronize()
     assert np.array_equal(actual.cpu().numpy(), expected)
+    # Do not carry the >2 GiB address probe's cached allocation into graph tools.
+    del actual, values, bitmap
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
 
 
 def _compile_sm90_variant(case: tuple[int, int]) -> list[dict]:
