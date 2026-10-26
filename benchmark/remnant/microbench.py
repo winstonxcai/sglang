@@ -28,6 +28,7 @@ from sgl_kernel import flash_mla
 from sglang.benchmark.remnant.cases import (
     PROTOCOL,
     PREFILL_PROTOCOL,
+    FP4_DECODE_PROTOCOL,
     DecodeCase,
     FP4DecodeCase,
     PrefillReadCase,
@@ -1410,7 +1411,7 @@ def main() -> None:
     can_write = replay_payload is None
     payload = {
         "schema_version": 2,
-        "protocol": "remnant-v41-fp4-decode-v1"
+        "protocol": FP4_DECODE_PROTOCOL
         if is_fp4
         else (PREFILL_PROTOCOL if is_prefill else PROTOCOL),
         "config": vars(args),

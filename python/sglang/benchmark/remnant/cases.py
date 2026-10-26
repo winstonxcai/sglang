@@ -19,6 +19,7 @@ from pathlib import Path
 
 PROTOCOL = "remnant-three-modes-v1"
 PREFILL_PROTOCOL = "remnant-prefill-read-v1"
+FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v2"
 SEED = 20260919
 MODES = ("native", "triton", "kernel")
 DEFAULT_DECODE_BATCHES = (8, 16, 24, 28, 32)
@@ -45,7 +46,9 @@ class DecodeCase:
 
 @dataclass(frozen=True)
 class FP4DecodeCase(DecodeCase):
-    """V4 decode shapes, with explicit V4.1 page and SWA identities."""
+    """Production V4.1 H100 decode geometry with explicit C1/C2 pages."""
+
+    swa_length: int = 128
 
     global_page_size: int = 256
     swa_page_size: int = 128
@@ -57,9 +60,10 @@ class FP4DecodeCase(DecodeCase):
 
 def fp4_decode_cases() -> list[FP4DecodeCase]:
     return [
-        FP4DecodeCase(h, b, 512, swa_length=w, swa_page_size=w)
-        for w in (64, 128)
-        for h in (64, 128)
+        # V4.1 has 64 query heads; SM90 pads smaller TP shards back to 64.
+        # Its 256-token logical pages hold 256 C1 or 128 C2 compressed rows.
+        FP4DecodeCase(64, b, 512, global_page_size=page)
+        for page in (256, 128)
         for b in DEFAULT_DECODE_BATCHES
     ]
 
@@ -500,7 +504,7 @@ def validate_timing(
         records = payload.get("cases", [])
         if (
             payload.get("status") != "passed"
-            or payload.get("protocol") != "remnant-v41-fp4-decode-v1"
+            or payload.get("protocol") != FP4_DECODE_PROTOCOL
             or len(records) != len(definitions)
             or {r["name"] for r in records} != set(definitions)
             or payload.get("config", {}).get("warmup") != 10

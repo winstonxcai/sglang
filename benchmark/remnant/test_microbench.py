@@ -1278,23 +1278,23 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
 
 
 def test_v41_fp4_matrix_and_timing_gate():
-    """All V4 decode shapes survive; missing/invalid timing never qualifies."""
+    """Production V4.1 geometry only; stale or incomplete timing cannot qualify."""
     import copy
     from dataclasses import asdict
 
     args = cases.parser().parse_args(["--suite", "v41-fp4-decode"])
     matrix = cases.selected_cases(args)
-    assert len(matrix) == len({c.name for c in matrix}) == 20
+    assert len(matrix) == len({c.name for c in matrix}) == 10
     assert {(c.heads, c.batch, c.topk_length) for c in matrix} == {
-        (h, b, 512) for h in (64, 128) for b in (8, 16, 24, 28, 32)
+        (64, b, 512) for b in (8, 16, 24, 28, 32)
     }
     assert {(c.swa_length, c.swa_page_size, c.global_page_size) for c in matrix} == {
-        (64, 64, 256),
         (128, 128, 256),
+        (128, 128, 128),
     }
     payload = {
         "status": "passed",
-        "protocol": "remnant-v41-fp4-decode-v1",
+        "protocol": "remnant-v41-fp4-decode-v2",
         "config": vars(args),
         "cases": [],
     }
@@ -1331,6 +1331,9 @@ def test_v41_fp4_matrix_and_timing_gate():
         "bad-sample",
         "wrong-layout",
         "wrong-geometry",
+        "nonproduction-swa",
+        "nonproduction-heads",
+        "old-protocol",
     ):
         broken = copy.deepcopy(payload)
         if fault == "missing-case":
@@ -1341,7 +1344,13 @@ def test_v41_fp4_matrix_and_timing_gate():
             broken["cases"][0]["paths"]["native"]["samples"][0] = float("nan")
         elif fault == "wrong-layout":
             broken["cases"][0]["path_layouts"]["native"]["record_bytes"] = 584
-        else:
+        elif fault == "wrong-geometry":
             broken["cases"][0]["case"]["swa_page_size"] = 64 + 128
+        elif fault == "nonproduction-swa":
+            broken["cases"][0]["case"]["swa_length"] = 64
+        elif fault == "nonproduction-heads":
+            broken["cases"][0]["case"]["heads"] = 128
+        else:
+            broken["protocol"] = "remnant-v41-fp4-decode-v1"
         with pytest.raises((RuntimeError, ValueError)):
             cases.validate_timing(broken, suite="v41-fp4-decode")
