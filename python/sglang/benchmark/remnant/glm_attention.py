@@ -238,6 +238,25 @@ def attention_reference(q, dense, indices, *, device=None):
     return torch.stack(out).unsqueeze(0).to(output_device)
 
 
+def selected_packed_reference(values, bitmaps, selected):
+    """Independent bitmap scatter on the inputs' device; no production unpacker.
+
+    values uint8 [slots,256], bitmaps uint64 [slots,8], selected int32 [Q,K].
+    Returns raw uint8 dense rows and int32 local indices, preserving duplicates.
+    """
+    import torch
+
+    unique, inverse = torch.unique(selected[selected >= 0], return_inverse=True)
+    words = bitmaps.view(torch.int64)[unique.long()]
+    coords = torch.arange(DIM, device=selected.device)
+    keep = ((words[:, coords // 64] >> (63 - coords % 64)) & 1).bool()
+    dense = torch.zeros(len(unique), DIM, dtype=torch.uint8, device=selected.device)
+    dense[keep] = values[unique.long()].flatten()
+    local = torch.full_like(selected, -1)
+    local[selected >= 0] = inverse.to(local.dtype)
+    return dense, local
+
+
 def _hash_tensor(digest, tensor) -> None:
     import torch
 
@@ -429,51 +448,42 @@ class Fixture:
         import torch
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
+        cpu = reference_device == "cpu"
         sample = torch.linspace(
-            0, self.case.queries - 1, min(8, self.case.queries), device="cuda"
+            0, self.case.queries - 1, min(8, self.case.queries),
+            device="cpu" if cpu else "cuda",
         ).long()
         for bank in range(self.banks):
             self.check()
-            selected = self.ids[bank][sample, 0]
             cache = self.packed[bank]
-            # Independently expand only the selected rows with boolean scatter.
-            unique, inverse = torch.unique(selected[selected >= 0], return_inverse=True)
-            words = cache.bitmaps.view(torch.int64)[unique.long()]
-            coords = torch.arange(DIM, device="cuda")
-            keep = ((words[:, coords // 64] >> (63 - coords % 64)) & 1).bool()
-            dense = torch.zeros(len(unique), DIM, dtype=torch.uint8, device="cuda")
-            dense[keep] = cache.values[unique.long()].flatten()
-            local = torch.full_like(selected, -1)
-            local[selected >= 0] = inverse.to(local.dtype)
+            # Focused tools keep ALL reference-only metadata/check operations
+            # on CPU, not just matmuls. Actual attention calls remain on H100.
+            ids = self.ids[bank].cpu() if cpu else self.ids[bank]
+            selected = ids[sample, 0]
+            dense, local = selected_packed_reference(
+                cache.values.cpu() if cpu else cache.values,
+                cache.bitmaps.cpu() if cpu else cache.bitmaps, selected)
+            query = self.q.cpu()[sample] if cpu else self.q[sample]
             native_ref = attention_reference(
-                self.q[sample], self.native[bank], selected, device=reference_device
-            )
-            direct_ref = attention_reference(
-                self.q[sample], dense, local, device=reference_device
-            )
+                query, self.native[bank].cpu() if cpu else self.native[bank],
+                selected, device=reference_device)
+            direct_ref = attention_reference(query, dense, local, device=reference_device)
             for mode, reference in (("native", native_ref), ("direct", direct_ref)):
                 output = self.call(mode, bank)
-                if not bool(torch.isfinite(output).all()):
-                    raise RuntimeError(
-                        f"{self.case.name}/{bank}/{mode}: nonfinite output"
-                    )
-                torch.testing.assert_close(
-                    output[:, sample], reference, atol=ATOL, rtol=RTOL
-                )
+                checked = output.cpu() if cpu else output
+                if not bool(torch.isfinite(checked).all()):
+                    raise RuntimeError(f"{self.case.name}/{bank}/{mode}: nonfinite output")
+                torch.testing.assert_close(checked[:, sample], reference, atol=ATOL, rtol=RTOL)
                 if mode == "direct":
                     stock = tilelang_sparse_fwd(
-                        self.q[sample],
-                        dense.view(torch.float8_e4m3fn).unsqueeze(1),
-                        local.unsqueeze(1),
-                        SCALE,
-                        DIM,
-                    )
+                        query.to("cuda") if cpu else query,
+                        (dense.to("cuda") if cpu else dense).view(torch.float8_e4m3fn).unsqueeze(1),
+                        (local.to("cuda") if cpu else local).unsqueeze(1), SCALE, DIM)
                     torch.testing.assert_close(
-                        output[:, sample], stock, atol=ATOL, rtol=RTOL
-                    )
-                del output
+                        checked[:, sample], stock.cpu() if cpu else stock, atol=ATOL, rtol=RTOL)
+                del output, checked
 
-    def capture(self, *, warmup_calls: int = 10, capture_stream=None) -> None:
+    def capture(self, *, warmup_calls: int = 10, capture_stream=None, reference_device=None) -> None:
         import torch
 
         if warmup_calls < 1:
@@ -514,15 +524,18 @@ class Fixture:
                     f"{self.case.name}/{mode}: graph allocation {graph_bytes} exceeds bounded liveness {bound} or fixture memory cap"
                 )
             self.identity[f"{mode}_graph_bytes"] = graph_bytes
-        self.validate_replay()
+        self.validate_replay(reference_device=reference_device)
 
-    def validate_replay(self) -> None:
+    def validate_replay(self, *, reference_device=None) -> None:
         import torch
 
         for mode in ("direct", "native", "direct", "native"):
             self.graphs[mode].replay()
             expected = self.call(mode, self.banks - 1)
-            torch.testing.assert_close(self.outputs[mode], expected, atol=0, rtol=0)
+            actual = self.outputs[mode]
+            if reference_device == "cpu":
+                actual, expected = actual.cpu(), expected.cpu()
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def time(self) -> dict:
         from sglang.benchmark.remnant.cases import summary

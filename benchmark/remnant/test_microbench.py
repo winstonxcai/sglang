@@ -1522,3 +1522,14 @@ def test_glm_decode_scope_and_weighting():
     assert score["batch_weighted_overhead_percent"] == pytest.approx((.01 + 144*.2)/145*100)
     with pytest.raises(RuntimeError, match="identity"):
         glm.resume_prefix({**payload,"source":{},"seed":glm.SEED,"rounds":30}, {}, "all")
+
+
+def test_glm_selected_packed_reference_preserves_bytes_and_duplicates():
+    torch = pytest.importorskip("torch")
+    values = torch.arange(256, dtype=torch.uint8).repeat(2,1)
+    words = torch.tensor([[2**64-1]*4+[0]*4, [0]*4+[2**64-1]*4],dtype=torch.uint64)
+    ids = torch.tensor([[1,-1,0,1]],dtype=torch.int32)
+    dense, local = glm.selected_packed_reference(values, words, ids)
+    assert local.tolist() == [[1,-1,0,1]]
+    assert torch.equal(dense[0,:256],values[0]) and not dense[0,256:].any()
+    assert torch.equal(dense[1,256:],values[1]) and not dense[1,:256].any()

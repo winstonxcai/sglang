@@ -705,11 +705,12 @@ def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10, reference_d
                                    atol=0.02, rtol=0.02)
     f.validate(reference_device=reference_device)
     f.capture(warmup_calls=warmup_calls,
-              capture_stream=torch.cuda.current_stream() if phase == "decode" else None)
+              capture_stream=torch.cuda.current_stream() if phase == "decode" else None,
+              reference_device=reference_device)
     f.q.normal_()
     for ids in f.ids:
         ids[1] = -1
-    f.validate_replay()
+    f.validate_replay(reference_device=reference_device)
     f.validate(reference_device=reference_device)
     assert f.identity['native_graph_bytes'] > 0
     assert f.identity['direct_graph_bytes'] > 0
