@@ -19,6 +19,7 @@ from pathlib import Path
 
 PROTOCOL = "remnant-three-modes-v1"
 PREFILL_PROTOCOL = "remnant-prefill-read-v1"
+FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v3"
 SEED = 20260919
 MODES = ("native", "triton", "kernel")
 DEFAULT_DECODE_BATCHES = (8, 16, 24, 28, 32)
@@ -41,6 +42,30 @@ class DecodeCase:
     @property
     def name(self) -> str:
         return f"h{self.heads}_b{self.batch}_k{self.topk_length}"
+
+
+@dataclass(frozen=True)
+class FP4DecodeCase(DecodeCase):
+    """Production V4.1 H100 decode geometry with explicit C1/C2 pages."""
+
+    swa_length: int = 128
+
+    global_page_size: int = 256
+    swa_page_size: int = 256
+
+    @property
+    def name(self) -> str:
+        return f"v41_{super().name}_swa{self.swa_length}_p{self.swa_page_size}_g{self.global_page_size}"
+
+
+def fp4_decode_cases() -> list[FP4DecodeCase]:
+    return [
+        # V4.1 has 64 query heads; SM90 pads smaller TP shards back to 64.
+        # Its 256-token logical pages hold 256 C1 or 128 C2 compressed rows.
+        FP4DecodeCase(64, b, 512, global_page_size=page)
+        for page in (256, 128)
+        for b in DEFAULT_DECODE_BATCHES
+    ]
 
 
 @dataclass(frozen=True)
@@ -340,7 +365,9 @@ def write_results(payload: dict, base: Path) -> None:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--suite", choices=("all", "decode", "store", "prefill-read"), default="all"
+        "--suite",
+        choices=("all", "decode", "store", "prefill-read", "v41-fp4-decode"),
+        default="all",
     )
     p.add_argument("--modes", help="Default: all modes at 256, native,triton otherwise")
     p.add_argument(
@@ -350,7 +377,7 @@ def parser() -> argparse.ArgumentParser:
         default=256,
         help="Retained coordinates per C4 record; independent of --topk-lengths",
     )
-    p.add_argument("--heads", default="64,128")
+    p.add_argument("--heads", help="Default: 64 for V4.1 FP4, 64,128 otherwise")
     p.add_argument("--batches", default=",".join(map(str, DEFAULT_DECODE_BATCHES)))
     p.add_argument("--topk-lengths", default="512")
     p.add_argument("--histories", default="143360")
@@ -400,7 +427,9 @@ def selected_cases(args) -> list:
     modes = benchmark_modes(args.keep_count, args.modes)
     if args.profile_mode and args.profile_mode not in modes:
         raise ValueError("--profile-mode must be included in the supported --modes")
-    h = positive_ints(args.heads, "--heads")
+    h = positive_ints(
+        args.heads or ("64" if args.suite == "v41-fp4-decode" else "64,128"), "--heads"
+    )
     b = positive_ints(args.batches, "--batches")
     k = positive_ints(args.topk_lengths, "--topk-lengths", 512)
     cases = []
@@ -416,6 +445,17 @@ def selected_cases(args) -> list:
             tuple(positive_ints(args.histories, "--histories")),
             tuple(positive_ints(args.query_chunks, "--query-chunks")),
         )
+    if args.suite == "v41-fp4-decode":
+        if args.modes not in (None, "native,kernel") or args.keep_count != 256:
+            raise ValueError("V4.1 FP4 compares dense Native and Packed Direct keep256")
+        if args.profile_mode or args.profile_path:
+            raise ValueError("V4.1 FP4 profiling is deferred")
+        if h != [64] or tuple(b) != DEFAULT_DECODE_BATCHES or k != [512]:
+            raise ValueError(
+                "V4.1 FP4 requires --heads 64, --batches 8,16,24,28,32 and --topk-lengths 512; "
+                "use --case to select a subset"
+            )
+        cases = fp4_decode_cases()
     if args.case:
         requested = args.case.split(",")
         if len(set(requested)) != len(requested) or set(requested) - {
@@ -466,6 +506,49 @@ def validate_timing(
     prefill_reader: str = "split",
 ) -> None:
     """Require the full default matrix and all measured rounds before promotion."""
+    if suite == "v41-fp4-decode":
+        definitions = {c.name: asdict(c) for c in fp4_decode_cases()}
+        records = payload.get("cases", [])
+        if (
+            payload.get("status") != "passed"
+            or payload.get("protocol") != FP4_DECODE_PROTOCOL
+            or len(records) != len(definitions)
+            or {r["name"] for r in records} != set(definitions)
+            or payload.get("config", {}).get("warmup") != 10
+            or payload["config"].get("rounds") != 30
+            or payload["config"].get("repeats") != 100
+        ):
+            raise RuntimeError("Incomplete V4.1 FP4 timing matrix/protocol")
+        for record in records:
+            if (
+                not record.get("valid")
+                or record.get("case") != definitions[record["name"]]
+                or record.get("execution") != "cuda_graph"
+                or record.get("repeats") != 100
+                or set(record.get("paths", {})) != {"native", "kernel"}
+                or not re.fullmatch(
+                    r"[a-f0-9]{64}", record.get("common_inputs_sha256", "")
+                )
+                or record.get("path_layouts")
+                != {
+                    "native": {
+                        "implementation": "Native FP4 Direct",
+                        "record_bytes": 288,
+                        "packed_keep_count": 512,
+                    },
+                    "kernel": {
+                        "implementation": "Packed FP4 Direct",
+                        "record_bytes": 224,
+                        "packed_keep_count": 256,
+                    },
+                }
+            ):
+                raise RuntimeError(f"Invalid V4.1 FP4 case: {record['name']}")
+            for path in record["paths"].values():
+                if len(path.get("samples", [])) != 30:
+                    raise RuntimeError(f"Missing FP4 rounds: {record['name']}")
+                summary(path["samples"])
+        return
     if suite not in ("all", "prefill-read"):
         raise ValueError(f"unsupported timing judge suite: {suite}")
     if prefill_reader not in ("split", "fused") or (

@@ -5,8 +5,6 @@ Author: Winston Cai.
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-
 import enum
 import functools
 import logging
@@ -55,6 +53,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -115,6 +114,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_model,
     get_parallel,
     get_platform,
     get_spec,
@@ -1208,7 +1208,17 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
-        if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+        # Author: Winston Cai. Freeze debug/CLI precedence before any cache reader
+        # is selected; later attention calls never reinterpret the environment.
+        self._q8kv8_sparse_prefill = use_dsv4_q8kv8_sparse_prefill(
+            self.dsv4_prefill_backend
+        )
+        if (
+            self._q8kv8_sparse_prefill
+            and get_model().dsv41_main_kv_cache_format != "auto"
+        ):
+            raise ValueError("Explicit V4.1 FP4 requires BF16 sparse prefill")
+        if self._q8kv8_sparse_prefill:
             if not get_platform().is_sm90:
                 raise ValueError(
                     "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
@@ -1264,7 +1274,7 @@ class DeepseekV4AttnBackend(
                 )
             if self.token_to_kv_pool.request_window is not None:
                 raise RuntimeError("Packed does not support encoder SWA bounded replay")
-            if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+            if self._q8kv8_sparse_prefill:
                 raise RuntimeError("Packed currently requires BF16 sparse prefill")
             if self.token_to_kv_pool._unified_kv:
                 raise RuntimeError("packed is incompatible with unified KV")
@@ -3438,7 +3448,7 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-        if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
+        if pool.get_extra_key_layout(layer.layer_id).is_fp4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
             # rounds once, with no fake quantization in between.
             pool.set_extra_key_buffer_fused(
@@ -3806,7 +3816,7 @@ class DeepseekV4AttnBackend(
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
-                if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+                if self._q8kv8_sparse_prefill:
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
                         layer_id=layer_id,
@@ -3902,7 +3912,28 @@ class DeepseekV4AttnBackend(
                 )
                 extra_indices = extra_indices.unsqueeze(1)
 
-            if get_platform().is_sm120:
+            if (
+                compress_ratio in (1, 2)
+                and token_to_kv_pool.get_extra_key_layout(layer_id).is_fp4
+                and get_platform().is_sm90
+            ):
+                from sgl_kernel.flash_mla import flash_mla_with_fp4_kvcache
+
+                attention_result = flash_mla_with_fp4_kvcache(
+                    q,
+                    swa_k_cache,
+                    swa_page_indices,
+                    extra_k_cache,
+                    extra_indices,
+                    packed=token_to_kv_pool.get_extra_key_layout(layer_id)
+                    is KVLayout.V41_FP4_REMNANT,
+                    topk_length=swa_topk_lengths,
+                    extra_topk_length=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                    softmax_scale=self.softmax_scale,
+                )
+                o = attention_result[0]
+            elif get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
@@ -4005,6 +4036,14 @@ class DeepseekV4AttnBackend(
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
+        elif (
+            get_platform().is_sm90 and get_model().dsv41_main_kv_cache_format != "auto"
+        ):
+            # Author: Winston Cai. All explicit-FP4 layers, including C0/SWA,
+            # share the role-divergent prefill synchronization specialization.
+            from sgl_kernel.flash_mla import (
+                flash_mla_fp4_sparse_fwd as flash_mla_sparse_fwd,
+            )
         else:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 

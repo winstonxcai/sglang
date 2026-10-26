@@ -10,8 +10,6 @@ from available GPU memory using a unified coeff+bias model:
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -19,6 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
@@ -1361,7 +1360,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
         compress state is priced per SWA slot (c4) or as fixed bytes (c128, ratio 2)."""
         if ratio in (1, 2):
-            return (self.kv_bytes + self.low_ratio_index_bytes) / ratio
+            return (
+                self._get_paged_kv_bytes_per_token(ratio) + self.low_ratio_index_bytes
+            ) / ratio
         if ratio == 4:
             c4_frac = 1 / (4 * self.c4_shrink_factor)
             return (
@@ -1442,6 +1443,33 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.disaggregation_mode == "decode":
             return max_running_requests + self.disaggregation_decode_extra_slots + 1
         return max_running_requests + 1
+
+    def _get_v41_reserved_page_bytes(self) -> int:
+        """Physical dummy rows in the explicit SM90 FP4 pools.
+
+        Full tokens are aligned to the global page. Main KV pools reserve one
+        *global* page of compressed slots. Index pools reserve the compressed
+        full-page prefix plus their own physical page. SWA reserves its own
+        logical page. Workspaces/activations are budgeted by the caller.
+        """
+        if get_model().dsv41_main_kv_cache_format == "auto":
+            return 0
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
+
+        swa_page = get_schedule().page_size
+        total = swa_page * self._get_paged_kv_bytes_per_token() * self.num_layers_total
+        for ratio in (1, 2):
+            layers = self.num_layers(ratio)
+            total += layers * self.page_size * self._get_paged_kv_bytes_per_token(ratio)
+            index_rows = (
+                ceil_div(
+                    self.page_size // ratio + DSV41_INDEX_PAGE_SIZE,
+                    DSV41_INDEX_PAGE_SIZE,
+                )
+                * DSV41_INDEX_PAGE_SIZE
+            )
+            total += layers * index_rows * self.low_ratio_index_bytes
+        return int(total)
 
     def _get_c128_state_fixed_bytes(self, max_running_requests: int) -> int:
         num_layers = self.num_layers(128)
@@ -1600,6 +1628,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + swa_fixed_bytes
             + swa_ring_fixed_bytes
             + c4_state_fixed_bytes
+            + self._get_v41_reserved_page_bytes()
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)

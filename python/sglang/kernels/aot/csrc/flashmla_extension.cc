@@ -20,6 +20,16 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
+// Author: Winston Cai. Separate BF16 prefill entry for explicit FP4 modes.
+std::vector<at::Tensor> fp4_sparse_prefill_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length);
+
 // FlashMLA exposes these two entry points only from csrc/api/*.cpp (its own pybind layer lives
 // behind FLASH_MLA_LIBTORCH_ONLY), so declare them here the way csrc/python_api.cpp does.
 std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> dense_attn_decode_interface(
@@ -176,7 +186,42 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       static_cast<float>(sm_scale));
 }
 
+// Author: Winston Cai. Separate opt-in FP4 Direct op.
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_fp4_interface(
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const std::optional<at::Tensor>&,
+    const std::optional<at::Tensor>&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const std::optional<at::Tensor>&,
+    bool,
+    float);
+
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_fp4_sparse_decode_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& lengths,
+    const std::optional<at::Tensor>& sink,
+    const at::Tensor& extra,
+    const at::Tensor& extra_indices,
+    const std::optional<at::Tensor>& extra_lengths,
+    bool packed,
+    double scale) {
+  return sparse_attn_decode_fp4_interface(
+      q, kv, indices, lengths, sink, extra, extra_indices, extra_lengths, packed, static_cast<float>(scale));
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def(
+      "fp4_sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, Tensor "
+      "extra_kv, Tensor extra_indices, Tensor? extra_topk_length, bool packed, float sm_scale) -> (Tensor, Tensor, "
+      "Tensor?, Tensor?)");
+  m.impl("fp4_sparse_decode_fwd", torch::kCUDA, &sgl_fp4_sparse_decode_fwd);
   /*
    * From FlashMLA
    */
@@ -237,6 +282,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink=None, "
       "Tensor? topk_length=None) -> Tensor[]");
   m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
+  m.def(
+      "fp4_sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink=None, "
+      "Tensor? topk_length=None) -> Tensor[]");
+  m.impl("fp4_sparse_prefill_fwd", torch::kCUDA, &fp4_sparse_prefill_fwd);
 
   m.def(
       "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

@@ -4,6 +4,7 @@ Author: Winston Cai.
 """
 
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -222,6 +223,7 @@ def configure_from_args(
     publish: bool = True,
 ) -> None:
     """Publish startup geometry atomically, including in spawned workers."""
+    validate_v41_cache_args(args)
     configure_cache_format(
         getattr(args, "dsv4_c4_cache_format", "native"),
         getattr(args, "dsv4_c4_cache_implementation", "kernel"),
@@ -284,3 +286,89 @@ def validate_packed_static_config() -> None:
             raise RuntimeError(
                 "non-256 Packed counts require Triton storage and reconstruction"
             )
+
+
+def resolve_dsv4_prefill_backend(backend: str = "auto") -> str:
+    """Resolve CLI/debug precedence once; callers retain the effective policy.
+
+    Author: Winston Cai. Kept free of CUDA/Triton imports for startup checks.
+    """
+    if backend not in ("auto", "flashmla_sparse", "flashmla_sparse_q8"):
+        raise ValueError(f"Unsupported DeepSeek V4 prefill backend: {backend!r}")
+    override = os.getenv("SGLANG_DSV4_Q8KV8_PREFILL")
+    q8 = (
+        override.lower() in {"1", "true", "yes", "on"}
+        if override is not None
+        else backend == "flashmla_sparse_q8"
+    )
+    return "flashmla_sparse_q8" if q8 else "flashmla_sparse"
+
+
+def validate_v41_cache_args(args: Any) -> None:
+    """Validate opt-in FP4 independently of V4 C4 dispatch publication."""
+    mode = getattr(args, "dsv41_main_kv_cache_format", "auto")
+    if mode not in ("auto", "fp4", "remnant"):
+        raise ValueError("dsv41_main_kv_cache_format must be auto, fp4 or remnant")
+    if mode == "auto":
+        return
+    conflicts = []
+    for name, default in (
+        ("dsv4_c4_cache_format", "native"),
+        ("dsv4_c4_cache_keep_count", 256),
+        ("dsv4_c4_cache_layer_keep_counts", None),
+        ("dsv4_c4_cache_implementation", "kernel"),
+        ("dsv4_c4_cache_store_implementation", None),
+    ):
+        if getattr(args, name, default) != default:
+            conflicts.append(name)
+    for name in (
+        "enable_hierarchical_cache",
+        "enable_hisparse",
+        "enable_prefill_cp",
+        "enable_encoder_swa_bounded_replay",
+        "enable_decoder_swa_bounded_replay",
+        "disaggregation_decode_enable_offload_kvcache",
+    ):
+        if getattr(args, name, False):
+            conflicts.append(name)
+    if getattr(args, "disaggregation_mode", "null") not in (None, "null"):
+        conflicts.append("disaggregation_mode")
+    if getattr(args, "speculative_algorithm", None) is not None:
+        conflicts.append("speculative_algorithm")
+    if getattr(args, "cpu_offload_gb", 0) > 0:
+        conflicts.append("cpu_offload_gb")
+    if getattr(args, "dsv4_attn_backend", "auto") not in ("auto", "flashmla"):
+        conflicts.append("dsv4_attn_backend (requires flashmla)")
+    prefill_backend = getattr(args, "dsv4_prefill_backend", "auto")
+    if (
+        prefill_backend not in ("auto", "flashmla_sparse")
+        or resolve_dsv4_prefill_backend(prefill_backend) != "flashmla_sparse"
+    ):
+        conflicts.append(
+            "dsv4_prefill_backend/SGLANG_DSV4_Q8KV8_PREFILL (requires BF16 sparse prefill)"
+        )
+    from sglang.srt.environ import envs
+
+    # The upstream default is v4, even when unset. Only explicit legacy
+    # overrides can conflict with the new mode; auto is neutral.
+    if any(
+        field.is_set() and field.get().lower() != "auto"
+        for field in (
+            envs.SGLANG_DSV4_KV_LAYOUT,
+            envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT,
+        )
+    ):
+        conflicts.append("legacy SGLANG_DSV4_*KV_LAYOUT settings")
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+
+    if is_unified_kv_triton():
+        conflicts.append("unified KV storage")
+    if conflicts:
+        raise ValueError(
+            "--dsv41-main-kv-cache-format "
+            + mode
+            + " is incompatible with "
+            + ", ".join(conflicts)
+        )
