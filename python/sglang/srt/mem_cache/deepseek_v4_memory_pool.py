@@ -5,8 +5,6 @@ Author: Winston Cai.
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-
 import logging
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
@@ -31,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
     fused_k_norm_rope_uniform_fp8,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
@@ -600,9 +599,9 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             kv_layout=kv_layout,
         )
         # The HiSparse transfer kernels hardcode the V4 token layout.
-        assert (
-            self.kv_layout is KVLayout.V4
-        ), f"HiSparse C4 pools support the V4 layout only, got {self.kv_layout}"
+        assert self.kv_layout is KVLayout.V4, (
+            f"HiSparse C4 pools support the V4 layout only, got {self.kv_layout}"
+        )
 
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -1293,9 +1292,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 ),
             )
         elif self._unified_kv:
-            assert (
-                self.kv_layout is KVLayout.V4
-            ), "unified_kv keeps bf16 rows, not a paged FlashMLA layout"
+            assert self.kv_layout is KVLayout.V4, (
+                "unified_kv keeps bf16 rows, not a paged FlashMLA layout"
+            )
             self.swa_kv_pool = None
             swa_ring_size = get_swa_ring_size(
                 self.sliding_window, get_spec().speculative_algorithm is not None
@@ -1625,9 +1624,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio in (1, 2)
         }
         if low_ratio_sources:
-            assert (
-                self.full_size is not None
-            ), "low compress ratios need the full pool size"
+            assert self.full_size is not None, (
+                "low compress ratios need the full pool size"
+            )
             assert not self._unified_kv, "unified_kv has no low compress ratio layout"
 
         if not self._unified_kv:
@@ -1644,9 +1643,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                         )
                     pool_cls = RemnantPackedKVPool
                 elif ratio == 4 and enable_hisparse:
-                    assert (
-                        not self.uniform_fp8
-                    ), "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
+                    assert not self.uniform_fp8, (
+                        "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
+                    )
                     pool_cls = HiSparseC4DevicePool
                 self.kv_pools[ratio] = self._make_kv_pool(
                     size=config.kv_size,
@@ -1902,9 +1901,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers and ratio-2 kv_source layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers and ratio-2 kv_source layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1961,9 +1960,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # One index list addresses every request-state buffer (one per layer), so
         # the request-scoped pools must share a ring layout.
         layout = (pools[0].ratio, pools[0].online, pools[0].ring_size)
-        assert all(
-            (p.ratio, p.online, p.ring_size) == layout for p in pools
-        ), "request-scoped state pools must share one ring layout"
+        assert all((p.ratio, p.online, p.ring_size) == layout for p in pools), (
+            "request-scoped state pools must share one ring layout"
+        )
         return pools[0].transfer_indices(req_pool_idx, seq_len)
 
     def clear_request_scoped_state(self, req_pool_idx: int) -> None:
@@ -2011,9 +2010,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
@@ -2127,9 +2126,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def _indexer_pool(self, compress_ratio: int) -> DeepSeekV4IndexerPool:
         pool = self.index_pools.get(compress_ratio)
-        assert (
-            pool is not None
-        ), f"No indexer pool for compression ratio {compress_ratio}"
+        assert pool is not None, (
+            f"No indexer pool for compression ratio {compress_ratio}"
+        )
         return pool
 
     def get_low_ratio_index_k_dequant(
@@ -2328,9 +2327,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert (
-                compress_kv_pool.kv_layout is KVLayout.V41_FP4
-            ), "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
+            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
+                "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
+            )
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
         )

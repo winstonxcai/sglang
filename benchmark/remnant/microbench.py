@@ -16,18 +16,33 @@ import importlib.metadata
 import json
 import math
 import os
-import random
 import sys
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+# Dispatch before importing DeepSeek/FlashMLA-only dependencies.
+if __name__ == "__main__":
+    import argparse
+
+    family_parser = argparse.ArgumentParser(add_help=False)
+    family_parser.add_argument(
+        "--model-family", choices=("dsv4", "glm53"), default="dsv4"
+    )
+    family, _ = family_parser.parse_known_args()
+    if family.model_family == "glm53":
+        from sglang.benchmark.remnant.glm_attention import main as glm_main
+
+        glm_main()
+        raise SystemExit(0)
+
 import torch
 from sgl_kernel import flash_mla
+
 from sglang.benchmark.remnant.cases import (
-    PROTOCOL,
     PREFILL_PROTOCOL,
+    PROTOCOL,
     DecodeCase,
     PrefillReadCase,
     StoreCase,
@@ -44,19 +59,20 @@ from sglang.benchmark.remnant.cases import (
     verify_profile_replay,
     write_results,
 )
+from sglang.benchmark.remnant.quantization import check_fp8_storage
+from sglang.benchmark.remnant.timing import measure, paired_samples
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
 )
-from sglang.benchmark.remnant.quantization import check_fp8_storage
 from sglang.srt import remnant
 from sglang.srt.remnant.packed import (
     NativeWorkspace,
     PackedBuffers,
     pack_rows,
     pack_rows_fused,
-    unpack_gather_native,
     unpack_gather_bf16,
+    unpack_gather_native,
 )
 from sglang.srt.remnant.reference import (
     _ue8m0_quantize,
@@ -400,9 +416,9 @@ def decode_operations(
         buffers = tuple(t.flatten(0, 1)[:rows] for t in cache)
         mask = topmag_keep_mask(x, keep_count / 512)
         expected = pack_rows_ref(x, mask, weight, EPS, keep_count=keep_count)
-        assert torch.equal(
-            buffers[1], expected[1]
-        ), f"{case.name}/{mode}: selection differs"
+        assert torch.equal(buffers[1], expected[1]), (
+            f"{case.name}/{mode}: selection differs"
+        )
         decoded = unpack_rows_ref(*buffers)
         check_fp8_storage(
             decoded, buffers[2], x, weight, EPS, case.name + "/" + mode, mask
@@ -803,9 +819,9 @@ def prefill_read_operations(
             )
             mask = topmag_keep_mask(x, keep_count / 512)
             expected = pack_rows_ref(x, mask, weight, EPS, keep_count=keep_count)
-            assert torch.equal(
-                actual[1], expected[1]
-            ), f"{case.name}/{label}: selection differs"
+            assert torch.equal(actual[1], expected[1]), (
+                f"{case.name}/{label}: selection differs"
+            )
             decoded = unpack_rows_ref(*actual)
             check_fp8_storage(
                 decoded, actual[2], x, weight, EPS, case.name + "/" + label, mask
@@ -1034,18 +1050,6 @@ def capture(op: Operation, warmup: int) -> tuple[torch.cuda.CUDAGraph, object]:
     return graph, output
 
 
-def measure(call: Callable, repeats: int) -> float:
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
-    )
-    start.record()
-    for _ in range(repeats):
-        call()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / repeats
-
-
 def time_case(case, operations: list[Operation], args) -> dict:
     graph_mode = isinstance(case, DecodeCase) or case.phase == "decode"
     repeats = args.repeats if graph_mode else args.prefill_repeats
@@ -1061,16 +1065,15 @@ def time_case(case, operations: list[Operation], args) -> dict:
             for _ in range(args.warmup):
                 op.call()
             calls[op.key] = op.call
-    samples = {op.key: [] for op in operations}
     by_key = {op.key: op for op in operations}
-    rng = random.Random(case_seed(case, args.seed))
-    for _ in range(args.rounds):
-        order = list(samples)
-        rng.shuffle(order)
-        for key in order:
-            op = by_key[key]
-            configure(op.mode, op.keep_count)
-            samples[key].append(measure(calls[key], repeats))
+    samples, _ = paired_samples(
+        calls,
+        args.rounds,
+        case_seed(case, args.seed),
+        repeats,
+        before=lambda key: configure(by_key[key].mode, by_key[key].keep_count),
+        sample=measure,
+    )
     for op in operations:
         op.validate()
     return {
@@ -1354,7 +1357,7 @@ def main() -> None:
         payload["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         if can_write:
             write_results(payload, base)
-    print(f'json_output={base.with_suffix(".json")}')
+    print(f"json_output={base.with_suffix('.json')}")
 
 
 if __name__ == "__main__":

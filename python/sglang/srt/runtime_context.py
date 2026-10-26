@@ -1024,8 +1024,8 @@ class RuntimeContext:
 
     def set_server_args(self, server_args: ServerArgs) -> None:
         """Replace the raw input and rebuild resolved config bags, clearing override provenance."""
-        from sglang.srt.remnant import config as remnant_config
         from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.remnant import config as remnant_config
 
         dispatch = remnant_config._dispatch_from_args(resolved_view(server_args))
         self.flags.capture.enable_torch_compile = bool(

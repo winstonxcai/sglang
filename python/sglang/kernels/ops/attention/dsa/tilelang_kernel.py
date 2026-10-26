@@ -1,5 +1,7 @@
+# Remnant GLM changes. Author: Winston Cai.
 import functools
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import tilelang
@@ -1087,11 +1089,13 @@ def sparse_mla_fwd_decode_partial_fp8(
     d_tail: int,
     topk: int,
     *,
+    packed: bool = False,
     sm_scale=None,
     block_I=64,
     inner_iter=1,
     threads=256,
 ):
+    assert not packed or (d_v == 512 and d_tail == 0)
     assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
     assert topk % block_I == 0, (
         "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -1134,7 +1138,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     num_pages = T.symbolic("num_pages")
 
     q_fp8_shape = [batch, seq_len, num_heads, d_v + d_tail]
-    kv_fp8_shape = [batch, num_pages, kv_group, dim_quant_fp8]
+    kv_fp8_shape = [batch, num_pages, kv_group, 256 if packed else dim_quant_fp8]
     idx_shape = [batch, seq_len, kv_group, topk]
     partial_o_shape = [batch, seq_len, n_groups, num_heads, d_v]
     partial_lse_shape = [batch, seq_len, n_groups, num_heads]
@@ -1142,10 +1146,22 @@ def sparse_mla_fwd_decode_partial_fp8(
     accum_dtype = T.float32
     dtype_bf16 = T.bfloat16
 
+    # Embed contents, not an include path: helper changes invalidate JIT caches.
+    packed_source = (
+        (
+            Path(__file__).resolve().parents[3]
+            / "jit/include/sgl_kernel/glm_packed_decode.cuh"
+        ).read_text()
+        if packed
+        else ""
+    )
+    assert not packed or (BI == 32 and threads == 128)
+
     @T.prim_func
     def main(
         q_fp8: T.Tensor(q_fp8_shape, fp8_dtype),
         kv_fp8: T.Tensor(kv_fp8_shape, fp8_dtype),
+        bitmap: T.Tensor([num_pages, 8] if packed else [1, 1], T.uint64),
         indices: T.Tensor(idx_shape, T.int32),
         partial_o: T.Tensor(partial_o_shape, dtype_bf16),
         partial_lse: T.Tensor(partial_lse_shape, accum_dtype),
@@ -1177,6 +1193,25 @@ def sparse_mla_fwd_decode_partial_fp8(
                 k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
             s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
             page_idx_shared = T.alloc_shared([BI], T.int32)
+            if packed:
+                T.import_source(packed_source)
+                packed_scratch = T.alloc_shared([32, 272], T.uint8)
+                T.annotate_layout(
+                    {
+                        kv_tile0: T.Layout(
+                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                        ),
+                        kv_tile1: T.Layout(
+                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                        ),
+                        kv_tile2: T.Layout(
+                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                        ),
+                        kv_tile3: T.Layout(
+                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                        ),
+                    }
+                )
 
             mask = T.alloc_fragment([BI], T.bool)
             acc_s = T.alloc_fragment([h_per_block, BI], accum_dtype)
@@ -1222,17 +1257,46 @@ def sparse_mla_fwd_decode_partial_fp8(
 
                 for bi_i in T.Parallel(BI):
                     idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    valid = idx >= 0
-                    page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
+                    valid = (idx >= 0) & (idx < num_pages) if packed else idx >= 0
+                    page_idx_shared[bi_i] = (
+                        idx if packed else T.if_then_else(valid, idx, 0)
+                    )
                     mask[bi_i] = valid
 
-                for bi_i, j in T.Parallel(BI, group_size):
-                    page = page_idx_shared[bi_i]
-                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, j]
-                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, group_size + j]
-                    if num_main_tiles == 4:
-                        kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
-                        kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
+                if packed:
+                    T.sync_threads()
+                    T.evaluate(
+                        T.call_extern(
+                            "int32",
+                            "remnant_glm_expand_tile",
+                            T.access_ptr(
+                                kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256
+                            ),
+                            T.access_ptr(
+                                bitmap, "r", extent=T.Cast("int64", num_pages) * 8
+                            ),
+                            T.access_ptr(page_idx_shared, "r"),
+                            T.access_ptr(packed_scratch, "rw"),
+                            T.access_ptr(kv_tile0, "w"),
+                            T.access_ptr(kv_tile1, "w"),
+                            T.access_ptr(kv_tile2, "w"),
+                            T.access_ptr(kv_tile3, "w"),
+                            T.Cast("int64", num_pages),
+                        )
+                    )
+                    T.sync_threads()
+                else:
+                    for bi_i, j in T.Parallel(BI, group_size):
+                        page = page_idx_shared[bi_i]
+                        kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, j]
+                        kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, group_size + j]
+                        if num_main_tiles == 4:
+                            kv_tile2[bi_i, j] = kv_fp8[
+                                b_i, page, g_i, 2 * group_size + j
+                            ]
+                            kv_tile3[bi_i, j] = kv_fp8[
+                                b_i, page, g_i, 3 * group_size + j
+                            ]
 
                 if has_tail:
                     for bi_i, j in T.Parallel(BI, d_tail):
@@ -1354,7 +1418,7 @@ def sparse_mla_fwd_decode_partial_fp8(
 
             T.copy(sumexp, partial_lse[b_i, s_i, group_i, H0:H1])
 
-    return main
+    return main.with_attr("global_symbol", "glm_packed_partial") if packed else main
 
 
 def tilelang_sparse_fwd(
@@ -1363,6 +1427,8 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    *,
+    packed_bitmap: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1390,6 +1456,7 @@ def tilelang_sparse_fwd(
                 d_v,
                 tail_dim,
                 topk,
+                packed=packed_bitmap is not None,
                 sm_scale=sm_scale,
                 block_I=block_I,
                 inner_iter=inner_iter,
@@ -1412,9 +1479,20 @@ def tilelang_sparse_fwd(
                 inner_iter=inner_iter,
                 threads=threads,
             )
-        partial_o_batched, partial_lse_batched = kernel_partial(
-            q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
-        )
+        if is_fp8_kv:
+            # Native uses an aliased dummy parameter eliminated by specialization.
+            bitmap = (
+                packed_bitmap
+                if packed_bitmap is not None
+                else kv.view(torch.uint64).reshape(-1)[:1].reshape(1, 1)
+            )
+            partial_o_batched, partial_lse_batched = kernel_partial(
+                q.unsqueeze(0), kv.unsqueeze(0), bitmap, indices.unsqueeze(0)
+            )
+        else:
+            partial_o_batched, partial_lse_batched = kernel_partial(
+                q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+            )
         n_groups = ni // inner_iter
         kernel_combine = sparse_mla_fwd_decode_combine(
             num_heads,

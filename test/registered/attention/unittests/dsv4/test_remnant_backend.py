@@ -15,7 +15,10 @@ from sglang.srt.layers.attention import deepseek_v4_backend as module
 from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 from sglang.srt.remnant import NativeWorkspace, capture
 from sglang.srt.remnant.packed import unpack_gather_native
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestRemnantBackend(CustomTestCase):

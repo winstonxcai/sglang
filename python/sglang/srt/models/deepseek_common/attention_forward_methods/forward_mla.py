@@ -1,3 +1,4 @@
+# Remnant GLM changes. Author: Winston Cai.
 from __future__ import annotations
 
 import logging
@@ -299,6 +300,15 @@ class DeepseekMLAForwardMixin:
             return None
         return backend
 
+    # Author: Winston Cai. Pass the original mask directly from selection to store.
+    def _glm_normalize_and_store(self, raw, forward_batch):
+        pool = forward_batch.token_to_kv_pool
+        if getattr(pool, "glm_packed", False):
+            return pool.normalize_and_store_glm(
+                self.layer_id, raw, self.kv_a_layernorm, forward_batch.out_cache_loc
+            )
+        return self.kv_a_layernorm(raw)
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -358,11 +368,11 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
                 with torch.cuda.stream(self.alt_stream):
-                    k_nope = self.kv_a_layernorm(k_nope)
+                    k_nope = self._glm_normalize_and_store(k_nope, forward_batch)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 q = self.q_a_layernorm(q)
-                k_nope = self.kv_a_layernorm(k_nope)
+                k_nope = self._glm_normalize_and_store(k_nope, forward_batch)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -484,7 +494,7 @@ class DeepseekMLAForwardMixin:
                 )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            k_nope = self._glm_normalize_and_store(k_nope, forward_batch).unsqueeze(1)
 
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)

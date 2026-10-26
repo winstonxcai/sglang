@@ -36,7 +36,6 @@ class Model(msgspec.Struct):
 
     _NS_PATH = "model"
 
-
     # ---- derived: computed at publish from the leaves below.
     is_startup_weight_load_overlap = Derived(
         fn="sglang.srt.arg_groups.model_override_base.startup_weight_load_overlap_of",
@@ -53,6 +52,13 @@ class Model(msgspec.Struct):
             aliases=["--model"],
         ),
     ]
+    # Author: Winston Cai. GLM uses raw FP8, without the DeepSeek scale plane.
+    glm5_mla_cache_format: A[
+        str, Arg(help="GLM MLA persistent cache format.", choices=["native", "remnant"])
+    ] = "native"
+    glm5_mla_cache_implementation: A[
+        str, Arg(help="GLM Packed reader.", choices=["adapter", "direct"])
+    ] = "direct"
     dsv4_c4_cache_format: A[
         str,
         Arg(

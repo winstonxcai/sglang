@@ -469,6 +469,7 @@ def test_prefill_timing_preserves_variant_configuration_and_pairing():
         "DecodeCase": cases.DecodeCase,
         "configure": configure,
         "measure": lambda call, repeats: call(),
+        "paired_samples": shared_timing.paired_samples,
         "case_seed": cases.case_seed,
         "random": random,
         "summary": cases.summary,
@@ -541,6 +542,7 @@ def test_prefill_traffic_requires_reads_writes_hits_and_launch_coverage():
 
 def test_native_repage_preserves_values_scales_and_zero_padding():
     import ast
+
     import torch
 
     tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
@@ -1081,6 +1083,7 @@ def test_quantization_reference_accepts_rounding_and_rejects_wrong_codes():
 def test_portable_packed_codec_and_profile_contract(count):
     """Real Torch numerics without importing SGLang's CUDA-only package startup."""
     import importlib
+
     import torch
 
     runtime = load_module(
@@ -1261,17 +1264,476 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
     """Catch required/default ordering with the real upstream Arg and msgspec types."""
     import ast
     from typing import Optional
+
     import msgspec
 
-    args = load_module("_v0522_arg_utils", ROOT / "python/sglang/srt/arg_groups/arg_utils.py")
-    tree = ast.parse((ROOT / "python/sglang/srt/arg_groups/fields/model.py").read_text())
-    model = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Model")
-    model.body = [n for n in model.body if isinstance(n, ast.AnnAssign) and (
-        n.target.id == "model_path" or n.target.id.startswith("dsv4_c4_cache_")
-    )]
+    args = load_module(
+        "_v0522_arg_utils", ROOT / "python/sglang/srt/arg_groups/arg_utils.py"
+    )
+    tree = ast.parse(
+        (ROOT / "python/sglang/srt/arg_groups/fields/model.py").read_text()
+    )
+    model = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Model"
+    )
+    model.body = [
+        n
+        for n in model.body
+        if isinstance(n, ast.AnnAssign)
+        and (n.target.id == "model_path" or n.target.id.startswith("dsv4_c4_cache_"))
+    ]
     namespace = {"msgspec": msgspec, "A": args.A, "Arg": args.Arg, "Optional": Optional}
-    exec(compile(ast.Module([model], type_ignores=[]), "model-fields.py", "exec"), namespace)
+    exec(
+        compile(ast.Module([model], type_ignores=[]), "model-fields.py", "exec"),
+        namespace,
+    )
     record = namespace["Model"](model_path="dummy")
     assert record.dsv4_c4_cache_format == "native"
     assert record.dsv4_c4_cache_keep_count == 256
     assert record.dsv4_c4_cache_store_implementation is None
+
+
+# GLM owns a separate protocol; importing it must not load torch/FlashMLA.
+glm = load_module(
+    "_glm_attention_contract", ROOT / "python/sglang/benchmark/remnant/glm_attention.py"
+)
+shared_timing = load_module(
+    "_remnant_shared_timing", ROOT / "python/sglang/benchmark/remnant/timing.py"
+)
+
+
+def test_glm_matrix_order_and_baseline_identity():
+    matrix = glm.cases()
+    assert len(matrix) == len({c.name for c in matrix}) == 128
+    assert sum(c.phase == "decode" for c in matrix) == 48
+    assert sum(c.phase == "prefill" for c in matrix) == 80
+    assert all(c.heads == 16 for c in matrix[:64])
+    assert all(c.heads == 8 for c in matrix[64:])
+    for heads in (16, 8):
+        subset = [c for c in matrix if c.heads == heads]
+        assert [c.phase for c in subset[:24]] == ["decode"] * 24
+    assert glm.MODES == ("native", "direct")
+
+
+def test_glm_grouped_causal_prefill_and_shared_prefix():
+    import numpy as np
+
+    for phase in (0, 3):
+        for locality in ("independent", "shared"):
+            case = glm.Case("prefill", 16, 8, phase, locality, "warm")
+            ids = glm.logical_selection(case)
+            assert np.array_equal(ids, glm.logical_selection(case))
+            first = glm.HISTORY + (4 if phase == 0 else 3)
+            for q, row in enumerate(ids):
+                groups = row[:2048].reshape(512, 4)
+                assert len(np.unique(groups[:, 0])) == 512
+                assert np.all(groups[:, 0] % 4 == 0)
+                assert np.array_equal(
+                    groups - groups[:, :1], np.tile(np.arange(4), (512, 1))
+                )
+                length = first + q
+                assert np.all(row[row >= 0] < length)
+                tail = length % 4
+                assert np.array_equal(
+                    row[2048 : 2048 + tail], np.arange(length - tail, length)
+                )
+                assert np.all(row[2048 + tail :] == -1)
+            if locality == "shared":
+                assert np.all(ids[:, :2048] == ids[0, :2048])
+            else:
+                assert not np.array_equal(ids[0, :2048], ids[1, :2048])
+
+
+def test_glm_separate_decode_requests_and_page_mapping():
+    import numpy as np
+
+    case = glm.Case("decode", 8, 8, 3, "independent", "warm")
+    logical, physical = glm.logical_selection(case), glm.physical_selection(case)
+    valid = logical >= 0
+    assert np.array_equal(logical[valid] % 256, physical[valid] % 256)
+    assert np.all(physical[valid] >= 256)
+    for q in range(case.queries):
+        selected = physical[q][physical[q] >= 0]
+        assert np.all((selected - 256) // case.request_slots == q)
+    assert np.array_equal(physical, glm.physical_selection(case))
+    assert not np.array_equal(physical, glm.physical_selection(case, 1))
+
+
+def test_glm_rotation_and_call_normalization():
+    assert glm.rotation_count(2048, 50 * 1024**2) == 161
+    assert (161 - 1) * 2048 * 320 <= 2 * 50 * 1024**2 < 161 * 2048 * 320
+    assert glm.cycles_per_sample(1) == 100
+    assert glm.cycles_per_sample(3) == 34
+    assert glm.cycles_per_sample(161) == 1
+    for value in (0, -1):
+        with pytest.raises(ValueError):
+            glm.cycles_per_sample(value)
+        with pytest.raises(ValueError):
+            glm.rotation_count(value, 1024)
+
+
+def test_glm_shared_round_schedule_and_preconditioning():
+    calls, before = [], []
+    values, order = shared_timing.paired_samples(
+        {m: lambda m=m: calls.append(m) for m in glm.MODES},
+        30,
+        123,
+        34,
+        balanced=True,
+        before=before.append,
+        sample=lambda call, repeat: (call(), float(repeat))[1],
+    )
+    assert order.count(["native", "direct"]) == order.count(["direct", "native"]) == 15
+    assert before == calls == [m for row in order for m in row]
+    assert values == {m: [34.0] * 30 for m in glm.MODES}
+    assert shared_timing.round_orders(glm.MODES, 30, 123, balanced=True) == order
+    with pytest.raises(ValueError):
+        shared_timing.round_orders(glm.MODES, 3, 1, balanced=True)
+
+
+def test_glm_cli_rejects_adapter_and_deepseek_options():
+    for argv in (
+        ["--modes", "native,adapter"],
+        ["--keep-count", "256"],
+        ["--native-library", "/tmp/native.so"],
+        ["--suite", "store"],
+        ["--profile-mode", "native"],
+    ):
+        with pytest.raises(SystemExit):
+            glm.parser().parse_args(argv)
+    args = glm.parser().parse_args(
+        ["--model-family", "glm53", "--suite", "glm-attention"]
+    )
+    assert args.modes == "native,direct"
+
+
+def test_glm_entrypoint_dispatches_before_deepseek_imports():
+    source = (ROOT / "benchmark/remnant/microbench.py").read_text()
+    assert source.index("glm_main()") < source.index("from sgl_kernel import flash_mla")
+
+
+def test_glm_rejects_incomplete_timing():
+    with pytest.raises(RuntimeError, match="incomplete"):
+        glm.validate_timing({"protocol": glm.PROTOCOL, "status": "incomplete"})
+    with pytest.raises(RuntimeError, match="128-case"):
+        glm.validate_timing({"protocol": glm.PROTOCOL, "status": "passed", "cases": []})
+
+
+def _glm_complete_timing_payload():
+    from dataclasses import asdict
+
+    records = []
+    for definition in glm.cases():
+        banks = 1 if definition.policy == "warm" else 2
+        records.append(
+            dict(
+                name=definition.name,
+                case=asdict(definition),
+                valid=True,
+                fixture=dict(
+                    banks=banks,
+                    selected_rows_per_bank=[1] * banks,
+                    l2_bytes=200,
+                    projected_bytes=1,
+                    memory_limit_bytes=2,
+                    common_inputs_sha256="0" * 64,
+                ),
+                paths={m: dict(samples=[1.0] * 30) for m in glm.MODES},
+                round_orders=[["native", "direct"], ["direct", "native"]] * 15,
+                execution="cuda_graph",
+                cycles_per_sample=100 // banks,
+                calls_per_sample=100,
+                paired_ratios={"direct_over_native": {"samples": [1.0] * 30}},
+            )
+        )
+    return dict(protocol=glm.PROTOCOL, status="passed", cases=records)
+
+
+def test_glm_full_timing_coverage_rejects_sample_and_cache_corruption():
+    import copy
+
+    payload = _glm_complete_timing_payload()
+    glm.validate_timing(payload)
+    for field, value in [
+        ("calls_per_sample", 99),
+        ("round_orders", [["native", "direct"]] * 30),
+    ]:
+        changed = copy.deepcopy(payload)
+        changed["cases"][0][field] = value
+        with pytest.raises(RuntimeError):
+            glm.validate_timing(changed)
+    changed = copy.deepcopy(payload)
+    changed["cases"][1]["fixture"]["l2_bytes"] = 10000
+    with pytest.raises(RuntimeError, match="cache policy"):
+        glm.validate_timing(changed)
+    changed = copy.deepcopy(payload)
+    changed["cases"][0]["paths"]["direct"]["samples"] = [1.0] * 29
+    with pytest.raises(RuntimeError, match="rounds"):
+        glm.validate_timing(changed)
+
+
+def test_glm_graph_pool_accounting_ignores_global_cache_changes():
+    from types import SimpleNamespace
+
+    pool = (7, 3)
+    graph = SimpleNamespace(pool=lambda: pool)
+    calls = []
+
+    def snapshot(pool_id):
+        calls.append(pool_id)
+        # total_size includes inactive bytes, which also belong to this graph.
+        return [
+            dict(address=4096, total_size=8192, active_size=1024),
+            dict(address=16384, total_size=4096, active_size=0),
+        ]
+
+    # No global memory_reserved query is available: its delta can be negative.
+    cuda = SimpleNamespace(memory_snapshot=snapshot)
+    assert glm.graph_reserved_bytes(cuda, graph) == 12288
+    assert calls == [pool]
+    for segments in (
+        [],
+        [dict(address=1, total_size=0)],
+        [dict(address=1, total_size=2)] * 2,
+    ):
+        cuda.memory_snapshot = lambda pool_id: segments
+        with pytest.raises(RuntimeError, match="Graph pool snapshot"):
+            glm.graph_reserved_bytes(cuda, graph)
+
+
+def test_glm_selected_initialization_covers_real_backing_locations():
+    import numpy as np
+
+    case = glm.Case("prefill", 16, 128, 3, "independent", "warm")
+    ids = glm.physical_selection(case)
+    locations = glm.selected_physical_rows(ids)
+    assert len(locations) == len(set(ids[ids >= 0].tolist()))
+    assert np.all(locations >= glm.PAGE)
+    # Independent expected gather/scatter on shuffled pages and duplicated,
+    # invalid, tail and request-offset positions. Unselected storage stays zero.
+    native = np.zeros((locations.max() + 1, 2), dtype=np.int64)
+    dense = np.arange(len(native) * 2, dtype=np.int64).reshape(-1, 2)
+    native[locations] = dense[locations]
+    np.testing.assert_array_equal(native[ids[ids >= 0]], dense[ids[ids >= 0]])
+    assert not native[0].any()
+    np.testing.assert_array_equal(
+        glm.selected_physical_rows(np.array([-1, 257, 256, 257, -1, 1024])),
+        [256, 257, 1024],
+    )
+
+
+def test_glm_resume_requires_identical_valid_ordered_prefix():
+    import copy
+
+    source = dict(sources={"fixture": "hash"}, compiled_build={"artifact": "hash"})
+    previous = _glm_complete_timing_payload()
+    previous.update(
+        source=source, seed=glm.SEED, rounds=glm.ROUNDS, status="incomplete"
+    )
+    previous["cases"] = previous["cases"][:3] + [dict(valid=False)]
+    accepted = glm.resume_prefix(previous, source)
+    assert len(accepted) == 3
+    assert previous["cases"][-1] == dict(valid=False)  # input retained as evidence
+    for key, value in [("source", {}), ("seed", 0), ("rounds", 29)]:
+        changed = copy.deepcopy(previous)
+        changed[key] = value
+        with pytest.raises(RuntimeError, match="identity"):
+            glm.resume_prefix(changed, source)
+    changed = copy.deepcopy(previous)
+    changed["cases"][1]["valid"] = False
+    with pytest.raises(RuntimeError, match="Incomplete GLM case"):
+        glm.resume_prefix(changed, source)
+    changed = copy.deepcopy(previous)
+    changed["cases"][:2] = changed["cases"][1::-1]
+    with pytest.raises(RuntimeError, match="128-case"):
+        glm.resume_prefix(changed, source)
+    changed = copy.deepcopy(previous)
+    changed["cases"][0]["paths"]["native"]["samples"] = [1.0] * 29
+    with pytest.raises(RuntimeError, match="rounds"):
+        glm.resume_prefix(changed, source)
+
+
+def test_glm_measured_capture_preserves_ten_warmups():
+    import inspect
+
+    assert (
+        inspect.signature(glm.Fixture.capture).parameters["warmup_calls"].default == 10
+    )
+
+
+def test_glm_cpu_oracle_preserves_fp8_rounding_and_empty_rows():
+    import torch
+
+    q = torch.zeros(2, 1, 512, dtype=torch.bfloat16)
+    q[0, 0, 0] = 1.0625  # midpoint: E4M3 RNE rounds to 1.0
+    rows = torch.zeros(2, 512)
+    rows[:, 0] = torch.tensor([1.0, -1.0])
+    codes = rows.to(torch.float8_e4m3fn).view(torch.uint8)
+    ids = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32)
+    expected = torch.zeros(1, 2, 1, 512, dtype=torch.bfloat16)
+    expected[0, 0, 0, 0] = torch.tanh(torch.tensor(glm.SCALE))
+    actual = glm.attention_reference(q, codes, ids, device="cpu")
+    assert actual.device.type == "cpu"
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_glm_decode_scope_and_weighting():
+    assert len(glm.cases("decode")) == 48
+    assert glm.cases("decode") == [c for c in glm.cases() if c.phase == "decode"]
+    assert glm.parser().parse_args(["--phase", "decode"]).phase == "decode"
+    payload = _glm_complete_timing_payload()
+    payload.update(
+        protocol=glm.DECODE_PROTOCOL,
+        phase="decode",
+        cases=[c for c in payload["cases"] if c["case"]["phase"] == "decode"],
+    )
+    glm.validate_timing(payload)
+    with pytest.raises(RuntimeError):
+        glm.validate_timing({**payload, "protocol": glm.PROTOCOL})
+    for c in payload["cases"]:
+        ratio = 1.01 if c["case"]["queries"] == 1 else 1.2
+        c["paired_ratios"]["direct_over_native"].update(
+            samples=[ratio] * 30, mean=ratio
+        )
+    score = glm.weighted_overhead(payload["cases"])
+    assert score["completed_cases"] == 48
+    assert score["batch_weighted_overhead_percent"] == pytest.approx(
+        (0.01 + 144 * 0.2) / 145 * 100
+    )
+    with pytest.raises(RuntimeError, match="identity"):
+        glm.resume_prefix(
+            {**payload, "source": {}, "seed": glm.SEED, "rounds": 30}, {}, "all"
+        )
+
+
+def test_glm_selected_packed_reference_preserves_bytes_and_duplicates():
+    torch = pytest.importorskip("torch")
+    values = torch.arange(256, dtype=torch.uint8).repeat(2, 1)
+    words = torch.tensor(
+        [[2**64 - 1] * 4 + [0] * 4, [0] * 4 + [2**64 - 1] * 4], dtype=torch.uint64
+    )
+    ids = torch.tensor([[1, -1, 0, 1]], dtype=torch.int32)
+    dense, local = glm.selected_packed_reference(values, words, ids)
+    assert local.tolist() == [[1, -1, 0, 1]]
+    assert torch.equal(dense[0, :256], values[0]) and not dense[0, 256:].any()
+    assert torch.equal(dense[1, 256:], values[1]) and not dense[1, :256].any()
+
+
+@pytest.mark.parametrize("mode", ["native", "triton", "kernel"])
+def test_single_mode_benchmark_timing(mode):
+    """Exercise the shared loop through the existing benchmark entry point."""
+    import ast
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    args = cases.parser().parse_args(["--suite", "decode", "--modes", mode])
+    assert cases.benchmark_modes(args.keep_count, args.modes) == (mode,)
+    args.rounds, args.warmup, args.repeats = 2, 0, 1
+    function = next(
+        node
+        for node in ast.parse(
+            (ROOT / "benchmark/remnant/microbench.py").read_text()
+        ).body
+        if isinstance(node, ast.FunctionDef) and node.name == "time_case"
+    )
+    operation = SimpleNamespace(
+        key=mode, mode=mode, keep_count=256, call=lambda: 3.0, validate=Mock()
+    )
+    namespace = dict(
+        Operation=object,
+        DecodeCase=cases.DecodeCase,
+        configure=Mock(),
+        capture=lambda op, warmup: (SimpleNamespace(replay=op.call), None),
+        paired_samples=shared_timing.paired_samples,
+        measure=lambda call, repeats: call(),
+        case_seed=cases.case_seed,
+        summary=cases.summary,
+        paired_ratios=cases.paired_ratios,
+    )
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    result = namespace["time_case"](cases.selected_cases(args)[0], [operation], args)
+    assert result["paths"][mode]["samples"] == [3.0, 3.0]
+    assert operation.validate.call_count == 2
+
+
+def test_balanced_timing_still_requires_two_paths():
+    with pytest.raises(ValueError, match="Balanced"):
+        shared_timing.round_orders(("native",), 30, 1, balanced=True)
+
+
+def test_glm_artifact_metadata_binds_verified_source_binary_and_abi(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    from types import ModuleType
+
+    artifacts = load_module(
+        "_glm_artifact_contract",
+        ROOT / "python/sglang/benchmark/remnant/glm_artifacts.py",
+    )
+    generated = tmp_path / "device_kernel.cu"
+    generated.write_text(
+        "void glm_packed_partial_kernel(uint64_t* bitmap, int* indices, "
+        "uint8_t* kv_fp8, float* partial_lse, float* partial_o, "
+        "uint8_t* q_fp8, int num_pages, int seq_len) {}"
+    )
+    (tmp_path / "host_kernel.cu").write_text("v_int64) = ((int64_t)37248);")
+    cubin = tmp_path / "test.cubin"
+    cubin.write_bytes(b"verified cubin")
+    cache = {
+        str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in (generated, cubin, tmp_path / "host_kernel.cu")
+    }
+    tilelang = ModuleType("tilelang")
+    tilelang.__file__ = str(tmp_path / "tilelang/__init__.py")
+    cuda_cache = ModuleType("tilelang.cache.cuda_binary_cache")
+
+    class Cache:
+        @staticmethod
+        def make_key(**kwargs):
+            assert (
+                kwargs["target_arch"] == "90a" and kwargs["compile_format"] == "cubin"
+            )
+            return "verified-key"
+
+        @staticmethod
+        def get_path(key, suffix):
+            assert (key, suffix) == ("verified-key", "cubin")
+            return str(cubin)
+
+    cuda_cache.CUDABinaryCache = Cache
+    monkeypatch.setitem(sys.modules, "tilelang", tilelang)
+    monkeypatch.setitem(sys.modules, "tilelang.cache.cuda_binary_cache", cuda_cache)
+    variant = dict(heads=8, inner=2, packed=True, source_sha256=cache[str(generated)])
+    manifest = dict(tilelang=[variant], cache_files=cache)
+    artifacts.bind_partial_launch_metadata(manifest)
+    assert variant["cubin_sha256"] == cache[str(cubin)]
+    assert variant["dynamic_shared"] == 37248
+    assert variant["symbol"] == "glm_packed_partial_kernel"
+    assert [p["name"] for p in variant["parameters"]][-2:] == ["num_pages", "seq_len"]
+    cubin.write_bytes(b"tampered cubin")
+    with pytest.raises(RuntimeError, match="Unverified production GLM cubin"):
+        artifacts.bind_partial_launch_metadata(manifest)
+    cubin.write_bytes(b"verified cubin")
+    generated.write_text(generated.read_text().replace("num_pages", "wrong_abi"))
+    variant["source_sha256"] = hashlib.sha256(generated.read_bytes()).hexdigest()
+    cache[str(generated)] = variant["source_sha256"]
+    with pytest.raises(RuntimeError, match="ABI changed"):
+        artifacts.bind_partial_launch_metadata(manifest)
+
+
+def test_glm_cpu_preparation_requires_explicit_cache_paths(monkeypatch):
+    artifacts = load_module(
+        "_glm_artifact_paths", ROOT / "python/sglang/benchmark/remnant/glm_artifacts.py"
+    )
+    for name in (
+        "TRITON_CACHE_DIR",
+        "TILELANG_CACHE_DIR",
+        "REMNANT_GLM_COMPILE_MANIFEST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="requires explicit paths"):
+        artifacts.precompile_sm90()

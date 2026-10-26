@@ -133,14 +133,25 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
 
 std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_remnant_interface(
-    const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    const std::optional<at::Tensor>&, const std::optional<at::Tensor>&,
-    std::optional<at::Tensor>, std::optional<at::Tensor>,
-    const std::optional<at::Tensor>&, const std::optional<at::Tensor>&,
-    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    const at::Tensor&, int, float);
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const std::optional<at::Tensor>&,
+    const std::optional<at::Tensor>&,
+    std::optional<at::Tensor>,
+    std::optional<at::Tensor>,
+    const std::optional<at::Tensor>&,
+    const std::optional<at::Tensor>&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    int,
+    float);
 
-static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_remnant_sparse_decode_fwd(
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_remnant_sparse_decode_fwd(
     const at::Tensor& q,
     const at::Tensor& kv,
     const at::Tensor& indices,
@@ -215,8 +226,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "sparse_decode_fwd_with_wait_cycles(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?, Tensor)");
-  m.impl("sparse_decode_fwd_with_wait_cycles", torch::kCUDA,
-         &sgl_sparse_decode_fwd_with_wait_cycles);
+  m.impl("sparse_decode_fwd_with_wait_cycles", torch::kCUDA, &sgl_sparse_decode_fwd_with_wait_cycles);
 #endif
 
   m.def(

@@ -5,8 +5,8 @@
 // public 328-byte packed ABI and the native MODEL1 page layout unchanged.
 
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -24,8 +24,7 @@ constexpr int kWarpsPerBlock = 4;
 constexpr int kWarpSize = 32;
 
 template <typename index_t>
-__device__ __forceinline__ int64_t load_index(
-    const index_t* data, int64_t offset) {
+__device__ __forceinline__ int64_t load_index(const index_t* data, int64_t offset) {
   return static_cast<int64_t>(data[offset]);
 }
 
@@ -44,16 +43,13 @@ __device__ __forceinline__ float decode_e4m3fn(uint8_t code) {
   return sign ? -value : value;
 }
 
-__device__ __forceinline__ uint8_t load_packed_byte(
-    uint64_t bitmap_word, int prefix, const uint8_t* packed_values,
-    int coordinate) {
+__device__ __forceinline__ uint8_t
+load_packed_byte(uint64_t bitmap_word, int prefix, const uint8_t* packed_values, int coordinate) {
   const int lane = coordinate & 63;
   if ((bitmap_word & (uint64_t{1} << (63 - lane))) == 0) {
     return 0;
   }
-  const int rank = prefix + (lane == 0
-      ? 0
-      : __popcll(bitmap_word >> (64 - lane)));
+  const int rank = prefix + (lane == 0 ? 0 : __popcll(bitmap_word >> (64 - lane)));
   return packed_values[rank];
 }
 
@@ -89,15 +85,12 @@ __global__ void packed_to_native_kernel(
 
   const int64_t output_page = row / page_size;
   const int64_t output_offset = row - output_page * page_size;
-  uint8_t* value_out = native_out + output_page * bytes_per_page
-      + output_offset * kNativeValueBytes;
-  uint8_t* scale_out = native_out + output_page * bytes_per_page
-      + static_cast<int64_t>(page_size) * kNativeValueBytes
-      + output_offset * kNativeScaleBytes;
+  uint8_t* value_out = native_out + output_page * bytes_per_page + output_offset * kNativeValueBytes;
+  uint8_t* scale_out = native_out + output_page * bytes_per_page + static_cast<int64_t>(page_size) * kNativeValueBytes +
+                       output_offset * kNativeScaleBytes;
 
-  const bool valid = rank_in_query < topk && physical >= 0
-      && physical < pool_rows && raw >= 0 && raw < (freq_rows + 3) / 4
-      && raw * int64_t{4} < freq_rows;
+  const bool valid = rank_in_query < topk && physical >= 0 && physical < pool_rows && raw >= 0 &&
+                     raw < (freq_rows + 3) / 4 && raw * int64_t{4} < freq_rows;
   auto* value_words = reinterpret_cast<uint32_t*>(value_out);
   if (!valid) {
     for (int word = lane; word < kNativeValueBytes / 4; word += kWarpSize) {
@@ -122,8 +115,7 @@ __global__ void packed_to_native_kernel(
   if (lane < kBitmapWords) {
     bitmap_shared[warp][lane] = bitmap[lane];
   }
-  values_shared[warp][lane] =
-      reinterpret_cast<const uint64_t*>(packed_values)[lane];
+  values_shared[warp][lane] = reinterpret_cast<const uint64_t*>(packed_values)[lane];
   if (lane < 2) {
     values_shared[warp][kKeptValues / 8 + lane] = 0;
   }
@@ -131,7 +123,7 @@ __global__ void packed_to_native_kernel(
 
   if (lane == 0) {
     int prefix = 0;
-    #pragma unroll
+#pragma unroll
     for (int word = 0; word < kBitmapWords; ++word) {
       prefix_shared[warp][word] = prefix;
       prefix += __popcll(bitmap_shared[warp][word]);
@@ -139,27 +131,23 @@ __global__ void packed_to_native_kernel(
   }
   __syncwarp();
 
-  const uint8_t* staged_values =
-      reinterpret_cast<const uint8_t*>(values_shared[warp]);
+  const uint8_t* staged_values = reinterpret_cast<const uint8_t*>(values_shared[warp]);
   if (lane < kNopeDim / 16) {
-    #pragma unroll
+#pragma unroll
     for (int group = 0; group < 4; ++group) {
       const int word_index = lane * 4 + group;
       const int coordinate = word_index * 4;
       const int bitmap_word = coordinate >> 6;
       const int bit_in_word = coordinate & 63;
       const uint64_t bitmap_word_bits = bitmap_shared[warp][bitmap_word];
-      const int rank = prefix_shared[warp][bitmap_word]
-          + (bit_in_word == 0
-              ? 0
-              : __popcll(bitmap_word_bits >> (64 - bit_in_word)));
+      const int rank =
+          prefix_shared[warp][bitmap_word] + (bit_in_word == 0 ? 0 : __popcll(bitmap_word_bits >> (64 - bit_in_word)));
       uint32_t packed = 0;
       int retained = 0;
-      #pragma unroll
+#pragma unroll
       for (int byte = 0; byte < 4; ++byte) {
         const int bit = bit_in_word + byte;
-        const bool kept = (bitmap_word_bits
-            & (uint64_t{1} << (63 - bit))) != 0;
+        const bool kept = (bitmap_word_bits & (uint64_t{1} << (63 - bit))) != 0;
         uint8_t value = 0;
         if (kept) {
           value = staged_values[rank + retained];
@@ -172,34 +160,28 @@ __global__ void packed_to_native_kernel(
   }
 
   if (lane == 0) {
-    *reinterpret_cast<uint64_t*>(scale_out) =
-        *reinterpret_cast<const uint64_t*>(packed_scales)
-        & 0x00FFFFFFFFFFFFFFull;
+    *reinterpret_cast<uint64_t*>(scale_out) = *reinterpret_cast<const uint64_t*>(packed_scales) & 0x00FFFFFFFFFFFFFFull;
   }
 
   const int64_t frequency = (raw * int64_t{4} * 32 + lane) * 2;
   const float cosine = freq_pairs[frequency];
   const float sine = freq_pairs[frequency + 1];
-  const float scale = ldexpf(
-      1.0f, static_cast<int>(packed_scales[kBitmapWords - 1]) - 127);
+  const float scale = ldexpf(1.0f, static_cast<int>(packed_scales[kBitmapWords - 1]) - 127);
 
   const int coordinate0 = kNopeDim + 2 * lane;
   const int coordinate1 = coordinate0 + 1;
   const int rope_word = kBitmapWords - 1;
   const uint64_t rope_bitmap = bitmap_shared[warp][rope_word];
   const int rope_prefix = prefix_shared[warp][rope_word];
-  float x0 = decode_e4m3fn(load_packed_byte(
-      rope_bitmap, rope_prefix, staged_values, coordinate0));
-  float x1 = decode_e4m3fn(load_packed_byte(
-      rope_bitmap, rope_prefix, staged_values, coordinate1));
+  float x0 = decode_e4m3fn(load_packed_byte(rope_bitmap, rope_prefix, staged_values, coordinate0));
+  float x1 = decode_e4m3fn(load_packed_byte(rope_bitmap, rope_prefix, staged_values, coordinate1));
   x0 *= scale;
   x1 *= scale;
 
   const __nv_bfloat16 y0 = __float2bfloat16_rn(x0 * cosine - x1 * sine);
   const __nv_bfloat16 y1 = __float2bfloat16_rn(x0 * sine + x1 * cosine);
   value_words[kNopeDim / 4 + lane] =
-      static_cast<uint32_t>(__bfloat16_as_ushort(y0))
-      | (static_cast<uint32_t>(__bfloat16_as_ushort(y1)) << 16);
+      static_cast<uint32_t>(__bfloat16_as_ushort(y0)) | (static_cast<uint32_t>(__bfloat16_as_ushort(y1)) << 16);
 }
 
 void check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
@@ -224,12 +206,20 @@ void launch_packed_to_native(
   const dim3 grid((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(values.get_device());
   packed_to_native_kernel<index_t><<<grid, block, 0, stream>>>(
-      values.data_ptr<uint8_t>(), bitmaps.data_ptr<uint64_t>(),
-      scales.data_ptr<uint8_t>(), physical_indices.data_ptr<index_t>(),
-      raw_indices.data_ptr<index_t>(), topk_lengths.data_ptr<index_t>(),
-      freq_pairs.data_ptr<float>(), native_out.data_ptr<uint8_t>(), rows,
-      physical_indices.size(1), values.numel() / kKeptValues,
-      freq_pairs.size(0), static_cast<int>(page_size), bytes_per_page);
+      values.data_ptr<uint8_t>(),
+      bitmaps.data_ptr<uint64_t>(),
+      scales.data_ptr<uint8_t>(),
+      physical_indices.data_ptr<index_t>(),
+      raw_indices.data_ptr<index_t>(),
+      topk_lengths.data_ptr<index_t>(),
+      freq_pairs.data_ptr<float>(),
+      native_out.data_ptr<uint8_t>(),
+      rows,
+      physical_indices.size(1),
+      values.numel() / kKeptValues,
+      freq_pairs.size(0),
+      static_cast<int>(page_size),
+      bytes_per_page);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -259,43 +249,37 @@ void remnant_packed_to_native(
   TORCH_CHECK(scales.scalar_type() == at::kByte, "scales must be uint8");
   TORCH_CHECK(freq_pairs.scalar_type() == at::kFloat, "freq_pairs must be float32");
   TORCH_CHECK(native_out.scalar_type() == at::kByte, "native_out must be uint8");
-  TORCH_CHECK(physical_indices.scalar_type() == raw_indices.scalar_type(),
-              "physical_indices and raw_indices must have the same dtype");
-  TORCH_CHECK(physical_indices.scalar_type() == topk_lengths.scalar_type(),
-              "indices and topk_lengths must have the same dtype");
-  TORCH_CHECK(physical_indices.scalar_type() == at::kInt
-                  || physical_indices.scalar_type() == at::kLong,
-              "indices must be int32 or int64");
+  TORCH_CHECK(
+      physical_indices.scalar_type() == raw_indices.scalar_type(),
+      "physical_indices and raw_indices must have the same dtype");
+  TORCH_CHECK(
+      physical_indices.scalar_type() == topk_lengths.scalar_type(),
+      "indices and topk_lengths must have the same dtype");
+  TORCH_CHECK(
+      physical_indices.scalar_type() == at::kInt || physical_indices.scalar_type() == at::kLong,
+      "indices must be int32 or int64");
   TORCH_CHECK(physical_indices.dim() == 2, "indices must be [batch, topk]");
-  TORCH_CHECK(raw_indices.sizes() == physical_indices.sizes(),
-              "physical_indices and raw_indices must have equal shape");
-  TORCH_CHECK(topk_lengths.numel() >= physical_indices.size(0),
-              "topk_lengths must contain one value per query");
-  TORCH_CHECK(values.numel() % kKeptValues == 0,
-              "values must contain 256 bytes per packed row");
+  TORCH_CHECK(
+      raw_indices.sizes() == physical_indices.sizes(), "physical_indices and raw_indices must have equal shape");
+  TORCH_CHECK(topk_lengths.numel() >= physical_indices.size(0), "topk_lengths must contain one value per query");
+  TORCH_CHECK(values.numel() % kKeptValues == 0, "values must contain 256 bytes per packed row");
   const int64_t pool_rows = values.numel() / kKeptValues;
-  TORCH_CHECK(bitmaps.numel() == pool_rows * kBitmapWords,
-              "bitmaps must contain 8 words per packed row");
-  TORCH_CHECK(scales.numel() == pool_rows * kBitmapWords,
-              "scales must contain 8 bytes per packed row");
-  TORCH_CHECK(freq_pairs.dim() == 3 && freq_pairs.size(1) == 32
-                  && freq_pairs.size(2) == 2,
-              "freq_pairs must have shape [positions, 32, 2]");
-  TORCH_CHECK(page_size > 0 && bytes_per_page >= page_size * 584,
-              "invalid native page geometry");
+  TORCH_CHECK(bitmaps.numel() == pool_rows * kBitmapWords, "bitmaps must contain 8 words per packed row");
+  TORCH_CHECK(scales.numel() == pool_rows * kBitmapWords, "scales must contain 8 bytes per packed row");
+  TORCH_CHECK(
+      freq_pairs.dim() == 3 && freq_pairs.size(1) == 32 && freq_pairs.size(2) == 2,
+      "freq_pairs must have shape [positions, 32, 2]");
+  TORCH_CHECK(page_size > 0 && bytes_per_page >= page_size * 584, "invalid native page geometry");
   const auto device = values.device();
-  TORCH_CHECK(bitmaps.device() == device && scales.device() == device
-                  && physical_indices.device() == device
-                  && raw_indices.device() == device
-                  && topk_lengths.device() == device
-                  && freq_pairs.device() == device
-                  && native_out.device() == device,
-              "all tensors must be on the same CUDA device");
+  TORCH_CHECK(
+      bitmaps.device() == device && scales.device() == device && physical_indices.device() == device &&
+          raw_indices.device() == device && topk_lengths.device() == device && freq_pairs.device() == device &&
+          native_out.device() == device,
+      "all tensors must be on the same CUDA device");
 
   const int64_t rows = physical_indices.numel();
   const int64_t output_pages = (rows + page_size - 1) / page_size;
-  TORCH_CHECK(native_out.numel() >= output_pages * bytes_per_page,
-              "native_out is too small");
+  TORCH_CHECK(native_out.numel() >= output_pages * bytes_per_page, "native_out is too small");
   if (rows == 0) {
     return;
   }
@@ -303,11 +287,27 @@ void remnant_packed_to_native(
   c10::cuda::CUDAGuard device_guard(values.device());
   if (physical_indices.scalar_type() == at::kInt) {
     launch_packed_to_native<int32_t>(
-        values, bitmaps, scales, physical_indices, raw_indices, topk_lengths,
-        freq_pairs, native_out, page_size, bytes_per_page);
+        values,
+        bitmaps,
+        scales,
+        physical_indices,
+        raw_indices,
+        topk_lengths,
+        freq_pairs,
+        native_out,
+        page_size,
+        bytes_per_page);
   } else {
     launch_packed_to_native<int64_t>(
-        values, bitmaps, scales, physical_indices, raw_indices, topk_lengths,
-        freq_pairs, native_out, page_size, bytes_per_page);
+        values,
+        bitmaps,
+        scales,
+        physical_indices,
+        raw_indices,
+        topk_lengths,
+        freq_pairs,
+        native_out,
+        page_size,
+        bytes_per_page);
   }
 }

@@ -1,3 +1,4 @@
+# Remnant GLM changes. Author: Winston Cai.
 from __future__ import annotations
 
 import logging
@@ -2163,7 +2164,9 @@ class DeepseekSparseAttnBackend(
 
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+            if save_kv_cache and not getattr(
+                self.token_to_kv_pool, "glm_packed", False
+            ):
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -2193,7 +2196,11 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = (
+            self.token_to_kv_pool.get_glm_packed_buffer(layer.layer_id)
+            if getattr(self.token_to_kv_pool, "glm_packed", False)
+            else self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        )
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2519,7 +2526,9 @@ class DeepseekSparseAttnBackend(
 
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+            if save_kv_cache and not getattr(
+                self.token_to_kv_pool, "glm_packed", False
+            ):
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -2533,7 +2542,11 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = (
+            self.token_to_kv_pool.get_glm_packed_buffer(layer.layer_id)
+            if getattr(self.token_to_kv_pool, "glm_packed", False)
+            else self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        )
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -3382,7 +3395,14 @@ class DeepseekSparseAttnBackend(
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
         # so mask-pad the tail-extended table to the next complete block.
-        padding = (-page_table_1.shape[-1]) % 64
+        packed = getattr(self.token_to_kv_pool, "glm_packed", False)
+        if packed and page_table_1.shape[-1] > 2112:
+            raise ValueError("GLM Packed history/tails exceed 2112 columns")
+        padding = (
+            (2112 - page_table_1.shape[-1])
+            if packed
+            else (-page_table_1.shape[-1]) % 64
+        )
         if padding:
             page_table_1 = torch.cat(
                 (
@@ -3391,6 +3411,12 @@ class DeepseekSparseAttnBackend(
                 ),
                 dim=-1,
             )
+
+        # Author: Winston Cai. Both prefill and decode retain Native TileLang math.
+        if packed:
+            from sglang.srt.remnant.glm import attention as glm_attention
+
+            return glm_attention(q_all, kv_cache, page_table_1.unsqueeze(1), sm_scale)
 
         return tilelang_sparse_fwd(
             q=q_all,

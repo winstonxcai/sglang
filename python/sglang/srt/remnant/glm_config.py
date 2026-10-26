@@ -1,0 +1,112 @@
+"""GLM raw FP8 Packed contracts; independent of DeepSeek's scaled codec.
+
+Author: Winston Cai.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+LATENT_DIM = 512
+KEEP_COUNT = 256
+BITMAP_WORDS = 8
+ROW_BYTES = 320
+MAX_QUERY_CHUNK = 128
+SELECTION_COLUMNS = 2112
+
+
+def enabled() -> bool:
+    from sglang.srt.runtime_context import get_model
+
+    return get_model().glm5_mla_cache_format == "remnant"
+
+
+def validate(args: Any, hf_config: Any) -> None:
+    if args.glm5_mla_cache_format == "native":
+        return
+    text = getattr(hf_config, "text_config", hf_config)
+    if getattr(text, "model_type", None) != "glm5_next_text":
+        raise ValueError("GLM Packed requires GLM-5.3-Flash text configuration")
+    if (
+        getattr(text, "kv_lora_rank", None),
+        getattr(text, "qk_rope_head_dim", None),
+    ) != (512, 0):
+        raise ValueError("GLM Packed requires latent dimension 512 and no RoPE tail")
+    geometry = {
+        "qk_nope_head_dim": 256,
+        "v_head_dim": 256,
+        "index_topk": 2048,
+        "index_kpool": 4,
+        "index_head_dim": 128,
+        "num_hidden_layers": 45,
+        "num_attention_heads": 64,
+        "index_kpool_compress": True,
+        "index_kpool_always_select_tail": True,
+    }
+    mismatched = [
+        f"{name}={getattr(text, name, None)!r} (expected {value!r})"
+        for name, value in geometry.items()
+        if getattr(text, name, None) != value
+    ]
+    if mismatched:
+        raise ValueError("GLM Packed unqualified geometry: " + ", ".join(mismatched))
+    unsupported = []
+    if (
+        getattr(args, "tp_size", 1) not in (1, 2, 4, 8)
+        or getattr(args, "pp_size", 1) != 1
+    ):
+        unsupported.append("requires TP1/2/4/8 and PP1")
+    if hasattr(hf_config, "vision_config") and not getattr(
+        args, "language_model_only", False
+    ):
+        unsupported.append(
+            "multimodal GLM configuration requires --language-model-only"
+        )
+    for name in (
+        "enable_two_batch_overlap",
+        "enable_kv_cache_sharding",
+        "enable_hisparse",
+        "enable_hierarchical_cache",
+        "enable_unified_memory",
+        "enable_page_major_kv_layout",
+        "enable_unified_cache_external_linker",
+        "disaggregation_decode_enable_offload_kvcache",
+        "enable_multimodal",
+        "enable_prefill_cp",
+        "enable_cp_decode_attn_tp",
+        "enable_dp_attention",
+        "enable_dsa_prefill_context_parallel",
+        "enable_dsa_decode_context_parallel",
+        "disable_cuda_graph_padding",
+    ):
+        if getattr(args, name, False):
+            unsupported.append(name)
+    for name in ("speculative_algorithm", "disaggregation_mode"):
+        if getattr(args, name, None) not in (None, "null", "none"):
+            unsupported.append(name)
+    if getattr(args, "cpu_offload_gb", 0) > 0:
+        unsupported.append("cpu_offload_gb")
+    for name in ("attn_dcp_size", "attn_cp_size", "dcp_size", "cp_size"):
+        if getattr(args, name, 1) != 1:
+            unsupported.append(name)
+    if getattr(args, "kv_cache_dtype", None) != "fp8_e4m3":
+        unsupported.append("kv_cache_dtype must be fp8_e4m3")
+    # These are the resolved outer dispatch choices. TileLang DSA options alone
+    # do not prevent an explicit FA3/Triton override from selecting dense APIs.
+    for phase in ("prefill", "decode"):
+        backend = getattr(args, f"{phase}_attention_backend", None) or getattr(
+            args, "attention_backend", None
+        )
+        if backend != "dsa":
+            unsupported.append(
+                f"{phase} attention backend must be dsa (got {backend!r})"
+            )
+    for name in ("dsa_prefill_backend", "dsa_decode_backend"):
+        if getattr(args, name, None) != "tilelang":
+            unsupported.append(name + " must be tilelang")
+    if getattr(args, "device", "cuda") != "cuda":
+        unsupported.append("device must be CUDA/SM90")
+    if unsupported:
+        raise ValueError(
+            "GLM Packed unsupported configuration: " + ", ".join(unsupported)
+        )
