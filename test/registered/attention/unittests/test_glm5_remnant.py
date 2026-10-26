@@ -921,6 +921,155 @@ def precompile_sm90():
     )
 
 
+class _CachedPartial:
+    """Launch one partition of the exact CPU-built production cubin.
+
+    Restricting the grid does not change the binary, tensor strides, barriers or
+    arithmetic. It removes 32/65 empty CTAs and the unchanged combine kernel from
+    sanitizer iteration. All arguments and shared bytes come from verified CPU
+    metadata, never a guessed ABI. CUDA modules outlive their captured graphs.
+    """
+
+    def __init__(self, variant):
+        import ctypes as C
+
+        self.C = C
+        self.driver = C.CDLL("libcuda.so.1")
+        self.module, self.function = C.c_void_p(), C.c_void_p()
+        self.variant = variant
+        path = Path(variant["cubin_path"])
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == variant["cubin_sha256"]
+        self._check(self.driver.cuModuleLoad(C.byref(self.module), str(path).encode()))
+        try:
+            self._check(self.driver.cuModuleGetFunction(C.byref(self.function), self.module,
+                                                       variant["symbol"].encode()))
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _check(status):
+        if status:
+            raise RuntimeError(f"Focused production partial CUDA Driver error: {status}")
+
+    def __call__(self, tensors, *, slots, stream):
+        C = self.C
+        arguments = []
+        for param in self.variant["parameters"]:
+            if param["pointer"]:
+                arguments.append(C.c_void_p(tensors[param["name"]].data_ptr()))
+            else:
+                assert param["type"] == "int"
+                arguments.append(C.c_int(slots if param["name"] == "num_pages" else 1))
+        pointers = (C.c_void_p * len(arguments))(*(C.addressof(x) for x in arguments))
+        self._check(self.driver.cuLaunchKernel(self.function, 1, 1, 1, 128, 1, 1,
+                    self.variant["dynamic_shared"], C.c_void_p(stream.cuda_stream), pointers, None))
+
+    def close(self):
+        if self.module.value:
+            self._check(self.driver.cuModuleUnload(self.module))
+            self.module.value = None
+
+
+@pytest.mark.parametrize("inner", [1, 2])
+@pytest.mark.parametrize("heads", [8, 16])
+def test_decode_partial_graph(heads, inner, record_property):
+    """Essential sanitizer: one exact production CTA, two banks, tails 0..3.
+
+    Fixture creation, reconstruction, finiteness and comparisons run on CPU.
+    The instrumented GPU work is only the changed partial kernel, with stock
+    Native on independently reconstructed Packed rows as its control. The full
+    66/33-partition attention and combine path has a separate uninstrumented gate.
+    """
+    import numpy as np
+
+    compiled = json.loads(Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text())
+    variants = {v["packed"]: v for v in compiled["tilelang"]
+                if v["heads"] == heads and v["inner"] == inner}
+    record_property("decode_geometry", json.dumps(dict(heads=heads, inner=inner,
+        banks=2, queries=1, tails=[0,1,2,3], nondefault_stream=True,
+        launched_partitions=1, binary_partitions=66//inner)))
+    record_property("partial_cubins", json.dumps({str(k): v["cubin_sha256"] for k,v in variants.items()}))
+    slots = 513  # Both sides of 256-token page boundaries.
+    rng = np.random.default_rng(20261024 + heads*10 + inner)
+    owner, stream = torch.cuda.current_stream(), torch.cuda.Stream()
+    stream.wait_stream(owner)
+    kernels, graphs = {}, {}
+    try:
+        with torch.cuda.stream(stream):
+            banks = []
+            for bank in range(2):
+                payload = rng.integers(0, 112, (slots,256), dtype=np.uint8)
+                words = np.zeros((slots,8), dtype=np.uint64)
+                dense = np.zeros((slots,512), dtype=np.uint8)
+                for row in range(slots):
+                    coords = np.sort(rng.choice(512,256,replace=False))
+                    # Independent ascending-coordinate scatter; finite raw codes.
+                    dense[row,coords] = payload[row]
+                    for coord in coords:
+                        words[row,coord//64] |= np.uint64(1) << np.uint64(63-coord%64)
+                q = torch.from_numpy(rng.normal(0,.15,(1,1,heads,512)).astype(np.float32)).to(torch.float8_e4m3fn)
+                ids = np.full((1,1,1,2112),-1,dtype=np.int32)
+                # First partition contains duplicates, invalid and partial rows;
+                # tails occupy its final three entries to reach the changed loader.
+                ids[0,0,0,:32*inner] = np.resize(np.array([0,1,255,256,511,512,-1,slots],np.int32),32*inner)
+                if inner == 2:
+                    ids[0,0,0,:32] = -1  # Empty tile followed by a live tile.
+                ids[0,0,0,32*inner-3:] = -1
+                ids[0,0,0,32*inner-3:32*inner-3+bank] = np.arange(bank)+510
+                common = dict(q_fp8=q.view(torch.uint8).cuda(), indices=torch.from_numpy(ids).cuda(),
+                    partial_o=torch.empty(1,1,66//inner,heads,512,dtype=torch.bfloat16,device="cuda"),
+                    partial_lse=torch.empty(1,1,66//inner,heads,dtype=torch.float32,device="cuda"))
+                native_ids = ids.copy()
+                native_ids[native_ids >= slots] = -1  # Stock Native guards negative IDs only.
+                banks.append({False: dict(common,indices=torch.from_numpy(native_ids).cuda(),kv_fp8=torch.from_numpy(dense).cuda(),
+                                              bitmap=torch.zeros(1,1,dtype=torch.uint64,device="cuda")),
+                              True: dict(common,kv_fp8=torch.from_numpy(payload).cuda(),
+                                             bitmap=torch.from_numpy(words).cuda())})
+            for mode in (False,True):
+                kernels[mode] = _CachedPartial(variants[mode])
+                # Preload the module/function before capture; no lazy compilation.
+                kernels[mode](banks[0][mode],slots=slots,stream=stream)
+            stream.synchronize()
+            for mode in (False,True):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph,stream=stream):
+                    for bank in banks:
+                        kernels[mode](bank[mode],slots=slots,stream=stream)
+                graphs[mode] = graph
+            for phase in range(2):
+                if phase:
+                    for b,bank in enumerate(banks):
+                        new_q = torch.from_numpy(rng.normal(0,.15,(1,1,heads,512)).astype(np.float32)).to(torch.float8_e4m3fn).view(torch.uint8)
+                        new_ids = bank[True]["indices"].cpu()
+                        new_ids[0,0,0,32*inner-3:32*inner] = -1
+                        new_ids[0,0,0,32*inner-3:32*inner-3+2+b] = torch.arange(2+b,dtype=torch.int32)+510
+                        bank[False]["q_fp8"].copy_(new_q)
+                        bank[True]["indices"].copy_(new_ids)
+                        new_ids[new_ids >= slots] = -1
+                        bank[False]["indices"].copy_(new_ids)
+                results = {}
+                # Opposite order after mutation verifies alternating mode ownership.
+                for mode in ((False,True) if not phase else (True,False)):
+                    graphs[mode].replay()
+                    stream.synchronize()
+                    results[mode] = [(bank[mode]["partial_o"][0,0,0].cpu().float(),
+                                      bank[mode]["partial_lse"][0,0,0].cpu()) for bank in banks]
+                for actual,expected in zip(results[True],results[False]):
+                    assert torch.isfinite(actual[0]).all()
+                    assert torch.isfinite(actual[1]).all()
+                    for a,e in zip(actual,expected):
+                        torch.testing.assert_close(a,e,atol=.02,rtol=.02)
+    finally:
+        # Graph nodes retain CUDA function handles. Destroy them before unloading.
+        stream.synchronize()
+        for graph in graphs.values():
+            graph.reset()
+        for kernel in kernels.values():
+            kernel.close()
+        owner.wait_stream(stream)
+
+
 if __name__ == "__main__":
     import sys
 
