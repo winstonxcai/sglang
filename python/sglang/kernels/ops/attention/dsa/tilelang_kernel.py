@@ -1392,7 +1392,7 @@ def sparse_mla_fwd_decode_partial_fp8(
 
             T.copy(sumexp, partial_lse[b_i, s_i, group_i, H0:H1])
 
-    return main
+    return main.with_attr("global_symbol", "glm_packed_partial") if packed else main
 
 
 def tilelang_sparse_fwd(

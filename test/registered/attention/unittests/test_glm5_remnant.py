@@ -796,7 +796,7 @@ def _packed_loader_probe():
                     out[i,j+128] = b[i,j]
                     out[i,j+256] = c[i,j]
                     out[i,j+384] = d[i,j]
-        return main
+        return main.with_attr("global_symbol", "glm_packed_bytes")
 
     return probe
 
