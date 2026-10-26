@@ -736,9 +736,11 @@ def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_pro
 
 @pytest.mark.parametrize("inner", [1, 2])
 @pytest.mark.parametrize("heads", [8, 16])
-def test_decode_bank_graph(heads, inner):
+def test_decode_bank_graph(heads, inner, record_property):
     """Focused decode loader, arithmetic, alternating-bank and changing-input replay."""
     target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
+    record_property("decode_geometry", json.dumps(dict(heads=heads, inner=inner,
+        banks=4, queries=2, tails=[0,1,2,3], nondefault_stream=True)))
     owner = torch.cuda.current_stream()
     stream = torch.cuda.Stream()
     stream.wait_stream(owner)
