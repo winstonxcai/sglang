@@ -740,7 +740,7 @@ def test_decode_bank_graph(heads, inner):
     """Focused decode loader, arithmetic, alternating-bank and changing-input replay."""
     target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
     with patch(target, return_value=inner):
-        identity = _benchmark_bank_graph(heads, 2, 2, warmup_calls=1,
+        identity = _benchmark_bank_graph(heads, 4, 2, warmup_calls=1,
                                         reference_device="cpu", phase="decode")
         assert identity["inner_iter"] == inner
 
@@ -753,7 +753,6 @@ def _packed_loader_probe():
     The large sparse backing tests a real address beyond 2 GiB; only selected
     rows are initialized, and no allocation is made during graph replay.
     """
-    import numpy as np
     import tilelang
     import tilelang.language as T
     source = (Path(__file__).resolve().parents[4] /
@@ -777,7 +776,8 @@ def _packed_loader_probe():
                     c: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4))),
                     d: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4)))})
                 T.evaluate(T.call_extern("int32", "remnant_glm_expand_tile",
-                    T.access_ptr(values,"r"), T.access_ptr(bitmap,"r"), T.access_ptr(ids,"r"),
+                    T.access_ptr(values,"r", extent=T.int64(slots)*256),
+                    T.access_ptr(bitmap,"r", extent=T.int64(slots)*8), T.access_ptr(ids,"r"),
                     T.access_ptr(scratch,"rw"), T.access_ptr(a,"w"), T.access_ptr(b,"w"),
                     T.access_ptr(c,"w"), T.access_ptr(d,"w"), T.int64(slots)))
                 T.sync_threads()
