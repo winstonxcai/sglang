@@ -1,6 +1,7 @@
 # Remnant GLM changes. Author: Winston Cai.
 import functools
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import tilelang
@@ -1145,28 +1146,12 @@ def sparse_mla_fwd_decode_partial_fp8(
     accum_dtype = T.float32
     dtype_bf16 = T.bfloat16
 
-    # Author: Winston Cai. Expand raw codes directly into the existing GEMM tiles.
-    # Coordinate 64*w+lane uses bit 63-lane; compact rank counts preceding bits.
-    @T.macro
-    def load_packed_tile(kv, bitmap, pages, tile, offset):
-        for bi, j in T.Parallel(BI, group_size):
-            page = pages[bi]
-            coord = offset + j
-            word_id = coord // 64
-            lane = coord % 64
-            word = bitmap[page, word_id]
-            rank = T.alloc_var(T.int32)
-            rank = 0
-            for w in T.unroll(8):
-                if w < word_id:
-                    rank += T.call_extern("int32", "__popcll", bitmap[page, w])
-            # Avoid a shift by 64 even when the conditional is vectorized.
-            prefix = T.if_then_else(lane == 0, T.uint64(0), word >> ((64 - lane) % 64))
-            rank += T.call_extern("int32", "__popcll", prefix)
-            if ((word >> (63 - lane)) & T.uint64(1)) != T.uint64(0):
-                tile[bi, j] = kv[0, page, 0, rank]
-            else:
-                tile[bi, j] = 0
+    # Embed contents, not an include path: helper changes invalidate JIT caches.
+    packed_source = (
+        (Path(__file__).resolve().parents[3] / "jit/include/sgl_kernel/glm_packed_decode.cuh").read_text()
+        if packed else ""
+    )
+    assert not packed or (BI == 32 and threads == 128)
 
     @T.prim_func
     def main(
@@ -1204,6 +1189,15 @@ def sparse_mla_fwd_decode_partial_fp8(
                 k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
             s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
             page_idx_shared = T.alloc_shared([BI], T.int32)
+            if packed:
+                T.import_source(packed_source)
+                packed_scratch = T.alloc_shared([32, 272], T.uint8)
+                T.annotate_layout({
+                    kv_tile0: T.Layout([32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))),
+                    kv_tile1: T.Layout([32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))),
+                    kv_tile2: T.Layout([32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))),
+                    kv_tile3: T.Layout([32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))),
+                })
 
             mask = T.alloc_fragment([BI], T.bool)
             acc_s = T.alloc_fragment([h_per_block, BI], accum_dtype)
@@ -1250,14 +1244,21 @@ def sparse_mla_fwd_decode_partial_fp8(
                 for bi_i in T.Parallel(BI):
                     idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
                     valid = (idx >= 0) & (idx < num_pages) if packed else idx >= 0
-                    page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
+                    page_idx_shared[bi_i] = idx if packed else T.if_then_else(valid, idx, 0)
                     mask[bi_i] = valid
 
                 if packed:
-                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile0, 0)
-                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile1, 128)
-                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile2, 256)
-                    load_packed_tile(kv_fp8, bitmap, page_idx_shared, kv_tile3, 384)
+                    T.sync_threads()
+                    T.evaluate(T.call_extern(
+                        "int32", "remnant_glm_expand_tile",
+                        T.access_ptr(kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256),
+                        T.access_ptr(bitmap, "r", extent=T.Cast("int64", num_pages) * 8),
+                        T.access_ptr(page_idx_shared, "r"),
+                        T.access_ptr(packed_scratch, "rw"),
+                        T.access_ptr(kv_tile0, "w"), T.access_ptr(kv_tile1, "w"),
+                        T.access_ptr(kv_tile2, "w"), T.access_ptr(kv_tile3, "w"),
+                        T.Cast("int64", num_pages)))
+                    T.sync_threads()
                 else:
                     for bi_i, j in T.Parallel(BI, group_size):
                         page = page_idx_shared[bi_i]

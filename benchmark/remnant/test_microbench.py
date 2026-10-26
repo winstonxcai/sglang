@@ -1502,3 +1502,23 @@ def test_glm_cpu_oracle_preserves_fp8_rounding_and_empty_rows():
     actual = glm.attention_reference(q, codes, ids, device='cpu')
     assert actual.device.type == 'cpu'
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_glm_decode_scope_and_weighting():
+    assert len(glm.cases("decode")) == 48
+    assert glm.cases("decode") == [c for c in glm.cases() if c.phase == "decode"]
+    assert glm.parser().parse_args(["--phase", "decode"]).phase == "decode"
+    payload = _glm_complete_timing_payload()
+    payload.update(protocol=glm.DECODE_PROTOCOL, phase="decode",
+                   cases=[c for c in payload["cases"] if c["case"]["phase"] == "decode"])
+    glm.validate_timing(payload)
+    with pytest.raises(RuntimeError):
+        glm.validate_timing({**payload, "protocol": glm.PROTOCOL})
+    for c in payload["cases"]:
+        ratio = 1.01 if c["case"]["queries"] == 1 else 1.2
+        c["paired_ratios"]["direct_over_native"].update(samples=[ratio]*30, mean=ratio)
+    score = glm.weighted_overhead(payload["cases"])
+    assert score["completed_cases"] == 48
+    assert score["batch_weighted_overhead_percent"] == pytest.approx((.01 + 144*.2)/145*100)
+    with pytest.raises(RuntimeError, match="identity"):
+        glm.resume_prefix({**payload,"source":{},"seed":glm.SEED,"rounds":30}, {}, "all")

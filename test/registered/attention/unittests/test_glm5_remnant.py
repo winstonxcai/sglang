@@ -671,14 +671,14 @@ def test_benchmark_bank_graph_ownership(heads, banks):
     _benchmark_bank_graph(heads, banks, 128 if heads == 8 else 512)
 
 
-def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10, reference_device=None):
+def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10, reference_device=None, phase="prefill"):
     import time
     from sglang.benchmark.remnant.glm_attention import Fixture, Case
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_inner_iter
 
     raw, norm, cache = fixture()
     f = Fixture.__new__(Fixture)
-    f.case = Case("prefill", heads, queries, 3, "independent", "rotating")
+    f.case = Case(phase, heads, queries, 3, "independent", "rotating")
     f.deadline = time.monotonic() + 1200
     f.banks, f.memory_limit = banks, int(torch.cuda.get_device_properties(0).total_memory * 0.7)
     f.q = torch.randn(queries, heads, 512, dtype=torch.bfloat16, device="cuda")
@@ -732,6 +732,100 @@ def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_pro
                           queries=queries, forced_inner=inner, warmup_calls=1,
                           actual_warmup_calls_per_mode=banks, reference_device="cpu",
                           measured_warmup_calls=10)))
+
+
+@pytest.mark.parametrize("inner", [1, 2])
+@pytest.mark.parametrize("heads", [8, 16])
+def test_decode_bank_graph(heads, inner):
+    """Focused decode loader, arithmetic, alternating-bank and changing-input replay."""
+    target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
+    with patch(target, return_value=inner):
+        identity = _benchmark_bank_graph(heads, 2, 2, warmup_calls=1,
+                                        reference_device="cpu", phase="decode")
+        assert identity["inner_iter"] == inner
+
+
+def _packed_loader_probe():
+    """Invoke the production helper and compare every raw code independently.
+
+    Synthetic masks include >256 survivors, empty words, all fragment/word
+    boundaries, and ranks at the final window. Every FP8 byte pattern occurs.
+    The large sparse backing tests a real address beyond 2 GiB; only selected
+    rows are initialized, and no allocation is made during graph replay.
+    """
+    import numpy as np
+    import tilelang
+    import tilelang.language as T
+    source = (Path(__file__).resolve().parents[4] /
+        "python/sglang/kernels/jit/include/sgl_kernel/glm_packed_decode.cuh").read_text()
+
+    @tilelang.jit(out_idx=[-1])
+    def probe(slots: int):
+        @T.prim_func
+        def main(values: T.Tensor([slots, 256], T.uint8),
+                 bitmap: T.Tensor([slots, 8], T.uint64),
+                 ids: T.Tensor([32], T.int32), out: T.Tensor([32, 512], T.uint8)):
+            with T.Kernel(1, threads=128):
+                T.import_source(source)
+                scratch = T.alloc_shared([32, 272], T.uint8)
+                a = T.alloc_shared([32, 128], T.uint8)
+                b = T.alloc_shared([32, 128], T.uint8)
+                c = T.alloc_shared([32, 128], T.uint8)
+                d = T.alloc_shared([32, 128], T.uint8)
+                T.annotate_layout({a: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4))),
+                    b: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4))),
+                    c: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4))),
+                    d: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4)))})
+                T.evaluate(T.call_extern("int32", "remnant_glm_expand_tile",
+                    T.access_ptr(values,"r"), T.access_ptr(bitmap,"r"), T.access_ptr(ids,"r"),
+                    T.access_ptr(scratch,"rw"), T.access_ptr(a,"w"), T.access_ptr(b,"w"),
+                    T.access_ptr(c,"w"), T.access_ptr(d,"w"), T.int64(slots)))
+                T.sync_threads()
+                for i,j in T.Parallel(32,128):
+                    out[i,j] = a[i,j]
+                    out[i,j+128] = b[i,j]
+                    out[i,j+256] = c[i,j]
+                    out[i,j+384] = d[i,j]
+        return main
+
+    return probe
+
+
+def test_packed_loader_bytes():
+    import numpy as np
+    probe = _packed_loader_probe()
+    # 256 * index crosses signed 32-bit at index 8388608.
+    slots = 8388610
+    values = torch.empty(slots,256,dtype=torch.uint8,device="cuda")
+    bitmap = torch.empty(slots,8,dtype=torch.uint64,device="cuda")
+    host_values = np.tile(np.arange(256,dtype=np.uint8),(16,1))
+    host_words = np.zeros((16,8),dtype=np.uint64)
+    for row in range(16):
+        mask = np.zeros(512,dtype=bool)
+        if row == 0: mask[:256] = True
+        elif row == 1: mask[256:] = True
+        elif row == 2: mask[:] = True
+        elif row == 3: pass
+        else:
+            mask[np.random.default_rng(20261024+row).choice(512,256,replace=False)] = True
+        for w in range(8):
+            host_words[row,w] = sum(int(mask[w*64+j]) << (63-j) for j in range(64))
+    locations = [*range(15), slots-1]
+    for row, loc in enumerate(locations):
+        values[loc].copy_(torch.from_numpy(host_values[row]).cuda())
+        bitmap[loc].copy_(torch.from_numpy(host_words[row]).cuda())
+    host_ids = np.array([*locations, -1, slots, -9, *locations[:13]],dtype=np.int32)
+    expected = np.zeros((32,512),dtype=np.uint8)
+    for row, loc in enumerate(host_ids):
+        if loc not in locations: continue
+        src = locations.index(loc); rank = 0
+        for j in range(512):
+            if int(host_words[src,j//64]) & (1 << (63-j%64)):
+                if rank < 256: expected[row,j] = host_values[src,rank]
+                rank += 1
+    actual = probe(slots)(values,bitmap,torch.from_numpy(host_ids).cuda())
+    torch.cuda.synchronize()
+    assert np.array_equal(actual.cpu().numpy(), expected)
 
 
 def _compile_sm90_variant(case: tuple[int, int]) -> list[dict]:
@@ -797,6 +891,7 @@ def precompile_sm90():
                 [(v["heads"], v["inner"], v["packed"]) for v in variants],
                 flush=True,
             )
+    _packed_loader_probe()(8388610)
     artifacts["cache_files"] = {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()
         for root in (

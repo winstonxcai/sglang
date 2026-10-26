@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 PROTOCOL = "remnant-glm-attention-v1"
+DECODE_PROTOCOL = "remnant-glm-decode-v1"
 MODES = ("native", "direct")
 SEED = 20261024
 HISTORY, PAGE, DIM, KEEP, COLUMNS, GROUPS = 131072, 256, 512, 256, 2112, 512
@@ -53,7 +54,9 @@ class Case:
         return math.ceil((HISTORY + 4 + extension) / PAGE) * PAGE
 
 
-def cases() -> list[Case]:
+def cases(phase_scope: str = "all") -> list[Case]:
+    if phase_scope not in ("all", "decode"):
+        raise ValueError(f"Unsupported GLM phase: {phase_scope}")
     return [
         Case(phase, heads, queries, tail, locality, policy)
         for heads in (16, 8)
@@ -61,6 +64,7 @@ def cases() -> list[Case]:
             ("decode", (1, 8, 16, 24, 32, 64)),
             ("prefill", (128, 512, 1536, 4096, 8192)),
         )
+        if phase_scope == "all" or phase == phase_scope
         for queries in sizes
         for tail in (0, 3)
         for locality in (
@@ -177,6 +181,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-family", choices=("glm53",), default="glm53")
     p.add_argument("--suite", choices=("glm-attention",), default="glm-attention")
+    p.add_argument("--phase", choices=("all", "decode"), default="all")
     p.add_argument("--modes", choices=("native,direct",), default="native,direct")
     p.add_argument(
         "--resume",
@@ -552,6 +557,7 @@ class Fixture:
 def runtime_hashes(root: Path) -> dict[str, str]:
     paths = (
         "kernels/ops/attention/dsa/tilelang_kernel.py",
+        "kernels/jit/include/sgl_kernel/glm_packed_decode.cuh",
         "srt/remnant/glm.py",
         "srt/remnant/glm_pool.py",
         "srt/remnant/reference.py",
@@ -568,7 +574,8 @@ def source_manifest() -> dict:
 
     sources = {
         str(Path(p).resolve()): hashlib.sha256(Path(p).read_bytes()).hexdigest()
-        for p in (__file__, codec.__file__, tile.__file__, timing.__file__)
+        for p in (__file__, codec.__file__, tile.__file__, timing.__file__,
+                  Path(tile.__file__).resolve().parents[3] / "jit/include/sgl_kernel/glm_packed_decode.cuh")
     }
     build_path = os.environ.get("REMNANT_BUILD_MANIFEST_PATH")
     return dict(
@@ -620,17 +627,19 @@ def write_results(payload: dict, base: Path) -> None:
 
 
 def validate_timing(payload: dict, *, prefix: bool = False) -> None:
-    if payload.get("protocol") != PROTOCOL or (
+    phase = payload.get("phase", "all")
+    protocol = DECODE_PROTOCOL if phase == "decode" else PROTOCOL
+    if payload.get("protocol") != protocol or (
         not prefix and payload.get("status") != "passed"
     ):
         raise RuntimeError("GLM timing protocol incomplete")
-    expected = cases()
+    expected = cases(phase)
     if prefix:
         if len(payload["cases"]) > len(expected):
             raise RuntimeError("GLM checkpoint exceeds the required matrix")
         expected = expected[: len(payload["cases"])]
     if [c["name"] for c in payload["cases"]] != [c.name for c in expected]:
-        raise RuntimeError("GLM timing requires the full ordered 128-case matrix")
+        raise RuntimeError(f"GLM timing requires the ordered {len(cases(phase))}-case {phase} matrix")
     for case, definition in zip(payload["cases"], expected):
         if (
             not case.get("valid")
@@ -688,10 +697,11 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             raise RuntimeError(f"Invalid GLM paired ratios {case['name']}")
 
 
-def resume_prefix(previous: dict, source: dict) -> list[dict]:
+def resume_prefix(previous: dict, source: dict, phase: str = "all") -> list[dict]:
     """Reuse only validated cases from an identical fixture/toolchain snapshot."""
     if (
-        previous.get("source") != source
+        previous.get("phase", "all") != phase
+        or previous.get("source") != source
         or previous.get("seed") != SEED
         or previous.get("rounds") != ROUNDS
     ):
@@ -707,14 +717,30 @@ def resume_prefix(previous: dict, source: dict) -> list[dict]:
     return records
 
 
+def weighted_overhead(records: list[dict]) -> dict:
+    """Batch-weighted mean of paired round overheads; other axes equal weight."""
+    def score(rows):
+        weight = sum(c["case"]["queries"] for c in rows)
+        return (100 * sum(c["case"]["queries"] *
+                (sum(c["paired_ratios"]["direct_over_native"]["samples"]) / ROUNDS - 1)
+                for c in rows) / weight) if weight else None
+    rows = [c for c in records if c.get("valid") and c["case"]["phase"] == "decode"]
+    return dict(batch_weighted_overhead_percent=score(rows),
+                by_heads={str(h): score([c for c in rows if c["case"]["heads"] == h])
+                          for h in (16, 8)}, completed_cases=len(rows),
+                unacceptable_2x_cases=[c["name"] for c in rows if
+                    c["paired_ratios"]["direct_over_native"]["mean"] >= 2])
+
+
 def main() -> None:
     args = parser().parse_args()
+    protocol = DECODE_PROTOCOL if args.phase == "decode" else PROTOCOL
     if args.check_imports:
         from sglang.srt.remnant.glm import compile_kernels
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         assert callable(tilelang_sparse_fwd) and callable(compile_kernels)
-        print(json.dumps(dict(protocol=PROTOCOL, cases=len(cases()), modes=MODES)))
+        print(json.dumps(dict(protocol=protocol, cases=len(cases(args.phase)), modes=MODES)))
         return
     if not args.output or not 60 <= args.max_seconds <= 1200:
         raise ValueError("GLM requires --output and --max-seconds between 60 and 1200")
@@ -726,7 +752,8 @@ def main() -> None:
     ):
         raise FileExistsError(f"Refusing to overwrite GLM run {base}")
     payload = dict(
-        protocol=PROTOCOL,
+        protocol=protocol,
+        phase=args.phase,
         status="running",
         seed=SEED,
         rounds=ROUNDS,
@@ -737,7 +764,7 @@ def main() -> None:
     if args.resume:
         checkpoint = Path(args.resume)
         payload["cases"] = resume_prefix(
-            json.loads(checkpoint.read_text()), payload["source"]
+            json.loads(checkpoint.read_text()), payload["source"], args.phase
         )
         payload["resumed_from"] = dict(
             path=str(checkpoint),
@@ -748,7 +775,7 @@ def main() -> None:
     fixture = None
     try:
         with torch.inference_mode():
-            for case in cases()[len(payload["cases"]) :]:
+            for case in cases(args.phase)[len(payload["cases"]) :]:
                 record = dict(name=case.name, case=asdict(case), valid=False)
                 payload["cases"].append(record)
                 write_results(payload, base)
@@ -756,6 +783,8 @@ def main() -> None:
                 record["fixture"] = fixture.identity
                 record.update(fixture.time())
                 record["valid"] = True
+                if args.phase == "decode":
+                    payload["summary"] = weighted_overhead(payload["cases"])
                 write_results(payload, base)
                 del fixture
                 fixture = None
