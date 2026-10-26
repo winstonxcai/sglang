@@ -12,8 +12,8 @@ from collections.abc import Callable, Mapping
 def round_orders(
     keys: tuple[str, ...], rounds: int, seed: int, *, balanced: bool = False
 ) -> list[list[str]]:
-    if rounds < 2 or len(keys) < 2:
-        raise ValueError("Paired timing needs two paths and at least two rounds")
+    if rounds < 1 or not keys:
+        raise ValueError("Timing needs at least one path and one round")
     rng = random.Random(seed)
     if balanced:
         if len(keys) != 2 or rounds % 2:

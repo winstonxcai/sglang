@@ -91,6 +91,16 @@ def validate(args: Any, hf_config: Any) -> None:
             unsupported.append(name)
     if getattr(args, "kv_cache_dtype", None) != "fp8_e4m3":
         unsupported.append("kv_cache_dtype must be fp8_e4m3")
+    # These are the resolved outer dispatch choices. TileLang DSA options alone
+    # do not prevent an explicit FA3/Triton override from selecting dense APIs.
+    for phase in ("prefill", "decode"):
+        backend = getattr(args, f"{phase}_attention_backend", None) or getattr(
+            args, "attention_backend", None
+        )
+        if backend != "dsa":
+            unsupported.append(
+                f"{phase} attention backend must be dsa (got {backend!r})"
+            )
     for name in ("dsa_prefill_backend", "dsa_decode_backend"):
         if getattr(args, name, None) != "tilelang":
             unsupported.append(name + " must be tilelang")

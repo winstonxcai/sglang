@@ -1533,3 +1533,124 @@ def test_glm_selected_packed_reference_preserves_bytes_and_duplicates():
     assert local.tolist() == [[1,-1,0,1]]
     assert torch.equal(dense[0,:256],values[0]) and not dense[0,256:].any()
     assert torch.equal(dense[1,256:],values[1]) and not dense[1,:256].any()
+
+
+@pytest.mark.parametrize("mode", ["native", "triton", "kernel"])
+def test_single_mode_benchmark_timing(mode):
+    """Exercise the shared loop through the existing benchmark entry point."""
+    import ast
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    args = cases.parser().parse_args(["--suite", "decode", "--modes", mode])
+    assert cases.benchmark_modes(args.keep_count, args.modes) == (mode,)
+    args.rounds, args.warmup, args.repeats = 2, 0, 1
+    function = next(
+        node
+        for node in ast.parse(
+            (ROOT / "benchmark/remnant/microbench.py").read_text()
+        ).body
+        if isinstance(node, ast.FunctionDef) and node.name == "time_case"
+    )
+    operation = SimpleNamespace(
+        key=mode, mode=mode, keep_count=256, call=lambda: 3.0, validate=Mock()
+    )
+    namespace = dict(
+        Operation=object,
+        DecodeCase=cases.DecodeCase,
+        configure=Mock(),
+        capture=lambda op, warmup: (SimpleNamespace(replay=op.call), None),
+        paired_samples=shared_timing.paired_samples,
+        measure=lambda call, repeats: call(),
+        case_seed=cases.case_seed,
+        summary=cases.summary,
+        paired_ratios=cases.paired_ratios,
+    )
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    result = namespace["time_case"](cases.selected_cases(args)[0], [operation], args)
+    assert result["paths"][mode]["samples"] == [3.0, 3.0]
+    assert operation.validate.call_count == 2
+
+
+def test_balanced_timing_still_requires_two_paths():
+    with pytest.raises(ValueError, match="Balanced"):
+        shared_timing.round_orders(("native",), 30, 1, balanced=True)
+
+
+def test_glm_artifact_metadata_binds_verified_source_binary_and_abi(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    from types import ModuleType
+
+    artifacts = load_module(
+        "_glm_artifact_contract",
+        ROOT / "python/sglang/benchmark/remnant/glm_artifacts.py",
+    )
+    generated = tmp_path / "device_kernel.cu"
+    generated.write_text(
+        "void glm_packed_partial_kernel(uint64_t* bitmap, int* indices, "
+        "uint8_t* kv_fp8, float* partial_lse, float* partial_o, "
+        "uint8_t* q_fp8, int num_pages, int seq_len) {}"
+    )
+    (tmp_path / "host_kernel.cu").write_text("v_int64) = ((int64_t)37248);")
+    cubin = tmp_path / "test.cubin"
+    cubin.write_bytes(b"verified cubin")
+    cache = {
+        str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in (generated, cubin, tmp_path / "host_kernel.cu")
+    }
+    tilelang = ModuleType("tilelang")
+    tilelang.__file__ = str(tmp_path / "tilelang/__init__.py")
+    cuda_cache = ModuleType("tilelang.cache.cuda_binary_cache")
+
+    class Cache:
+        @staticmethod
+        def make_key(**kwargs):
+            assert (
+                kwargs["target_arch"] == "90a" and kwargs["compile_format"] == "cubin"
+            )
+            return "verified-key"
+
+        @staticmethod
+        def get_path(key, suffix):
+            assert (key, suffix) == ("verified-key", "cubin")
+            return str(cubin)
+
+    cuda_cache.CUDABinaryCache = Cache
+    monkeypatch.setitem(sys.modules, "tilelang", tilelang)
+    monkeypatch.setitem(sys.modules, "tilelang.cache.cuda_binary_cache", cuda_cache)
+    variant = dict(heads=8, inner=2, packed=True, source_sha256=cache[str(generated)])
+    manifest = dict(tilelang=[variant], cache_files=cache)
+    artifacts.bind_partial_launch_metadata(manifest)
+    assert variant["cubin_sha256"] == cache[str(cubin)]
+    assert variant["dynamic_shared"] == 37248
+    assert variant["symbol"] == "glm_packed_partial_kernel"
+    assert [p["name"] for p in variant["parameters"]][-2:] == ["num_pages", "seq_len"]
+    cubin.write_bytes(b"tampered cubin")
+    with pytest.raises(RuntimeError, match="Unverified production GLM cubin"):
+        artifacts.bind_partial_launch_metadata(manifest)
+    cubin.write_bytes(b"verified cubin")
+    generated.write_text(generated.read_text().replace("num_pages", "wrong_abi"))
+    variant["source_sha256"] = hashlib.sha256(generated.read_bytes()).hexdigest()
+    cache[str(generated)] = variant["source_sha256"]
+    with pytest.raises(RuntimeError, match="ABI changed"):
+        artifacts.bind_partial_launch_metadata(manifest)
+
+
+
+def test_glm_cpu_preparation_requires_explicit_cache_paths(monkeypatch):
+    artifacts = load_module(
+        "_glm_artifact_paths", ROOT / "python/sglang/benchmark/remnant/glm_artifacts.py"
+    )
+    for name in (
+        "TRITON_CACHE_DIR",
+        "TILELANG_CACHE_DIR",
+        "REMNANT_GLM_COMPILE_MANIFEST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="requires explicit paths"):
+        artifacts.precompile_sm90()

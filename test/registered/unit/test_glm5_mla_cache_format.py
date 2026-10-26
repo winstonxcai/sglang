@@ -18,6 +18,7 @@ _spec.loader.exec_module(config)
 def args(**changes):
     values = dict(
         glm5_mla_cache_format="remnant",
+        attention_backend="dsa",
         kv_cache_dtype="fp8_e4m3",
         dsa_prefill_backend="tilelang",
         dsa_decode_backend="tilelang",
@@ -104,3 +105,23 @@ def test_rejects_unqualified_geometry(name, value):
     fields[name] = value
     with pytest.raises(ValueError, match="unqualified geometry"):
         config.validate(args(), SimpleNamespace(**fields))
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("backend", ["fa3", "triton", "flashinfer"])
+def test_rejects_effective_outer_backend_overrides(phase, backend):
+    with pytest.raises(ValueError, match=f"{phase} attention backend must be dsa"):
+        config.validate(args(**{f"{phase}_attention_backend": backend}), MODEL)
+
+
+def test_split_dsa_overrides_take_precedence_over_base_backend():
+    config.validate(
+        args(
+            attention_backend="fa3",
+            prefill_attention_backend="dsa",
+            decode_attention_backend="dsa",
+        ),
+        MODEL,
+    )
+    with pytest.raises(ValueError, match="attention backend must be dsa"):
+        config.validate(args(attention_backend="fa3"), MODEL)

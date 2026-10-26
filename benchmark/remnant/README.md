@@ -349,3 +349,41 @@ production CUDA path remains instrumented; no kernel filters apply. Unprofiled
 full-size smoke verifies CPU/GPU oracle parity on actual inputs at unchanged
 0.02 tolerances before these probes, while full-size/timing validation retains
 its GPU oracle. JUnit records reference device and exact representative geometry.
+
+
+### GLM implementation and artifact ownership
+
+The serving startup contract requires resolved DSA prefill/decode dispatch with
+TileLang implementations. Explicit dense attention overrides are rejected.
+Adapter reconstruction widens physical indices to int64 before byte offsets;
+its large-address regression covers the 2 GiB boundary, duplicates and invalids.
+Direct's loader and attention arithmetic are unchanged by these review fixes.
+
+`python/sglang/benchmark/remnant/glm_artifacts.py` owns the SM90 factory, byte
+probe and complete compile manifest, including verified generated source/host
+hashes, cubin identity, launch ABI and shared-memory requirements. The parent
+build runner and focused GPU tests consume that interface; GPU test fixtures no
+longer own compilation. Inside the maintained Linux CUDA build environment:
+
+```bash
+export TRITON_CACHE_DIR=/cache/glm/triton
+export TILELANG_CACHE_DIR=/cache/glm/tilelang
+export REMNANT_GLM_COMPILE_MANIFEST=/cache/glm/manifest.json
+python -m sglang.benchmark.remnant.glm_artifacts
+```
+
+The command requires explicit cache/output paths and defaults TileLang to SM90a.
+The maintained CPU build additionally supplies its verified import-driver stubs
+and pinned toolchain. Importing the artifact module itself needs no CUDA stack.
+Focused partial-graph tests read the resulting manifest directly; no parent-side
+metadata enrichment or imports from the parent repository are required.
+
+CPU regression command (no weights or GPU):
+
+```bash
+PYTHONPATH=python python -m pytest -q test/registered/unit/test_glm5_mla_cache_format.py benchmark/remnant/test_microbench.py
+```
+
+The new Adapter boundary regression still requires an H100 run. Historical
+Native/Direct results retain their recorded source identities and are not new
+qualification of subsequent commits.

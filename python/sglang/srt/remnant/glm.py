@@ -43,7 +43,8 @@ def _store(X, M, L, V, B, SX: tl.constexpr, SM: tl.constexpr, SLOTS):
 def _reconstruct(V, B, I, O, SLOTS):
     row = tl.program_id(0)
     c = tl.arange(0, 512)
-    idx = tl.load(I + row)
+    # Read indices are int32; widen before multiplying into the value plane.
+    idx = tl.load(I + row).to(tl.int64)
     valid = (idx >= 0) & (idx < SLOTS)
     word = tl.load(B + idx * 8 + c // 64, valid, 0)
     keep = ((word >> (63 - c % 64)) & 1).to(tl.int32)
@@ -53,9 +54,9 @@ def _reconstruct(V, B, I, O, SLOTS):
 
 
 @cache
-def compile_kernels() -> (
-    tuple[triton.compiler.CompiledKernel, triton.compiler.CompiledKernel]
-):
+def compile_kernels() -> tuple[
+    triton.compiler.CompiledKernel, triton.compiler.CompiledKernel
+]:
     """CPU-buildable SM90 artifacts; identical AST signatures at build and load.
 
     Explicit target avoids device discovery on CPU builders. Packed currently

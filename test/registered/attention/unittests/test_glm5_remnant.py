@@ -2,7 +2,9 @@
 
 Author: Winston Cai.
 
-Run via scripts/modal/kernels.py --model-family glm53. No weights. The Native
+Run via scripts/modal/kernels.py --model-family glm53. No weights.
+Focused partial-graph tests consume REMNANT_GLM_COMPILE_MANIFEST from
+python -m sglang.benchmark.remnant.glm_artifacts; no parent metadata is needed. The Native
 reference reads independently expanded codes with stock FP8 TileLang arithmetic.
 """
 
@@ -16,6 +18,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.benchmark.remnant.glm_artifacts import ATTENTION_SCALE, packed_loader_probe
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.remnant.glm import (
     PackedCache,
@@ -26,8 +29,6 @@ from sglang.srt.remnant.glm import (
 from sglang.srt.remnant.reference import topmag_keep_mask
 from sglang.srt.runtime_context import get_context
 from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
-
-ATTENTION_SCALE = 256**-0.5  # Native scales the original head, before 512-D absorption.
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="H100 required")
 
@@ -756,55 +757,10 @@ def test_decode_bank_graph(heads, inner, record_property):
         stream.synchronize()
 
 
-def _packed_loader_probe():
-    """Invoke the production helper and compare every raw code independently.
-
-    Synthetic masks include >256 survivors, empty words, all fragment/word
-    boundaries, and ranks at the final window. Every FP8 byte pattern occurs.
-    The large sparse backing tests a real address beyond 2 GiB; only selected
-    rows are initialized, and no allocation is made during graph replay.
-    """
-    import tilelang
-    import tilelang.language as T
-    source = (Path(__file__).resolve().parents[4] /
-        "python/sglang/kernels/jit/include/sgl_kernel/glm_packed_decode.cuh").read_text()
-
-    @tilelang.jit(out_idx=[-1])
-    def probe(slots: int):
-        @T.prim_func
-        def main(values: T.Tensor([slots, 256], T.uint8),
-                 bitmap: T.Tensor([slots, 8], T.uint64),
-                 ids: T.Tensor([32], T.int32), out: T.Tensor([32, 512], T.uint8)):
-            with T.Kernel(1, threads=128):
-                T.import_source(source)
-                scratch = T.alloc_shared([32, 272], T.uint8)
-                a = T.alloc_shared([32, 128], T.uint8)
-                b = T.alloc_shared([32, 128], T.uint8)
-                c = T.alloc_shared([32, 128], T.uint8)
-                d = T.alloc_shared([32, 128], T.uint8)
-                T.annotate_layout({a: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4))),
-                    b: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4))),
-                    c: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4))),
-                    d: T.Layout([32,128], lambda i,j: (i,j^((i&7)<<4)))})
-                T.evaluate(T.call_extern("int32", "remnant_glm_expand_tile",
-                    T.access_ptr(values,"r", extent=T.int64(slots)*256),
-                    T.access_ptr(bitmap,"r", extent=T.int64(slots)*8), T.access_ptr(ids,"r"),
-                    T.access_ptr(scratch,"rw"), T.access_ptr(a,"w"), T.access_ptr(b,"w"),
-                    T.access_ptr(c,"w"), T.access_ptr(d,"w"), T.int64(slots)))
-                T.sync_threads()
-                for i,j in T.Parallel(32,128):
-                    out[i,j] = a[i,j]
-                    out[i,j+128] = b[i,j]
-                    out[i,j+256] = c[i,j]
-                    out[i,j+384] = d[i,j]
-        return main.with_attr("global_symbol", "glm_packed_bytes")
-
-    return probe
-
 
 def test_packed_loader_bytes():
     import numpy as np
-    probe = _packed_loader_probe()
+    probe = packed_loader_probe()
     # 256 * index crosses signed 32-bit at index 8388608.
     slots = 8388610
     values = torch.empty(slots,256,dtype=torch.uint8,device="cuda")
@@ -842,83 +798,6 @@ def test_packed_loader_bytes():
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
-
-def _compile_sm90_variant(case: tuple[int, int]) -> list[dict]:
-    """One independent head/split pair, owned by a CPU compiler process."""
-    from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
-        sparse_mla_fwd_decode_partial_fp8,
-        sparse_mla_fwd_decode_combine,
-    )
-
-    heads, inner = case
-    variants = []
-    for packed in (False, True):
-        kernel = sparse_mla_fwd_decode_partial_fp8(
-            heads,
-            512,
-            0,
-            2112,
-            packed=packed,
-            sm_scale=ATTENTION_SCALE,
-            block_I=32,
-            inner_iter=inner,
-            threads=128,
-        )
-        variants.append(
-            dict(
-                heads=heads,
-                inner=inner,
-                packed=packed,
-                source_sha256=hashlib.sha256(
-                    kernel.get_kernel_source().encode()
-                ).hexdigest(),
-            )
-        )
-    sparse_mla_fwd_decode_combine(
-        heads, 512, (66 // inner) * 32, head_per_block=4, block_I=32, threads=128
-    )
-    return variants
-
-
-def precompile_sm90():
-    """Build exact CPU artifacts without allocating a CUDA tensor or context."""
-    import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
-    from sglang.srt.remnant.glm import compile_kernels
-
-    store, unpack = compile_kernels()
-    artifacts = {
-        "attention_scale": ATTENTION_SCALE,
-        "precompile_workers": 4,
-        "triton": [store.hash, unpack.hash],
-        "tilelang": [],
-    }
-    cases = [(heads, inner) for heads in (8, 16, 32, 64) for inner in (1, 2, 33, 66)]
-    # Separate processes isolate TVM compiler state; each pair owns its combine
-    # variant. The maintained runner supplies the overall bounded subprocess.
-    with ProcessPoolExecutor(
-        max_workers=4, mp_context=multiprocessing.get_context("spawn")
-    ) as executor:
-        for variants in executor.map(_compile_sm90_variant, cases):
-            artifacts["tilelang"].extend(variants)
-            print(
-                "Compiled GLM variants",
-                [(v["heads"], v["inner"], v["packed"]) for v in variants],
-                flush=True,
-            )
-    _packed_loader_probe()(8388610)
-    artifacts["cache_files"] = {
-        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
-        for root in (
-            Path(os.environ["TRITON_CACHE_DIR"]),
-            Path(os.environ["TILELANG_CACHE_DIR"]),
-        )
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
-    Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).write_text(
-        json.dumps(artifacts, indent=2) + "\n"
-    )
 
 
 class _CachedPartial:
@@ -983,7 +862,11 @@ def test_decode_partial_graph(heads, inner, record_property):
     """
     import numpy as np
 
-    compiled = json.loads(Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text())
+    manifest = os.environ.get("REMNANT_GLM_COMPILE_MANIFEST")
+    if not manifest:
+        pytest.fail("Set REMNANT_GLM_COMPILE_MANIFEST to the output of "
+                    "python -m sglang.benchmark.remnant.glm_artifacts before focused tests")
+    compiled = json.loads(Path(manifest).read_text())
     variants = {v["packed"]: v for v in compiled["tilelang"]
                 if v["heads"] == heads and v["inner"] == inner}
     record_property("decode_geometry", json.dumps(dict(heads=heads, inner=inner,
@@ -1070,9 +953,32 @@ def test_decode_partial_graph(heads, inner, record_property):
         owner.wait_stream(stream)
 
 
-if __name__ == "__main__":
-    import sys
 
-    if sys.argv[1:] != ["--compile-only"]:
-        raise SystemExit("Expected --compile-only; use pytest for execution")
-    precompile_sm90()
+
+def test_adapter_reconstruction_above_2gib():
+    """Valid int32 locations must retain 64-bit offsets into the value plane."""
+    slots = 8388610
+    rows = [8388607, 8388608, 8388609]
+    values = torch.empty((slots, 256), dtype=torch.uint8, device="cuda")
+    bitmap = torch.empty((slots, 8), dtype=torch.uint64, device="cuda")
+    try:
+        codes = torch.arange(256, dtype=torch.int32, device="cuda").to(torch.uint8)
+        for i, row in enumerate(rows):
+            values[row] = codes.roll(i)
+            bitmap[row] = torch.tensor(
+                [2**64 - 1] * 4 + [0] * 4, dtype=torch.uint64, device="cuda"
+            )
+        ids = torch.tensor(
+            [-1, *rows, rows[1], slots], dtype=torch.int32, device="cuda"
+        )
+        output = torch.empty((len(ids), 512), dtype=torch.uint8, device="cuda")
+        reconstruct(PackedCache(values, bitmap, None, "adapter"), ids, output)
+        expected = torch.zeros_like(output)
+        for i in range(3):
+            expected[i + 1, :256] = codes.roll(i)
+        expected[4, :256] = codes.roll(1)
+        assert torch.equal(output, expected)
+    finally:
+        torch.cuda.synchronize()
+        del values, bitmap
+        torch.cuda.empty_cache()
