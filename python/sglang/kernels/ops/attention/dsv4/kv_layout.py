@@ -12,7 +12,52 @@ pads to. Mirrors ``sgl_kernel/deepseek_v4/kv_layout.cuh``.
 from __future__ import annotations
 
 import enum
-from typing import Union
+from dataclasses import dataclass
+from typing import ClassVar, Union
+
+
+@dataclass(frozen=True)
+class FP4CacheLayout:
+    """SM90 persistent FP4 contract; offsets refer to a page's SoA planes.
+
+    Author: Winston Cai. Numerical references intentionally specify their own
+    expected bytes, so changing this contract cannot silently change the oracle.
+    """
+
+    packed: bool = False
+    head_dim: ClassVar[int] = 512
+    scale_group: ClassVar[int] = 16
+    bitmap_words: ClassVar[int] = 8
+    alignment: ClassVar[int] = 16
+    page_alignment: ClassVar[int] = 256
+
+    @property
+    def survivors(self) -> int:
+        return self.head_dim // 2 if self.packed else self.head_dim
+
+    @property
+    def value_bytes(self) -> int:
+        return self.survivors // 2
+
+    @property
+    def bitmap_bytes(self) -> int:
+        return self.bitmap_words * 8 if self.packed else 0
+
+    @property
+    def data_bytes(self) -> int:
+        return self.value_bytes + self.bitmap_bytes
+
+    @property
+    def scale_bytes(self) -> int:
+        return self.head_dim // self.scale_group
+
+    @property
+    def record_bytes(self) -> int:
+        return self.data_bytes + self.scale_bytes
+
+
+NATIVE_FP4 = FP4CacheLayout()
+PACKED_FP4 = FP4CacheLayout(packed=True)
 
 
 class KVLayout(str, enum.Enum):
@@ -32,8 +77,8 @@ class KVLayout(str, enum.Enum):
         return {
             KVLayout.V4: 576,
             KVLayout.V41: 512,
-            KVLayout.V41_FP4: 256,
-            KVLayout.V41_FP4_REMNANT: 192,
+            KVLayout.V41_FP4: NATIVE_FP4.data_bytes,
+            KVLayout.V41_FP4_REMNANT: PACKED_FP4.data_bytes,
             KVLayout.UNIFORM_FP8: 512,
         }[self]
 
@@ -42,8 +87,8 @@ class KVLayout(str, enum.Enum):
         return {
             KVLayout.V4: 8,
             KVLayout.V41: 16,
-            KVLayout.V41_FP4: 32,
-            KVLayout.V41_FP4_REMNANT: 32,
+            KVLayout.V41_FP4: NATIVE_FP4.scale_bytes,
+            KVLayout.V41_FP4_REMNANT: PACKED_FP4.scale_bytes,
             KVLayout.UNIFORM_FP8: 0,
         }[self]
 

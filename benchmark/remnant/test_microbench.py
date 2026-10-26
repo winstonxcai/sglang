@@ -541,6 +541,7 @@ def test_prefill_traffic_requires_reads_writes_hits_and_launch_coverage():
 
 def test_native_repage_preserves_values_scales_and_zero_padding():
     import ast
+
     import torch
 
     tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
@@ -1081,6 +1082,7 @@ def test_quantization_reference_accepts_rounding_and_rejects_wrong_codes():
 def test_portable_packed_codec_and_profile_contract(count):
     """Real Torch numerics without importing SGLang's CUDA-only package startup."""
     import importlib
+
     import torch
 
     runtime = load_module(
@@ -1261,6 +1263,7 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
     """Catch required/default ordering with the real upstream Arg and msgspec types."""
     import ast
     from typing import Optional
+
     import msgspec
 
     args = load_module("_v0522_arg_utils", ROOT / "python/sglang/srt/arg_groups/arg_utils.py")
@@ -1283,6 +1286,15 @@ def test_v41_fp4_matrix_and_timing_gate():
     from dataclasses import asdict
 
     args = cases.parser().parse_args(["--suite", "v41-fp4-decode"])
+    for flag, value in (
+        ("--heads", "128"),
+        ("--batches", "1"),
+        ("--topk-lengths", "317"),
+    ):
+        with pytest.raises(ValueError, match="V4.1 FP4 requires"):
+            cases.selected_cases(
+                cases.parser().parse_args(["--suite", "v41-fp4-decode", flag, value])
+            )
     matrix = cases.selected_cases(args)
     assert len(matrix) == len({c.name for c in matrix}) == 10
     assert {(c.heads, c.batch, c.topk_length) for c in matrix} == {

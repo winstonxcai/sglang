@@ -4,6 +4,7 @@ Author: Winston Cai.
 """
 
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -287,6 +288,22 @@ def validate_packed_static_config() -> None:
             )
 
 
+def resolve_dsv4_prefill_backend(backend: str = "auto") -> str:
+    """Resolve CLI/debug precedence once; callers retain the effective policy.
+
+    Author: Winston Cai. Kept free of CUDA/Triton imports for startup checks.
+    """
+    if backend not in ("auto", "flashmla_sparse", "flashmla_sparse_q8"):
+        raise ValueError(f"Unsupported DeepSeek V4 prefill backend: {backend!r}")
+    override = os.getenv("SGLANG_DSV4_Q8KV8_PREFILL")
+    q8 = (
+        override.lower() in {"1", "true", "yes", "on"}
+        if override is not None
+        else backend == "flashmla_sparse_q8"
+    )
+    return "flashmla_sparse_q8" if q8 else "flashmla_sparse"
+
+
 def validate_v41_cache_args(args: Any) -> None:
     """Validate opt-in FP4 independently of V4 C4 dispatch publication."""
     mode = getattr(args, "dsv41_main_kv_cache_format", "auto")
@@ -322,8 +339,14 @@ def validate_v41_cache_args(args: Any) -> None:
         conflicts.append("cpu_offload_gb")
     if getattr(args, "dsv4_attn_backend", "auto") not in ("auto", "flashmla"):
         conflicts.append("dsv4_attn_backend (requires flashmla)")
-    if getattr(args, "dsv4_prefill_backend", "auto") not in ("auto", "flashmla_sparse"):
-        conflicts.append("dsv4_prefill_backend (requires BF16 sparse prefill)")
+    prefill_backend = getattr(args, "dsv4_prefill_backend", "auto")
+    if (
+        prefill_backend not in ("auto", "flashmla_sparse")
+        or resolve_dsv4_prefill_backend(prefill_backend) != "flashmla_sparse"
+    ):
+        conflicts.append(
+            "dsv4_prefill_backend/SGLANG_DSV4_Q8KV8_PREFILL (requires BF16 sparse prefill)"
+        )
     from sglang.srt.environ import envs
 
     # The upstream default is v4, even when unset. Only explicit legacy

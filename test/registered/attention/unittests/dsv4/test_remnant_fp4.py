@@ -17,7 +17,11 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.srt.remnant.config import validate_v41_cache_args
+from sglang.srt.remnant.config import (
+    resolve_dsv4_prefill_backend,
+    validate_v41_cache_args,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
     dequantize_k_cache_v41_fp4,
     quantize_k_cache_v41_fp4,
@@ -25,6 +29,11 @@ from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
 
 from .test_remnant_flashmla_direct import _make_swa_cache
 from .test_remnant_pool import _gpu_storages
+
+# This model-free suite is run by the budgeted Modal runner, never broad CI.
+register_cuda_ci(
+    120, "stage-b-test-1-gpu-small", disabled="Modal-only H100 qualification"
+)
 
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Modal H100")
 RATIOS = [0] * 2 + [2] * 18 + [1] * 20
@@ -64,16 +73,43 @@ def _oracle(x: torch.Tensor, packed: bool) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def test_fp4_startup_contract(monkeypatch):
+    from sglang.kernels.ops.attention.dsv4.kv_layout import NATIVE_FP4, PACKED_FP4
     from sglang.srt.environ import envs
 
+    assert (NATIVE_FP4.record_bytes, PACKED_FP4.record_bytes) == (288, 224)
+    assert (
+        PACKED_FP4.value_bytes,
+        PACKED_FP4.bitmap_bytes,
+        PACKED_FP4.scale_bytes,
+    ) == (128, 64, 32)
+    assert PACKED_FP4.head_dim == 512 and PACKED_FP4.scale_group == 16
     for field in (envs.SGLANG_DSV4_KV_LAYOUT, envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT):
         monkeypatch.delenv(field.name, raising=False)
+    monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL", raising=False)
     validate_v41_cache_args(SimpleNamespace())
     for mode in ("fp4", "remnant"):
         validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format=mode))
         validate_v41_cache_args(
             SimpleNamespace(dsv41_main_kv_cache_format=mode, dsv4_attn_backend="auto")
         )
+        for cli in ("auto", "flashmla_sparse"):
+            for override in ("1", "true", "yes", "on"):
+                monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", override)
+                assert resolve_dsv4_prefill_backend(cli) == "flashmla_sparse_q8"
+                with pytest.raises(ValueError, match="SGLANG_DSV4_Q8KV8_PREFILL"):
+                    validate_v41_cache_args(
+                        SimpleNamespace(
+                            dsv41_main_kv_cache_format=mode, dsv4_prefill_backend=cli
+                        )
+                    )
+            monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", "0")
+            assert resolve_dsv4_prefill_backend(cli) == "flashmla_sparse"
+            validate_v41_cache_args(
+                SimpleNamespace(
+                    dsv41_main_kv_cache_format=mode, dsv4_prefill_backend=cli
+                )
+            )
+        monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL")
         for field in (
             envs.SGLANG_DSV4_KV_LAYOUT,
             envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT,
@@ -102,8 +138,9 @@ def test_fp4_startup_contract(monkeypatch):
     with pytest.raises(ValueError):
         validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format="fp8"))
     import argparse
-    from sglang.srt.server_args import ServerArgs
+
     from sglang.srt.runtime_context import get_context, get_model
+    from sglang.srt.server_args import ServerArgs
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
@@ -160,6 +197,14 @@ def test_fp4_store_and_reader(packed, page, pattern):
     x_gpu, f_gpu = x.cuda(), freq.cuda()
     store_fp4_cache(x_gpu, cache, locations, page, packed=packed, freqs_cis=f_gpu)
     torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)
+    # A valid base does not imply aligned later pages.
+    misaligned_pages = torch.empty(
+        (2, cache.shape[1] + 1), device="cuda", dtype=torch.uint8
+    )
+    with pytest.raises(ValueError, match="page stride must be 16-byte aligned"):
+        store_fp4_cache(x_gpu[:1], misaligned_pages, locations[:1], page, packed=packed)
+    with pytest.raises(ValueError, match="page stride must be 16-byte aligned"):
+        read_fp4_cache(misaligned_pages, locations[:1].int(), page, packed=packed)
     before = cache.clone()
     bad = torch.tensor([0, -1, page * 2], device="cuda", dtype=torch.int64)
     store_fp4_cache(x_gpu[:3], cache, bad, page, packed=packed, freqs_cis=f_gpu[:3])
@@ -296,6 +341,22 @@ def test_fp4_direct(packed, heads, page):
     from sgl_kernel.flash_mla import flash_mla_with_fp4_kvcache
 
     t = _attention_case(packed, heads, page)
+    # Offset views retain valid shapes/strides, but violate vector-load alignment.
+    offset_cache = torch.empty(t.cache.numel() + 1, dtype=torch.uint8, device="cuda")[
+        1:
+    ].view_as(t.cache_view)
+    offset_cache.copy_(t.cache_view)
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        flash_mla_with_fp4_kvcache(
+            t.q,
+            t.swa,
+            t.indices,
+            offset_cache,
+            t.extra,
+            packed=packed,
+            extra_topk_length=t.lengths,
+            attn_sink=t.sink,
+        )
     actual = flash_mla_with_fp4_kvcache(
         t.q,
         t.swa,
@@ -333,8 +394,9 @@ def test_fp4_direct(packed, heads, page):
 
 def _fp4_adapter(t, *, use_lengths):
     """Exercise production reconstruction and FP4-only BF16 prefill."""
-    from sglang.kernels.ops.attention.dsv4.fp4_cache import read_fp4_cache
     from sgl_kernel.flash_mla import flash_mla_fp4_sparse_fwd
+
+    from sglang.kernels.ops.attention.dsv4.fp4_cache import read_fp4_cache
 
     ids = torch.arange(t.values.shape[0], device="cuda", dtype=torch.int32)
     reconstructed = torch.empty(
@@ -369,6 +431,7 @@ def _fp4_adapter(t, *, use_lengths):
 @pytest.mark.parametrize("heads", [64, 128])
 def test_fp4_graph_and_stream(packed, heads):
     from sgl_kernel.flash_mla import flash_mla_with_fp4_kvcache
+
     from sglang.kernels.ops.attention.dsv4.fp4_cache import (
         read_fp4_cache,
         store_fp4_cache,
@@ -423,18 +486,18 @@ def test_fp4_graph_and_stream(packed, heads):
 
 @GPU
 def test_fp4_pool_allocations(tmp_path):
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-        DeepSeekV4SingleKVPool,
-        DeepSeekV4TokenToKVPool,
-    )
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
     # Include the complete Direct call's measured temporary/output peak at the
     # declared B8/H128 fixture, equally in both capacity budgets. Warm-up is
     # outside measurement; this records memory, never timing or throughput.
     from sgl_kernel.flash_mla import flash_mla_with_fp4_kvcache
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4SingleKVPool,
+        DeepSeekV4TokenToKVPool,
+    )
+    from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     direct_peaks = []
     for packed in (False, True):
@@ -712,9 +775,9 @@ def test_fp4_pool_allocations(tmp_path):
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
 def test_fp4_compressor_boundary(ratio, packed):
-    from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Compressor
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.kernels.ops.attention.dsv4.fp4_cache import store_fp4_cache
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Compressor
 
     torch.manual_seed(71)
     compressor = DeepseekV41Compressor(
@@ -802,8 +865,9 @@ def test_fp4_compressor_boundary(ratio, packed):
 
 
 def test_fp4_backend_dispatch():
-    from unittest import mock
     import sys
+    from unittest import mock
+
     from sglang.srt.layers.attention import deepseek_v4_backend as module
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
     from sglang.srt.remnant import capture

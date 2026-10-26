@@ -5,8 +5,6 @@ Author: Winston Cai.
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-
 import logging
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
@@ -31,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
     fused_k_norm_rope_uniform_fp8,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend

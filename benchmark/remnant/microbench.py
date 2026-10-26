@@ -25,10 +25,11 @@ from typing import Callable
 
 import torch
 from sgl_kernel import flash_mla
+
 from sglang.benchmark.remnant.cases import (
-    PROTOCOL,
-    PREFILL_PROTOCOL,
     FP4_DECODE_PROTOCOL,
+    PREFILL_PROTOCOL,
+    PROTOCOL,
     DecodeCase,
     FP4DecodeCase,
     PrefillReadCase,
@@ -46,19 +47,19 @@ from sglang.benchmark.remnant.cases import (
     verify_profile_replay,
     write_results,
 )
+from sglang.benchmark.remnant.quantization import check_fp8_storage
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
 )
-from sglang.benchmark.remnant.quantization import check_fp8_storage
 from sglang.srt import remnant
 from sglang.srt.remnant.packed import (
     NativeWorkspace,
     PackedBuffers,
     pack_rows,
     pack_rows_fused,
-    unpack_gather_native,
     unpack_gather_bf16,
+    unpack_gather_native,
 )
 from sglang.srt.remnant.reference import (
     _ue8m0_quantize,
@@ -341,8 +342,8 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
     """
     from sglang.kernels.ops.attention.dsv4.fp4_cache import store_fp4_cache
     from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
-        quantize_k_cache_v41_fp4,
         dequantize_k_cache_v41_fp4,
+        quantize_k_cache_v41_fp4,
     )
 
     page, rows = case.global_page_size, case.batch * 512
@@ -398,10 +399,13 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
     loc = torch.arange(page, page + rows, device="cuda", dtype=torch.int64)
     x_gpu = x.cuda()
     operations = []
-    for mode, values, record_bytes in (
-        ("native", native_values, 288),
-        ("kernel", packed_values, 224),
+    from sglang.kernels.ops.attention.dsv4.kv_layout import NATIVE_FP4, PACKED_FP4
+
+    for mode, values, layout in (
+        ("native", native_values, NATIVE_FP4),
+        ("kernel", packed_values, PACKED_FP4),
     ):
+        record_bytes = layout.record_bytes
         packed = mode == "kernel"
         cache = torch.zeros(
             (rows // page + 1, page * record_bytes), device="cuda", dtype=torch.uint8
@@ -435,8 +439,13 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
 
         def validate_output(output, expected=expected, mode=mode):
             for actual, target in zip(output, expected):
-                torch.testing.assert_close(actual.cpu(), target, atol=ATOL, rtol=RTOL,
-                                           msg=f"{case.name}/{mode}")
+                torch.testing.assert_close(
+                    actual.cpu(),
+                    target,
+                    atol=ATOL,
+                    rtol=RTOL,
+                    msg=f"{case.name}/{mode}",
+                )
 
         def validate(call=call, validate_output=validate_output):
             validate_output(call())

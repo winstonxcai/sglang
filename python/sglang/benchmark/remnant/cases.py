@@ -377,7 +377,7 @@ def parser() -> argparse.ArgumentParser:
         default=256,
         help="Retained coordinates per C4 record; independent of --topk-lengths",
     )
-    p.add_argument("--heads", default="64,128")
+    p.add_argument("--heads", help="Default: 64 for V4.1 FP4, 64,128 otherwise")
     p.add_argument("--batches", default=",".join(map(str, DEFAULT_DECODE_BATCHES)))
     p.add_argument("--topk-lengths", default="512")
     p.add_argument("--histories", default="143360")
@@ -427,7 +427,9 @@ def selected_cases(args) -> list:
     modes = benchmark_modes(args.keep_count, args.modes)
     if args.profile_mode and args.profile_mode not in modes:
         raise ValueError("--profile-mode must be included in the supported --modes")
-    h = positive_ints(args.heads, "--heads")
+    h = positive_ints(
+        args.heads or ("64" if args.suite == "v41-fp4-decode" else "64,128"), "--heads"
+    )
     b = positive_ints(args.batches, "--batches")
     k = positive_ints(args.topk_lengths, "--topk-lengths", 512)
     cases = []
@@ -448,6 +450,11 @@ def selected_cases(args) -> list:
             raise ValueError("V4.1 FP4 compares dense Native and Packed Direct keep256")
         if args.profile_mode or args.profile_path:
             raise ValueError("V4.1 FP4 profiling is deferred")
+        if h != [64] or tuple(b) != DEFAULT_DECODE_BATCHES or k != [512]:
+            raise ValueError(
+                "V4.1 FP4 requires --heads 64, --batches 8,16,24,28,32 and --topk-lengths 512; "
+                "use --case to select a subset"
+            )
         cases = fp4_decode_cases()
     if args.case:
         requested = args.case.split(",")

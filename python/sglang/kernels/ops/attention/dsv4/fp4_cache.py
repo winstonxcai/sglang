@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .kv_layout import NATIVE_FP4, PACKED_FP4
+
 
 @triton.jit
 def _fp4_magnitude(code):
@@ -52,6 +54,8 @@ def _store(
     STRIDE: tl.constexpr,
     N: tl.constexpr,
     PACKED: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    VALUE_BYTES: tl.constexpr,
     ROTATE: tl.constexpr,
 ):
     r = tl.program_id(0)
@@ -88,7 +92,6 @@ def _store(
     )
     sign = (scaled.to(tl.uint32, bitcast=True) >> 28) & 8
     code = code | sign.to(tl.int32)
-    data_bytes: tl.constexpr = 192 if PACKED else 256
     base = C + (loc // P) * STRIDE
     row = loc % P
     if PACKED:
@@ -106,18 +109,18 @@ def _store(
         keep = key >= cutoff
         coords = tl.sort(tl.where(keep, d, 512), descending=False)
         codes = tl.gather(code, tl.minimum(coords, 511), 0)
-        i = tl.arange(0, 128)
+        i = tl.arange(0, VALUE_BYTES)
         packed = tl.gather(codes, i * 2, 0) | (tl.gather(codes, i * 2 + 1, 0) << 4)
-        tl.store(base + row * 192 + i, packed.to(tl.uint8), valid)
+        tl.store(base + row * DATA_BYTES + i, packed.to(tl.uint8), valid)
         words = tl.sum(tl.reshape(keep.to(tl.uint64) << (63 - d % 64), (8, 64)), 1)
-        bitmap = (base + row * 192 + 128).to(tl.pointer_type(tl.uint64))
+        bitmap = (base + row * DATA_BYTES + VALUE_BYTES).to(tl.pointer_type(tl.uint64))
         tl.store(bitmap + tl.arange(0, 8), words, valid)
     else:
-        i = tl.arange(0, 256)
+        i = tl.arange(0, VALUE_BYTES)
         packed = tl.gather(code, i * 2, 0) | (tl.gather(code, i * 2 + 1, 0) << 4)
-        tl.store(base + row * 256 + i, packed.to(tl.uint8), valid)
+        tl.store(base + row * DATA_BYTES + i, packed.to(tl.uint8), valid)
     tl.store(
-        base + P * data_bytes + row * 32 + tl.arange(0, 32),
+        base + P * DATA_BYTES + row * 32 + tl.arange(0, 32),
         scale.to(tl.uint8, bitcast=True),
         valid,
     )
@@ -133,6 +136,8 @@ def _read(
     STRIDE: tl.constexpr,
     N: tl.constexpr,
     PACKED: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    VALUE_BYTES: tl.constexpr,
 ):
     r = tl.program_id(0)
     d = tl.arange(0, 512)
@@ -141,21 +146,20 @@ def _read(
     loc = tl.where(valid, loc, 0)
     base = C + (loc // P) * STRIDE
     row = loc % P
-    data_bytes: tl.constexpr = 192 if PACKED else 256
     if PACKED:
-        bitmap = (base + row * 192 + 128).to(tl.pointer_type(tl.uint64))
+        bitmap = (base + row * DATA_BYTES + VALUE_BYTES).to(tl.pointer_type(tl.uint64))
         word = tl.load(bitmap + d // 64, valid, 0)
         keep = ((word >> (63 - d % 64)) & 1).to(tl.int32)
         rank = tl.cumsum(keep) - 1
         byte = tl.load(
-            base + row * 192 + tl.maximum(rank, 0) // 2, valid & (keep != 0), 0
+            base + row * DATA_BYTES + tl.maximum(rank, 0) // 2, valid & (keep != 0), 0
         )
         code = (byte >> ((tl.maximum(rank, 0) % 2) * 4)) & 15
     else:
         keep = tl.full((512,), 1, tl.int32)
-        byte = tl.load(base + row * 256 + d // 2, valid, 0)
+        byte = tl.load(base + row * DATA_BYTES + d // 2, valid, 0)
         code = (byte >> ((d % 2) * 4)) & 15
-    raw_scale = tl.load(base + P * data_bytes + row * 32 + d // 16, valid, 0)
+    raw_scale = tl.load(base + P * DATA_BYTES + row * 32 + d // 16, valid, 0)
     scale = raw_scale.to(tl.float8e4nv, bitcast=True).to(tl.float32)
     mag = _fp4_magnitude(code & 7)
     value = tl.where((code & 8) != 0, -mag, mag) * scale
@@ -188,11 +192,14 @@ def store_fp4_cache(
         raise ValueError(
             "FP4 store requires BF16 [rows,512] latents contiguous in dimension 1"
         )
+    layout = PACKED_FP4 if packed else NATIVE_FP4
     if cache.dtype != torch.uint8 or cache.ndim != 2 or not cache.is_contiguous():
         raise ValueError(
             "FP4 cache requires contiguous uint8 [pages,page_bytes] storage"
         )
-    if page_size <= 0 or cache.shape[1] < page_size * (224 if packed else 288):
+    if cache.data_ptr() % layout.alignment or cache.stride(0) % layout.alignment:
+        raise ValueError("FP4 cache base and page stride must be 16-byte aligned")
+    if page_size <= 0 or cache.shape[1] < page_size * layout.record_bytes:
         raise ValueError("FP4 cache page geometry cannot hold the selected format")
     if (
         loc.ndim != 1
@@ -227,6 +234,8 @@ def store_fp4_cache(
             cache.stride(0),
             cache.shape[0],
             packed,
+            layout.data_bytes,
+            layout.value_bytes,
             freqs_cis is not None,
             num_warps=4,
             enable_fp_fusion=False,
@@ -246,9 +255,12 @@ def read_fp4_cache(
     Prefill callers supply a preallocated contiguous-along-row destination.
     Stored global records already include RoPE; reconstruction never rotates.
     """
+    layout = PACKED_FP4 if packed else NATIVE_FP4
     if cache.dtype != torch.uint8 or cache.ndim != 2 or not cache.is_contiguous():
         raise ValueError("FP4 reader requires contiguous uint8 pages")
-    if page_size <= 0 or cache.shape[1] < page_size * (224 if packed else 288):
+    if cache.data_ptr() % layout.alignment or cache.stride(0) % layout.alignment:
+        raise ValueError("FP4 cache base and page stride must be 16-byte aligned")
+    if page_size <= 0 or cache.shape[1] < page_size * layout.record_bytes:
         raise ValueError("FP4 reader page geometry cannot hold the selected format")
     if (
         ids.ndim != 1
@@ -284,6 +296,8 @@ def read_fp4_cache(
             cache.stride(0),
             cache.shape[0],
             packed,
+            layout.data_bytes,
+            layout.value_bytes,
             num_warps=4,
         )
     return out

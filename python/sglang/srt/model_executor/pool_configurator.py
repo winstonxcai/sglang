@@ -10,8 +10,6 @@ from available GPU memory using a unified coeff+bias model:
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -19,6 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
