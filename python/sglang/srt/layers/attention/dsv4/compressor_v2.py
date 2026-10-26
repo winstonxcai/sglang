@@ -5,9 +5,6 @@ Author: Winston Cai.
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-from sglang.srt.remnant import capture as _capture
-
 from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cast
 
 import torch
@@ -20,7 +17,9 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.environ import envs
+from sglang.srt.remnant import capture as _capture
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata

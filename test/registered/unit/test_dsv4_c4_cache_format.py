@@ -5,13 +5,17 @@ Author: Winston Cai.
 
 import argparse
 import multiprocessing
+import unittest
 from multiprocessing.connection import Connection
 from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt import remnant
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _spawned_worker_modes(
@@ -357,11 +361,14 @@ class TestDSV4C4CacheFormat(CustomTestCase):
                 hicache_mem_layout="page_first",
             )
             hf = SimpleNamespace(compress_ratios=(0, 128, 4, 128, 4))
-            with mock.patch(
-                "sglang.srt.server_args.model_config_of",
-                return_value=SimpleNamespace(hf_config=hf),
-            ), mock.patch(
-                "sglang.srt.configs.model_config.is_deepseek_v4", return_value=True
+            with (
+                mock.patch(
+                    "sglang.srt.server_args.model_config_of",
+                    return_value=SimpleNamespace(hf_config=hf),
+                ),
+                mock.patch(
+                    "sglang.srt.configs.model_config.is_deepseek_v4", return_value=True
+                ),
             ):
                 if cp:
                     with self.assertRaisesRegex(ValueError, "--enable-prefill-cp"):
@@ -376,10 +383,10 @@ class TestDSV4C4CacheFormat(CustomTestCase):
     def test_model_context_preserves_and_restores_packed_dispatch(self):
         from sglang.srt.runtime_context import (
             create_context,
-            use_context,
-            snapshot_context,
-            restore_context,
             reset_context,
+            restore_context,
+            snapshot_context,
+            use_context,
         )
 
         packed = self._parse(
@@ -479,11 +486,19 @@ class TestDSV4C4CacheFormat(CustomTestCase):
                 enable_hierarchical_cache=False,
                 enable_prefill_cp=False,
             )
-            with self.subTest(implementation=implementation), mock.patch(
-                "sglang.srt.configs.model_config.is_deepseek_v4", return_value=True
-            ), mock.patch(
-                "sglang.srt.server_args.model_config_of",
-                return_value=SimpleNamespace(hf_config=object()),
+            with (
+                self.subTest(implementation=implementation),
+                mock.patch(
+                    "sglang.srt.configs.model_config.is_deepseek_v4", return_value=True
+                ),
+                mock.patch(
+                    "sglang.srt.server_args.model_config_of",
+                    return_value=SimpleNamespace(hf_config=object()),
+                ),
             ):
                 with self.assertRaisesRegex(ValueError, "--enable-hisparse"):
                     ServerArgs._configure_dsv4_c4_cache_format(args)
+
+
+if __name__ == "__main__":
+    unittest.main()

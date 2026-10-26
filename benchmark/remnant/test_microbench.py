@@ -542,6 +542,7 @@ def test_prefill_traffic_requires_reads_writes_hits_and_launch_coverage():
 
 def test_native_repage_preserves_values_scales_and_zero_padding():
     import ast
+
     import torch
 
     tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
@@ -1082,6 +1083,7 @@ def test_quantization_reference_accepts_rounding_and_rejects_wrong_codes():
 def test_portable_packed_codec_and_profile_contract(count):
     """Real Torch numerics without importing SGLang's CUDA-only package startup."""
     import importlib
+
     import torch
 
     runtime = load_module(
@@ -1262,20 +1264,34 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
     """Catch required/default ordering with the real upstream Arg and msgspec types."""
     import ast
     from typing import Optional
+
     import msgspec
 
-    args = load_module("_v0522_arg_utils", ROOT / "python/sglang/srt/arg_groups/arg_utils.py")
-    tree = ast.parse((ROOT / "python/sglang/srt/arg_groups/fields/model.py").read_text())
-    model = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Model")
-    model.body = [n for n in model.body if isinstance(n, ast.AnnAssign) and (
-        n.target.id == "model_path" or n.target.id.startswith("dsv4_c4_cache_")
-    )]
+    args = load_module(
+        "_v0522_arg_utils", ROOT / "python/sglang/srt/arg_groups/arg_utils.py"
+    )
+    tree = ast.parse(
+        (ROOT / "python/sglang/srt/arg_groups/fields/model.py").read_text()
+    )
+    model = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Model"
+    )
+    model.body = [
+        n
+        for n in model.body
+        if isinstance(n, ast.AnnAssign)
+        and (n.target.id == "model_path" or n.target.id.startswith("dsv4_c4_cache_"))
+    ]
     namespace = {"msgspec": msgspec, "A": args.A, "Arg": args.Arg, "Optional": Optional}
-    exec(compile(ast.Module([model], type_ignores=[]), "model-fields.py", "exec"), namespace)
+    exec(
+        compile(ast.Module([model], type_ignores=[]), "model-fields.py", "exec"),
+        namespace,
+    )
     record = namespace["Model"](model_path="dummy")
     assert record.dsv4_c4_cache_format == "native"
     assert record.dsv4_c4_cache_keep_count == 256
     assert record.dsv4_c4_cache_store_implementation is None
+
 
 # GLM owns a separate protocol; importing it must not load torch/FlashMLA.
 glm = load_module(

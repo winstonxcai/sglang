@@ -16,11 +16,13 @@ from sglang.srt.remnant.reference import (
     topmag_keep_mask,
     unpack_rows_ref,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestRemnantPack(CustomTestCase):
-
     def tearDown(self):
         remnant.configure_cache_format("native")
 

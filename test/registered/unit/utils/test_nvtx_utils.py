@@ -16,6 +16,15 @@ from unittest.mock import patch
 
 import torch
 
+_ci_spec = importlib.util.spec_from_file_location(
+    "remnant_ci_contract",
+    Path(__file__).resolve().parents[4] / "python/sglang/test/ci/ci_register.py",
+)
+_ci_registry = importlib.util.module_from_spec(_ci_spec)
+_ci_spec.loader.exec_module(_ci_registry)
+register_cpu_ci = _ci_registry.register_cpu_ci
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
 
 def load_helper():
     environ = ModuleType("sglang.srt.environ")

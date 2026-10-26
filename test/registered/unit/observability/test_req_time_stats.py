@@ -68,7 +68,8 @@ class TestOutputMetaInfo(CustomTestCase):
                 else:
                     self.assertAlmostEqual(meta_info["first_token_latency"], expected)
                     self.assertAlmostEqual(
-                        meta_info["first_output_ts"], rts.convert_time_to_realtime(first)
+                        meta_info["first_output_ts"],
+                        rts.convert_time_to_realtime(first),
                     )
 
     def test_tpot_excludes_first_token_from_denominator(self):

@@ -166,8 +166,7 @@ def configure_cache_format(
     """Set startup configuration; Native ignores the Packed implementation."""
     if cache_format not in {"native", "remnant"}:
         raise ValueError(
-            "dsv4_c4_cache_format must be 'native' or 'remnant', "
-            f"got {cache_format!r}"
+            f"dsv4_c4_cache_format must be 'native' or 'remnant', got {cache_format!r}"
         )
     if implementation not in {"triton", "kernel"}:
         raise ValueError(

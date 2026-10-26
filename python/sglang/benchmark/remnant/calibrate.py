@@ -14,16 +14,16 @@ import io
 import json
 import math
 import os
-import stat
 import shutil
+import stat
 import sys
-import time
-import types
 import tarfile
 import threading
-from uuid import uuid4
+import time
+import types
 from collections import defaultdict
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -540,9 +540,10 @@ def render_serving_request(body, encoder, request_type):
 
 
 def audit_serving_prompts(items, model):
-    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-    from sglang.srt.entrypoints.openai import encoding_dsv4 as encoder
     from transformers import AutoTokenizer
+
+    from sglang.srt.entrypoints.openai import encoding_dsv4 as encoder
+    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(model), trust_remote_code=True, local_files_only=True
@@ -1707,7 +1708,9 @@ def report(root):
         if all(summaries[s]["ci"][1] < 0 for s in summaries)
         and not regressions
         and not tails_regress
-        else "inconclusive" if packed["delta"] < 0 else "not beneficial"
+        else "inconclusive"
+        if packed["delta"] < 0
+        else "not beneficial"
     )
     summaries.update(
         assessment=verdict,
@@ -1805,20 +1808,20 @@ def report(root):
         svg.extend(
             [
                 f'<text x="50" y="{y0}" font-size="15">CSA {layer}: calibration sensitivity, mean normalized</text>',
-                f'<path d="M50 {y0+140}H850 M50 {y0+15}V{y0+140}" stroke="black" fill="none"/>',
-                f'<path d="M{50+448/511*800:.1f} {y0+15}V{y0+140}" stroke="gray" stroke-dasharray="4 4"/>',
+                f'<path d="M50 {y0 + 140}H850 M50 {y0 + 15}V{y0 + 140}" stroke="black" fill="none"/>',
+                f'<path d="M{50 + 448 / 511 * 800:.1f} {y0 + 15}V{y0 + 140}" stroke="gray" stroke-dasharray="4 4"/>',
             ]
         )
         for vector, color in ((empirical, "#137b51"), (predicted, "#315ac3")):
             points = " ".join(
-                f"{50+i/511*800:.1f},{y0+140-v/upper*120:.1f}"
+                f"{50 + i / 511 * 800:.1f},{y0 + 140 - v / upper * 120:.1f}"
                 for i, v in enumerate(vector)
             )
             svg.append(
                 f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="1"/>'
             )
         svg.append(
-            f'<text x="50" y="{y0+158}" font-size="12">0 — NoPE — 447 | RoPE — 511. Green: deletion; blue: analytic; y max {upper:.2f}.</text>'
+            f'<text x="50" y="{y0 + 158}" font-size="12">0 — NoPE — 447 | RoPE — 511. Green: deletion; blue: analytic; y max {upper:.2f}.</text>'
         )
     svg.append("</svg>")
     (root / "analysis/sensitivity.svg").write_text("\n".join(svg))

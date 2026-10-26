@@ -3,16 +3,16 @@
 Author: Winston Cai.
 """
 
+import copy
 import importlib
 import importlib.util
 import json
 import math as python_math
-import tempfile
-import unittest
-import copy
-import time
-import threading
 import tarfile
+import tempfile
+import threading
+import time
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,6 +28,16 @@ SPEC.loader.exec_module(math)
 ref = math.reference()
 capture = importlib.import_module(ref.__package__ + ".capture")
 packed = importlib.import_module(ref.__package__ + ".packed")
+
+
+_ci_spec = importlib.util.spec_from_file_location(
+    "remnant_ci_contract",
+    Path(__file__).resolve().parents[5] / "python/sglang/test/ci/ci_register.py",
+)
+_ci_registry = importlib.util.module_from_spec(_ci_spec)
+_ci_spec.loader.exec_module(_ci_registry)
+register_cpu_ci = _ci_registry.register_cpu_ci
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 class Plan:
@@ -193,13 +203,19 @@ class CalibrationTests(unittest.TestCase):
                                 "replacement admitted before predecessor checkpoint"
                             )
                         replacement_started.set()
-                    yield b"data: " + json.dumps(
-                        {
-                            "id": self.rid,
-                            "usage": {"prompt_tokens": 128000, "completion_tokens": 1},
-                            "choices": [{"finish_reason": "stop"}],
-                        }
-                    ).encode()
+                    yield (
+                        b"data: "
+                        + json.dumps(
+                            {
+                                "id": self.rid,
+                                "usage": {
+                                    "prompt_tokens": 128000,
+                                    "completion_tokens": 1,
+                                },
+                                "choices": [{"finish_reason": "stop"}],
+                            }
+                        ).encode()
+                    )
 
             def checkpoint(root, config, result):
                 checkpointed.append(result["rid"])
@@ -209,12 +225,12 @@ class CalibrationTests(unittest.TestCase):
             requests = SimpleNamespace(
                 post=lambda *a, **k: Response(k["headers"]["x-override-rid"])
             )
-            with patch.dict("sys.modules", {"requests": requests}), patch.object(
-                math, "state_paths", return_value=[[Path("unused")]]
-            ), patch.object(math, "load_state", return_value={}), patch.object(
-                math, "validate_state"
-            ), patch.object(
-                math, "checkpoint_issue", side_effect=checkpoint
+            with (
+                patch.dict("sys.modules", {"requests": requests}),
+                patch.object(math, "state_paths", return_value=[[Path("unused")]]),
+                patch.object(math, "load_state", return_value={}),
+                patch.object(math, "validate_state"),
+                patch.object(math, "checkpoint_issue", side_effect=checkpoint),
             ):
                 math.capture_client(root, "http://unused", time.monotonic() + 10)
             self.assertTrue(replacement_started.is_set())
@@ -696,9 +712,10 @@ class CalibrationTests(unittest.TestCase):
         # log(admitted rows), with FlashMLA's +inf sentinel for no rows.
         for shared in (False, True):
             for csa_count, swa_count in ((3, 2), (0, 2), (3, 0), (0, 0)):
-                with self.subTest(
-                    shared=shared, csa=csa_count, swa=swa_count
-                ), tempfile.TemporaryDirectory() as directory:
+                with (
+                    self.subTest(shared=shared, csa=csa_count, swa=swa_count),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
                     root = Path(directory)
                     paths, _ = self.shared_fixture(root / "old")
                     for path in paths:
@@ -753,9 +770,10 @@ class CalibrationTests(unittest.TestCase):
 
     def test_owner_capture_allows_empty_csa_selection(self):
         for schema in (1, 2):
-            with self.subTest(
-                schema=schema
-            ), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(schema=schema),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 math.atomic_json(
                     root / "capture-config.json",
@@ -919,8 +937,9 @@ class CalibrationTests(unittest.TestCase):
             self.assertFalse((root / "selected/shared/layer-04-constants.pt").exists())
 
     def test_capture_disabled_has_no_observer_or_copies(self):
-        with patch.object(capture, "_DIRECTORY", None), patch.object(
-            capture, "HostCopy", side_effect=AssertionError("copy")
+        with (
+            patch.object(capture, "_DIRECTORY", None),
+            patch.object(capture, "HostCopy", side_effect=AssertionError("copy")),
         ):
             self.assertFalse(capture.enabled())
             self.assertIsNone(capture.observer())
@@ -937,16 +956,18 @@ class CalibrationTests(unittest.TestCase):
                     "requests": {"issue": {"quota": 1}},
                 },
             )
-            with patch.object(
-                torch.distributed, "is_initialized", return_value=True
-            ), patch.object(torch.distributed, "get_rank", return_value=1):
+            with (
+                patch.object(torch.distributed, "is_initialized", return_value=True),
+                patch.object(torch.distributed, "get_rank", return_value=1),
+            ):
                 obs = capture.Observer(root)
             batch = SimpleNamespace(rids=["issue"])
             config_module = importlib.import_module(ref.__package__ + ".config")
-            with patch.object(
-                config_module, "packed_enabled", return_value=False
-            ), patch.object(
-                capture, "HostCopy", side_effect=AssertionError("shared copy")
+            with (
+                patch.object(config_module, "packed_enabled", return_value=False),
+                patch.object(
+                    capture, "HostCopy", side_effect=AssertionError("shared copy")
+                ),
             ):
                 obs.observe_raw(2, batch, None, None, None, None, None, None)
             self.assertEqual(obs.shadow, {})
@@ -966,9 +987,10 @@ class CalibrationTests(unittest.TestCase):
                     "requests": {"issue": {"quota": 1, "prompt_tokens": 100}},
                 },
             )
-            with patch.object(
-                torch.distributed, "is_initialized", return_value=True
-            ), patch.object(torch.distributed, "get_rank", return_value=1):
+            with (
+                patch.object(torch.distributed, "is_initialized", return_value=True),
+                patch.object(torch.distributed, "get_rank", return_value=1),
+            ):
                 obs = capture.Observer(root)
             batch = SimpleNamespace(
                 rids=["issue"],
@@ -985,9 +1007,14 @@ class CalibrationTests(unittest.TestCase):
                     type(self).calls += 1
                     super().__init__(tensor)
 
-            with patch.object(
-                capture, "native_records", side_effect=AssertionError("shared gather")
-            ), patch.object(capture, "HostCopy", CountingCopy):
+            with (
+                patch.object(
+                    capture,
+                    "native_records",
+                    side_effect=AssertionError("shared gather"),
+                ),
+                patch.object(capture, "HostCopy", CountingCopy),
+            ):
                 obs.observe_attention(
                     2,
                     batch,

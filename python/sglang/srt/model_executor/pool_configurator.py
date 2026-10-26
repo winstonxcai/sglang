@@ -10,8 +10,6 @@ from available GPU memory using a unified coeff+bias model:
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -19,6 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
@@ -256,8 +255,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Author: Winston Cai. Adapter scratch is shared by all MLA layers,
         # so charge it once before token sizing rather than per cache row.
         from sglang.srt.remnant.glm_config import enabled as glm_packed_enabled
-        if glm_packed_enabled() and num_layers and get_model().glm5_mla_cache_implementation == "adapter":
+
+        if (
+            glm_packed_enabled()
+            and num_layers
+            and get_model().glm5_mla_cache_implementation == "adapter"
+        ):
             from sglang.srt.remnant.glm_config import MAX_QUERY_CHUNK, SELECTION_COLUMNS
+
             self._fixed_overhead_bytes += MAX_QUERY_CHUNK * SELECTION_COLUMNS * 512
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
@@ -657,9 +662,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -1586,9 +1591,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         max_running_requests_per_worker = self._resolve_max_running_requests_per_worker(
             available_bytes
@@ -1644,9 +1649,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         # Token count, not a byte budget: the fixed pools are not re-subtracted, so
         # the input must not exceed what calculate_pool_sizes derived for it.
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

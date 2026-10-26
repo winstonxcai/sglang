@@ -27,7 +27,9 @@ if __name__ == "__main__":
     import argparse
 
     family_parser = argparse.ArgumentParser(add_help=False)
-    family_parser.add_argument("--model-family", choices=("dsv4", "glm53"), default="dsv4")
+    family_parser.add_argument(
+        "--model-family", choices=("dsv4", "glm53"), default="dsv4"
+    )
     family, _ = family_parser.parse_known_args()
     if family.model_family == "glm53":
         from sglang.benchmark.remnant.glm_attention import main as glm_main
@@ -36,11 +38,11 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
 import torch
-from sglang.benchmark.remnant.timing import measure, paired_samples
 from sgl_kernel import flash_mla
+
 from sglang.benchmark.remnant.cases import (
-    PROTOCOL,
     PREFILL_PROTOCOL,
+    PROTOCOL,
     DecodeCase,
     PrefillReadCase,
     StoreCase,
@@ -57,19 +59,20 @@ from sglang.benchmark.remnant.cases import (
     verify_profile_replay,
     write_results,
 )
+from sglang.benchmark.remnant.quantization import check_fp8_storage
+from sglang.benchmark.remnant.timing import measure, paired_samples
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
 )
-from sglang.benchmark.remnant.quantization import check_fp8_storage
 from sglang.srt import remnant
 from sglang.srt.remnant.packed import (
     NativeWorkspace,
     PackedBuffers,
     pack_rows,
     pack_rows_fused,
-    unpack_gather_native,
     unpack_gather_bf16,
+    unpack_gather_native,
 )
 from sglang.srt.remnant.reference import (
     _ue8m0_quantize,
@@ -413,9 +416,9 @@ def decode_operations(
         buffers = tuple(t.flatten(0, 1)[:rows] for t in cache)
         mask = topmag_keep_mask(x, keep_count / 512)
         expected = pack_rows_ref(x, mask, weight, EPS, keep_count=keep_count)
-        assert torch.equal(
-            buffers[1], expected[1]
-        ), f"{case.name}/{mode}: selection differs"
+        assert torch.equal(buffers[1], expected[1]), (
+            f"{case.name}/{mode}: selection differs"
+        )
         decoded = unpack_rows_ref(*buffers)
         check_fp8_storage(
             decoded, buffers[2], x, weight, EPS, case.name + "/" + mode, mask
@@ -816,9 +819,9 @@ def prefill_read_operations(
             )
             mask = topmag_keep_mask(x, keep_count / 512)
             expected = pack_rows_ref(x, mask, weight, EPS, keep_count=keep_count)
-            assert torch.equal(
-                actual[1], expected[1]
-            ), f"{case.name}/{label}: selection differs"
+            assert torch.equal(actual[1], expected[1]), (
+                f"{case.name}/{label}: selection differs"
+            )
             decoded = unpack_rows_ref(*actual)
             check_fp8_storage(
                 decoded, actual[2], x, weight, EPS, case.name + "/" + label, mask
@@ -1064,7 +1067,10 @@ def time_case(case, operations: list[Operation], args) -> dict:
             calls[op.key] = op.call
     by_key = {op.key: op for op in operations}
     samples, _ = paired_samples(
-        calls, args.rounds, case_seed(case, args.seed), repeats,
+        calls,
+        args.rounds,
+        case_seed(case, args.seed),
+        repeats,
         before=lambda key: configure(by_key[key].mode, by_key[key].keep_count),
         sample=measure,
     )
@@ -1351,7 +1357,7 @@ def main() -> None:
         payload["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         if can_write:
             write_results(payload, base)
-    print(f'json_output={base.with_suffix(".json")}')
+    print(f"json_output={base.with_suffix('.json')}")
 
 
 if __name__ == "__main__":

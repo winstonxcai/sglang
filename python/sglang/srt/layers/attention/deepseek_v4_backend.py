@@ -5,8 +5,6 @@ Author: Winston Cai.
 
 from __future__ import annotations
 
-from sglang.srt import remnant as _sg_lr
-
 import enum
 import functools
 import logging
@@ -55,6 +53,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt import remnant as _sg_lr
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -721,9 +720,9 @@ class DSV4AttnMetadata:
         # logical token; num_tokens is that unpadded length.
         if num_tokens is None:
             num_tokens = self.seq_lens_casual.shape[0]
-        assert (
-            self.raw_out_loc.shape[0] == num_tokens
-        ), f"{self.raw_out_loc.shape=}, {num_tokens=}"
+        assert self.raw_out_loc.shape[0] == num_tokens, (
+            f"{self.raw_out_loc.shape=}, {num_tokens=}"
+        )
 
         if self.has_c4 or self.has_c128:
             # One kernel produces both ratios; compute_page_indices=False only
@@ -824,13 +823,13 @@ class DSV4AttnMetadata:
         for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
             val = getattr(self, field_name, None)
             if val is None:
-                assert (
-                    field_name in self._CP_REINDEX_OPTIONAL_FIELDS
-                ), f"CP reindex: {field_name} is None"
+                assert field_name in self._CP_REINDEX_OPTIONAL_FIELDS, (
+                    f"CP reindex: {field_name} is None"
+                )
                 continue
-            assert isinstance(
-                val, torch.Tensor
-            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
+            assert isinstance(val, torch.Tensor), (
+                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
+            )
             val = val[idx].contiguous()
             setattr(self, field_name, val)
             assert val.shape[0] == expected_local_len, (
@@ -1146,9 +1145,9 @@ class DeepseekV4AttnBackend(
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
-        assert (
-            head_dim == 512
-        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
+        assert head_dim == 512, (
+            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
+        )
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -1281,10 +1280,7 @@ class DeepseekV4AttnBackend(
                 raise RuntimeError(
                     "packed is incompatible with CPU or decode KV offload"
                 )
-            if (
-                get_parallel().enable_prefill_cp
-                or get_parallel().attn_cp_size != 1
-            ):
+            if get_parallel().enable_prefill_cp or get_parallel().attn_cp_size != 1:
                 raise RuntimeError("packed is incompatible with context parallelism")
             self.remnant_workspace = _sg_lr.NativeWorkspace.allocate(
                 self.token_to_kv_pool.max_num_reqs,
@@ -3784,13 +3780,13 @@ class DeepseekV4AttnBackend(
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
-            assert (
-                swa_page_indices.shape[-1] % 64 == 0
-            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
+            assert swa_page_indices.shape[-1] % 64 == 0, (
+                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
+            )
             if extra_indices is not None:
-                assert (
-                    extra_indices.shape[-1] % 64 == 0
-                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+                assert extra_indices.shape[-1] % 64 == 0, (
+                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+                )
 
             # The tail stays dense: its window floor lives in swa_page_indices,
             # which the sparse chunk cache ignores.
@@ -4400,9 +4396,9 @@ class DeepseekV4AttnBackend(
                 f"and is only valid on the DSpark draft backend "
                 f"(is_dspark_draft={self.is_dspark_draft})."
             )
-            assert (
-                swa_replay_start is None
-            ), "swa_replay_start is not wired for the DSpark draft window"
+            assert swa_replay_start is None, (
+                "swa_replay_start is not wired for the DSpark draft window"
+            )
             if dspark_swa_buffers is None:
                 swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
                     seq_lens_casual=seq_lens_casual,

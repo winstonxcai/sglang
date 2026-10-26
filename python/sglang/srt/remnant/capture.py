@@ -357,8 +357,8 @@ class Observer:
                 continue
             cidx = csa_indices[index].reshape(-1).detach().cpu()
             sidx = swa_indices[index].reshape(-1).detach().cpu()
-            clen, slen = int(csa_lengths[index]), int(swa_lengths[index])
-            cvalid = (torch.arange(cidx.numel()) < clen) & (cidx != -1)
+            csa_length, slen = int(csa_lengths[index]), int(swa_lengths[index])
+            cvalid = (torch.arange(cidx.numel()) < csa_length) & (cidx != -1)
             svalid = (torch.arange(sidx.numel()) < slen) & (sidx != -1)
             if bool(
                 (
@@ -405,7 +405,7 @@ class Observer:
                 "swa_indices": sidx,
                 "csa_valid": cvalid,
                 "swa_valid": svalid,
-                "csa_length": clen,
+                "csa_length": csa_length,
                 "swa_length": slen,
                 "csa_page_size": csa_page_size,
                 "swa_page_size": swa_page_size,
