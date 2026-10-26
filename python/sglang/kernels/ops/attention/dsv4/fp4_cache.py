@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .kv_layout import NATIVE_FP4, PACKED_FP4
+from .kv_layout import NATIVE_FP4, PACKED_FP4, FP4CacheLayout
 
 
 @triton.jit
@@ -168,6 +168,18 @@ def _read(
     )
 
 
+def _validate_cache_pages(
+    cache: torch.Tensor, page_size: int, layout: FP4CacheLayout
+) -> None:
+    """Keep the store and reader on the same physical page contract."""
+    if cache.dtype != torch.uint8 or cache.ndim != 2 or not cache.is_contiguous():
+        raise ValueError("FP4 cache requires contiguous uint8 [pages,page_bytes] storage")
+    if cache.data_ptr() % layout.alignment or cache.stride(0) % layout.alignment:
+        raise ValueError("FP4 cache base and page stride must be 16-byte aligned")
+    if page_size <= 0 or cache.shape[1] < page_size * layout.record_bytes:
+        raise ValueError("FP4 cache page geometry cannot hold the selected format")
+
+
 def store_fp4_cache(
     x: torch.Tensor,
     cache: torch.Tensor,
@@ -193,14 +205,7 @@ def store_fp4_cache(
             "FP4 store requires BF16 [rows,512] latents contiguous in dimension 1"
         )
     layout = PACKED_FP4 if packed else NATIVE_FP4
-    if cache.dtype != torch.uint8 or cache.ndim != 2 or not cache.is_contiguous():
-        raise ValueError(
-            "FP4 cache requires contiguous uint8 [pages,page_bytes] storage"
-        )
-    if cache.data_ptr() % layout.alignment or cache.stride(0) % layout.alignment:
-        raise ValueError("FP4 cache base and page stride must be 16-byte aligned")
-    if page_size <= 0 or cache.shape[1] < page_size * layout.record_bytes:
-        raise ValueError("FP4 cache page geometry cannot hold the selected format")
+    _validate_cache_pages(cache, page_size, layout)
     if (
         loc.ndim != 1
         or loc.numel() != x.shape[0]
@@ -256,12 +261,7 @@ def read_fp4_cache(
     Stored global records already include RoPE; reconstruction never rotates.
     """
     layout = PACKED_FP4 if packed else NATIVE_FP4
-    if cache.dtype != torch.uint8 or cache.ndim != 2 or not cache.is_contiguous():
-        raise ValueError("FP4 reader requires contiguous uint8 pages")
-    if cache.data_ptr() % layout.alignment or cache.stride(0) % layout.alignment:
-        raise ValueError("FP4 cache base and page stride must be 16-byte aligned")
-    if page_size <= 0 or cache.shape[1] < page_size * layout.record_bytes:
-        raise ValueError("FP4 reader page geometry cannot hold the selected format")
+    _validate_cache_pages(cache, page_size, layout)
     if (
         ids.ndim != 1
         or ids.dtype not in (torch.int32, torch.int64)
