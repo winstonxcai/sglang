@@ -739,10 +739,17 @@ def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_pro
 def test_decode_bank_graph(heads, inner):
     """Focused decode loader, arithmetic, alternating-bank and changing-input replay."""
     target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
-    with patch(target, return_value=inner):
-        identity = _benchmark_bank_graph(heads, 4, 2, warmup_calls=1,
-                                        reference_device="cpu", phase="decode")
-        assert identity["inner_iter"] == inner
+    owner = torch.cuda.current_stream()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(owner)
+    try:
+        with torch.cuda.stream(stream), patch(target, return_value=inner):
+            identity = _benchmark_bank_graph(heads, 4, 2, warmup_calls=1,
+                                            reference_device="cpu", phase="decode")
+            assert identity["inner_iter"] == inner
+    finally:
+        owner.wait_stream(stream)
+        stream.synchronize()
 
 
 def _packed_loader_probe():
