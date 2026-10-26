@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from sglang.benchmark.remnant.glm_artifacts import ATTENTION_SCALE, packed_loader_probe
+from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.remnant.glm import (
     PackedCache,
@@ -28,7 +29,16 @@ from sglang.srt.remnant.glm import (
 )
 from sglang.srt.remnant.reference import topmag_keep_mask
 from sglang.srt.runtime_context import get_context
-from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# This suite requires the explicitly owned preparation/qualification workflow.
+# A disabled generic CI registration does not skip the maintained pytest runner.
+register_cuda_ci(
+    est_time=0,
+    stage="base-a",
+    runner_config="1-gpu-small",
+    disabled="Manual H100 qualification with CPU-prepared artifacts; run scripts/modal/kernels.py --model-family glm53",
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="H100 required")
 
@@ -37,8 +47,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="H100 requ
 def model_free_rank_context():
     from sglang.srt.runtime_context import get_parallel
 
-    with torch.inference_mode(), get_parallel().override(
-        attn_dcp_rank=0, attn_cp_rank=0, attn_tp_rank=0
+    with (
+        torch.inference_mode(),
+        get_parallel().override(attn_dcp_rank=0, attn_cp_rank=0, attn_tp_rank=0),
     ):
         yield
 
@@ -305,7 +316,7 @@ def test_changing_input_graph(implementation):
 
 
 def make_pool(size, implementation="native", layers=11, mamba=None):
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, DSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
     from sglang.srt.remnant.glm_pool import GLMPackedTokenToKVPool
 
     return HybridLinearKVPool(
@@ -387,6 +398,7 @@ def test_pool_lifecycle():
 
 def test_production_backend_constructor():
     from types import SimpleNamespace
+
     from sglang.srt.configs.glm5_next import Glm5NextConfig
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
@@ -443,6 +455,7 @@ def test_production_backend_constructor():
 
 def test_allocator_accounting():
     from types import SimpleNamespace
+
     from sglang.srt.configs.glm5_next import Glm5NextConfig
     from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -507,13 +520,14 @@ def test_allocator_accounting():
 
 
 def test_real_gpu_allocations(tmp_path):
+    from dsv4.test_remnant_pool import _gpu_storages
+
     from sglang.srt.configs.mamba_utils import (
         KimiLinearCacheParams,
         KimiLinearStateShape,
         Mamba2StateDType,
     )
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-    from dsv4.test_remnant_pool import _gpu_storages
 
     source = Path(os.environ["REMNANT_GLM_MODEL_CONFIG"])
     assert (
@@ -610,9 +624,9 @@ def test_real_gpu_allocations(tmp_path):
                                 assert block["requested_size"] == wanted[block_address]
                                 blocks[block_address] = block["size"]
                             address += block["size"]
-                    assert (
-                        blocks.keys() == wanted.keys()
-                    ), "Some pool backing blocks were not reconciled"
+                    assert blocks.keys() == wanted.keys(), (
+                        "Some pool backing blocks were not reconciled"
+                    )
                     physical_bytes = sum(blocks.values())
                     workspace = 128 * 2112 * 512 if mode == "adapter" else 0
                     latent = 11 * (size + 256) * row_bytes
@@ -672,26 +686,39 @@ def test_benchmark_bank_graph_ownership(heads, banks):
     _benchmark_bank_graph(heads, banks, 128 if heads == 8 else 512)
 
 
-def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10, reference_device=None, phase="prefill"):
+def _benchmark_bank_graph(
+    heads, banks, queries, *, warmup_calls=10, reference_device=None, phase="prefill"
+):
     import time
-    from sglang.benchmark.remnant.glm_attention import Fixture, Case
+
+    from sglang.benchmark.remnant.glm_attention import Case, Fixture
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_inner_iter
 
     raw, norm, cache = fixture()
     f = Fixture.__new__(Fixture)
     f.case = Case(phase, heads, queries, 3, "independent", "rotating")
     f.deadline = time.monotonic() + 1200
-    f.banks, f.memory_limit = banks, int(torch.cuda.get_device_properties(0).total_memory * 0.7)
+    f.banks, f.memory_limit = (
+        banks,
+        int(torch.cuda.get_device_properties(0).total_memory * 0.7),
+    )
     f.q = torch.randn(queries, heads, 512, dtype=torch.bfloat16, device="cuda")
     f.native, f.packed, f.ids, f.graphs, f.outputs = [], [], [], {}, {}
-    inner = _pick_inner_iter(queries, 66, torch.cuda.get_device_properties(0).multi_processor_count, 1)
+    inner = _pick_inner_iter(
+        queries, 66, torch.cuda.get_device_properties(0).multi_processor_count, 1
+    )
     f.identity = {"inner_iter": inner}
     for bank in range(banks):
         changed = raw.roll(bank, 0).contiguous()
-        values, bitmaps = torch.zeros_like(cache.values), torch.zeros_like(cache.bitmaps)
-        normalize_and_store(changed, norm, torch.arange(len(raw), device="cuda"), values, bitmaps)
+        values, bitmaps = (
+            torch.zeros_like(cache.values),
+            torch.zeros_like(cache.bitmaps),
+        )
+        normalize_and_store(
+            changed, norm, torch.arange(len(raw), device="cuda"), values, bitmaps
+        )
         native = torch.zeros(len(values), 512, dtype=torch.uint8, device="cuda")
-        native[:len(raw)] = norm(changed).to(torch.float8_e4m3fn).view(torch.uint8)
+        native[: len(raw)] = norm(changed).to(torch.float8_e4m3fn).view(torch.uint8)
         f.native.append(native)
         f.packed.append(PackedCache(values, bitmaps, None, "direct"))
         f.ids.append(selection(queries, bank % 4))
@@ -699,22 +726,28 @@ def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10, reference_d
         # Unprofiled full-size smoke establishes CPU/GPU oracle parity on actual
         # probe inputs; focused tools then keep cuBLAS oracle work off the GPU.
         from sglang.benchmark.remnant.glm_attention import attention_reference
+
         sample = min(8, queries)
         args = (f.q[:sample], f.native[0], f.ids[0][:sample, 0])
-        torch.testing.assert_close(attention_reference(*args),
-                                   attention_reference(*args, device="cpu"),
-                                   atol=0.02, rtol=0.02)
+        torch.testing.assert_close(
+            attention_reference(*args),
+            attention_reference(*args, device="cpu"),
+            atol=0.02,
+            rtol=0.02,
+        )
     f.validate(reference_device=reference_device)
-    f.capture(warmup_calls=warmup_calls,
-              capture_stream=torch.cuda.current_stream() if phase == "decode" else None,
-              reference_device=reference_device)
+    f.capture(
+        warmup_calls=warmup_calls,
+        capture_stream=torch.cuda.current_stream() if phase == "decode" else None,
+        reference_device=reference_device,
+    )
     f.q.normal_()
     for ids in f.ids:
         ids[1] = -1
     f.validate_replay(reference_device=reference_device)
     f.validate(reference_device=reference_device)
-    assert f.identity['native_graph_bytes'] > 0
-    assert f.identity['direct_graph_bytes'] > 0
+    assert f.identity["native_graph_bytes"] > 0
+    assert f.identity["direct_graph_bytes"] > 0
     return f.identity
 
 
@@ -728,13 +761,27 @@ def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_pro
     """
     target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
     with patch(target, return_value=inner) as dispatch:
-        identity = _benchmark_bank_graph(heads, banks, queries, warmup_calls=1, reference_device="cpu")
+        identity = _benchmark_bank_graph(
+            heads, banks, queries, warmup_calls=1, reference_device="cpu"
+        )
         assert identity["inner_iter"] == inner
         assert dispatch.call_count > 1
-    record_property("probe_geometry", json.dumps(dict(probe="focused-bank-graph", heads=heads, banks=banks,
-                          queries=queries, forced_inner=inner, warmup_calls=1,
-                          actual_warmup_calls_per_mode=banks, reference_device="cpu",
-                          measured_warmup_calls=10)))
+    record_property(
+        "probe_geometry",
+        json.dumps(
+            dict(
+                probe="focused-bank-graph",
+                heads=heads,
+                banks=banks,
+                queries=queries,
+                forced_inner=inner,
+                warmup_calls=1,
+                actual_warmup_calls_per_mode=banks,
+                reference_device="cpu",
+                measured_warmup_calls=10,
+            )
+        ),
+    )
 
 
 @pytest.mark.parametrize("inner", [1, 2])
@@ -742,62 +789,84 @@ def test_benchmark_sanitizer_bank_graph(heads, banks, queries, inner, record_pro
 def test_decode_bank_graph(heads, inner, record_property):
     """Focused decode loader, arithmetic, alternating-bank and changing-input replay."""
     target = "sglang.kernels.ops.attention.dsa.tilelang_kernel._pick_inner_iter"
-    record_property("decode_geometry", json.dumps(dict(heads=heads, inner=inner,
-        banks=4, queries=2, tails=[0,1,2,3], nondefault_stream=True)))
+    record_property(
+        "decode_geometry",
+        json.dumps(
+            dict(
+                heads=heads,
+                inner=inner,
+                banks=4,
+                queries=2,
+                tails=[0, 1, 2, 3],
+                nondefault_stream=True,
+            )
+        ),
+    )
     owner = torch.cuda.current_stream()
     stream = torch.cuda.Stream()
     stream.wait_stream(owner)
     try:
         with torch.cuda.stream(stream), patch(target, return_value=inner):
-            identity = _benchmark_bank_graph(heads, 4, 2, warmup_calls=1,
-                                            reference_device="cpu", phase="decode")
+            identity = _benchmark_bank_graph(
+                heads, 4, 2, warmup_calls=1, reference_device="cpu", phase="decode"
+            )
             assert identity["inner_iter"] == inner
     finally:
         owner.wait_stream(stream)
         stream.synchronize()
 
 
-
 def test_packed_loader_bytes():
     import numpy as np
+
     probe = packed_loader_probe()
     # 256 * index crosses signed 32-bit at index 8388608.
     slots = 8388610
-    values = torch.empty(slots,256,dtype=torch.uint8,device="cuda")
-    bitmap = torch.empty(slots,8,dtype=torch.uint64,device="cuda")
-    host_values = np.tile(np.arange(256,dtype=np.uint8),(16,1))
-    host_words = np.zeros((16,8),dtype=np.uint64)
+    values = torch.empty(slots, 256, dtype=torch.uint8, device="cuda")
+    bitmap = torch.empty(slots, 8, dtype=torch.uint64, device="cuda")
+    host_values = np.tile(np.arange(256, dtype=np.uint8), (16, 1))
+    host_words = np.zeros((16, 8), dtype=np.uint64)
     for row in range(16):
-        mask = np.zeros(512,dtype=bool)
-        if row == 0: mask[:256] = True
-        elif row == 1: mask[256:] = True
-        elif row == 2: mask[:] = True
-        elif row == 3: pass
+        mask = np.zeros(512, dtype=bool)
+        if row == 0:
+            mask[:256] = True
+        elif row == 1:
+            mask[256:] = True
+        elif row == 2:
+            mask[:] = True
+        elif row == 3:
+            pass
         else:
-            mask[np.random.default_rng(20261024+row).choice(512,256,replace=False)] = True
+            mask[
+                np.random.default_rng(20261024 + row).choice(512, 256, replace=False)
+            ] = True
         for w in range(8):
-            host_words[row,w] = sum(int(mask[w*64+j]) << (63-j) for j in range(64))
-    locations = [*range(15), slots-1]
+            host_words[row, w] = sum(
+                int(mask[w * 64 + j]) << (63 - j) for j in range(64)
+            )
+    locations = [*range(15), slots - 1]
     for row, loc in enumerate(locations):
         values[loc].copy_(torch.from_numpy(host_values[row]).cuda())
         bitmap[loc].copy_(torch.from_numpy(host_words[row]).cuda())
-    host_ids = np.array([*locations, -1, slots, -9, *locations[:13]],dtype=np.int32)
-    expected = np.zeros((32,512),dtype=np.uint8)
+    host_ids = np.array([*locations, -1, slots, -9, *locations[:13]], dtype=np.int32)
+    expected = np.zeros((32, 512), dtype=np.uint8)
     for row, loc in enumerate(host_ids):
-        if loc not in locations: continue
-        src = locations.index(loc); rank = 0
+        if loc not in locations:
+            continue
+        src = locations.index(loc)
+        rank = 0
         for j in range(512):
-            if int(host_words[src,j//64]) & (1 << (63-j%64)):
-                if rank < 256: expected[row,j] = host_values[src,rank]
+            if int(host_words[src, j // 64]) & (1 << (63 - j % 64)):
+                if rank < 256:
+                    expected[row, j] = host_values[src, rank]
                 rank += 1
-    actual = probe(slots)(values,bitmap,torch.from_numpy(host_ids).cuda())
+    actual = probe(slots)(values, bitmap, torch.from_numpy(host_ids).cuda())
     torch.cuda.synchronize()
     assert np.array_equal(actual.cpu().numpy(), expected)
     # Do not carry the >2 GiB address probe's cached allocation into graph tools.
     del actual, values, bitmap
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
-
 
 
 class _CachedPartial:
@@ -820,8 +889,11 @@ class _CachedPartial:
         assert hashlib.sha256(path.read_bytes()).hexdigest() == variant["cubin_sha256"]
         self._check(self.driver.cuModuleLoad(C.byref(self.module), str(path).encode()))
         try:
-            self._check(self.driver.cuModuleGetFunction(C.byref(self.function), self.module,
-                                                       variant["symbol"].encode()))
+            self._check(
+                self.driver.cuModuleGetFunction(
+                    C.byref(self.function), self.module, variant["symbol"].encode()
+                )
+            )
         except BaseException:
             self.close()
             raise
@@ -829,7 +901,9 @@ class _CachedPartial:
     @staticmethod
     def _check(status):
         if status:
-            raise RuntimeError(f"Focused production partial CUDA Driver error: {status}")
+            raise RuntimeError(
+                f"Focused production partial CUDA Driver error: {status}"
+            )
 
     def __call__(self, tensors, *, slots, stream):
         C = self.C
@@ -841,8 +915,21 @@ class _CachedPartial:
                 assert param["type"] == "int"
                 arguments.append(C.c_int(slots if param["name"] == "num_pages" else 1))
         pointers = (C.c_void_p * len(arguments))(*(C.addressof(x) for x in arguments))
-        self._check(self.driver.cuLaunchKernel(self.function, 1, 1, 1, 128, 1, 1,
-                    self.variant["dynamic_shared"], C.c_void_p(stream.cuda_stream), pointers, None))
+        self._check(
+            self.driver.cuLaunchKernel(
+                self.function,
+                1,
+                1,
+                1,
+                128,
+                1,
+                1,
+                self.variant["dynamic_shared"],
+                C.c_void_p(stream.cuda_stream),
+                pointers,
+                None,
+            )
+        )
 
     def close(self):
         if self.module.value:
@@ -864,17 +951,37 @@ def test_decode_partial_graph(heads, inner, record_property):
 
     manifest = os.environ.get("REMNANT_GLM_COMPILE_MANIFEST")
     if not manifest:
-        pytest.fail("Set REMNANT_GLM_COMPILE_MANIFEST to the output of "
-                    "python -m sglang.benchmark.remnant.glm_artifacts before focused tests")
+        pytest.fail(
+            "Set REMNANT_GLM_COMPILE_MANIFEST to the output of "
+            "python -m sglang.benchmark.remnant.glm_artifacts before focused tests"
+        )
     compiled = json.loads(Path(manifest).read_text())
-    variants = {v["packed"]: v for v in compiled["tilelang"]
-                if v["heads"] == heads and v["inner"] == inner}
-    record_property("decode_geometry", json.dumps(dict(heads=heads, inner=inner,
-        banks=2, queries=1, tails=[0,1,2,3], nondefault_stream=True,
-        launched_partitions=1, binary_partitions=66//inner)))
-    record_property("partial_cubins", json.dumps({str(k): v["cubin_sha256"] for k,v in variants.items()}))
+    variants = {
+        v["packed"]: v
+        for v in compiled["tilelang"]
+        if v["heads"] == heads and v["inner"] == inner
+    }
+    record_property(
+        "decode_geometry",
+        json.dumps(
+            dict(
+                heads=heads,
+                inner=inner,
+                banks=2,
+                queries=1,
+                tails=[0, 1, 2, 3],
+                nondefault_stream=True,
+                launched_partitions=1,
+                binary_partitions=66 // inner,
+            )
+        ),
+    )
+    record_property(
+        "partial_cubins",
+        json.dumps({str(k): v["cubin_sha256"] for k, v in variants.items()}),
+    )
     slots = 513  # Both sides of 256-token page boundaries.
-    rng = np.random.default_rng(20261024 + heads*10 + inner)
+    rng = np.random.default_rng(20261024 + heads * 10 + inner)
     owner, stream = torch.cuda.current_stream(), torch.cuda.Stream()
     stream.wait_stream(owner)
     kernels, graphs = {}, {}
@@ -882,67 +989,117 @@ def test_decode_partial_graph(heads, inner, record_property):
         with torch.cuda.stream(stream):
             banks = []
             for bank in range(2):
-                payload = rng.integers(0, 112, (slots,256), dtype=np.uint8)
-                words = np.zeros((slots,8), dtype=np.uint64)
-                dense = np.zeros((slots,512), dtype=np.uint8)
+                payload = rng.integers(0, 112, (slots, 256), dtype=np.uint8)
+                words = np.zeros((slots, 8), dtype=np.uint64)
+                dense = np.zeros((slots, 512), dtype=np.uint8)
                 for row in range(slots):
-                    coords = np.sort(rng.choice(512,256,replace=False))
+                    coords = np.sort(rng.choice(512, 256, replace=False))
                     # Independent ascending-coordinate scatter; finite raw codes.
-                    dense[row,coords] = payload[row]
+                    dense[row, coords] = payload[row]
                     for coord in coords:
-                        words[row,coord//64] |= np.uint64(1) << np.uint64(63-coord%64)
-                q = torch.from_numpy(rng.normal(0,.15,(1,1,heads,512)).astype(np.float32)).to(torch.float8_e4m3fn)
-                ids = np.full((1,1,1,2112),-1,dtype=np.int32)
+                        words[row, coord // 64] |= np.uint64(1) << np.uint64(
+                            63 - coord % 64
+                        )
+                q = torch.from_numpy(
+                    rng.normal(0, 0.15, (1, 1, heads, 512)).astype(np.float32)
+                ).to(torch.float8_e4m3fn)
+                ids = np.full((1, 1, 1, 2112), -1, dtype=np.int32)
                 # First partition contains duplicates, invalid and partial rows;
                 # tails occupy its final three entries to reach the changed loader.
-                ids[0,0,0,:32*inner] = np.resize(np.array([0,1,255,256,511,512,-1,slots],np.int32),32*inner)
+                ids[0, 0, 0, : 32 * inner] = np.resize(
+                    np.array([0, 1, 255, 256, 511, 512, -1, slots], np.int32),
+                    32 * inner,
+                )
                 if inner == 2:
-                    ids[0,0,0,:32] = -1  # Empty tile followed by a live tile.
-                ids[0,0,0,32*inner-3:] = -1
-                ids[0,0,0,32*inner-3:32*inner-3+bank] = np.arange(bank)+510
-                common = dict(q_fp8=q.view(torch.uint8).cuda(), indices=torch.from_numpy(ids).cuda(),
-                    partial_o=torch.empty(1,1,66//inner,heads,512,dtype=torch.bfloat16,device="cuda"),
-                    partial_lse=torch.empty(1,1,66//inner,heads,dtype=torch.float32,device="cuda"))
+                    ids[0, 0, 0, :32] = -1  # Empty tile followed by a live tile.
+                ids[0, 0, 0, 32 * inner - 3 :] = -1
+                ids[0, 0, 0, 32 * inner - 3 : 32 * inner - 3 + bank] = (
+                    np.arange(bank) + 510
+                )
+                common = dict(
+                    q_fp8=q.view(torch.uint8).cuda(),
+                    indices=torch.from_numpy(ids).cuda(),
+                    partial_o=torch.empty(
+                        1,
+                        1,
+                        66 // inner,
+                        heads,
+                        512,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    ),
+                    partial_lse=torch.empty(
+                        1, 1, 66 // inner, heads, dtype=torch.float32, device="cuda"
+                    ),
+                )
                 native_ids = ids.copy()
-                native_ids[native_ids >= slots] = -1  # Stock Native guards negative IDs only.
-                banks.append({False: dict(common,indices=torch.from_numpy(native_ids).cuda(),kv_fp8=torch.from_numpy(dense).cuda(),
-                                              bitmap=torch.zeros(1,1,dtype=torch.uint64,device="cuda")),
-                              True: dict(common,kv_fp8=torch.from_numpy(payload).cuda(),
-                                             bitmap=torch.from_numpy(words).cuda())})
-            for mode in (False,True):
+                native_ids[
+                    native_ids >= slots
+                ] = -1  # Stock Native guards negative IDs only.
+                banks.append(
+                    {
+                        False: dict(
+                            common,
+                            indices=torch.from_numpy(native_ids).cuda(),
+                            kv_fp8=torch.from_numpy(dense).cuda(),
+                            bitmap=torch.zeros(1, 1, dtype=torch.uint64, device="cuda"),
+                        ),
+                        True: dict(
+                            common,
+                            kv_fp8=torch.from_numpy(payload).cuda(),
+                            bitmap=torch.from_numpy(words).cuda(),
+                        ),
+                    }
+                )
+            for mode in (False, True):
                 kernels[mode] = _CachedPartial(variants[mode])
                 # Preload the module/function before capture; no lazy compilation.
-                kernels[mode](banks[0][mode],slots=slots,stream=stream)
+                kernels[mode](banks[0][mode], slots=slots, stream=stream)
             stream.synchronize()
-            for mode in (False,True):
+            for mode in (False, True):
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph,stream=stream):
+                with torch.cuda.graph(graph, stream=stream):
                     for bank in banks:
-                        kernels[mode](bank[mode],slots=slots,stream=stream)
+                        kernels[mode](bank[mode], slots=slots, stream=stream)
                 graphs[mode] = graph
             for phase in range(2):
                 if phase:
-                    for b,bank in enumerate(banks):
-                        new_q = torch.from_numpy(rng.normal(0,.15,(1,1,heads,512)).astype(np.float32)).to(torch.float8_e4m3fn).view(torch.uint8)
+                    for b, bank in enumerate(banks):
+                        new_q = (
+                            torch.from_numpy(
+                                rng.normal(0, 0.15, (1, 1, heads, 512)).astype(
+                                    np.float32
+                                )
+                            )
+                            .to(torch.float8_e4m3fn)
+                            .view(torch.uint8)
+                        )
                         new_ids = bank[True]["indices"].cpu()
-                        new_ids[0,0,0,32*inner-3:32*inner] = -1
-                        new_ids[0,0,0,32*inner-3:32*inner-3+2+b] = torch.arange(2+b,dtype=torch.int32)+510
+                        new_ids[0, 0, 0, 32 * inner - 3 : 32 * inner] = -1
+                        new_ids[0, 0, 0, 32 * inner - 3 : 32 * inner - 3 + 2 + b] = (
+                            torch.arange(2 + b, dtype=torch.int32) + 510
+                        )
                         bank[False]["q_fp8"].copy_(new_q)
                         bank[True]["indices"].copy_(new_ids)
                         new_ids[new_ids >= slots] = -1
                         bank[False]["indices"].copy_(new_ids)
                 results = {}
                 # Opposite order after mutation verifies alternating mode ownership.
-                for mode in ((False,True) if not phase else (True,False)):
+                for mode in (False, True) if not phase else (True, False):
                     graphs[mode].replay()
                     stream.synchronize()
-                    results[mode] = [(bank[mode]["partial_o"][0,0,0].cpu().float(),
-                                      bank[mode]["partial_lse"][0,0,0].cpu()) for bank in banks]
-                for actual,expected in zip(results[True],results[False]):
+                    results[mode] = [
+                        (
+                            bank[mode]["partial_o"][0, 0, 0].cpu().float(),
+                            bank[mode]["partial_lse"][0, 0, 0].cpu(),
+                        )
+                        for bank in banks
+                    ]
+                for actual, expected in zip(results[True], results[False]):
                     assert torch.isfinite(actual[0]).all()
                     assert torch.isfinite(actual[1]).all()
-                    for a,e in zip(actual,expected):
-                        torch.testing.assert_close(a,e,atol=.02,rtol=.02)
+                    for a, e in zip(actual, expected):
+                        torch.testing.assert_close(a, e, atol=0.02, rtol=0.02)
     finally:
         # Graph nodes retain CUDA function handles. Destroy them before unloading.
         stream.synchronize()
@@ -951,8 +1108,6 @@ def test_decode_partial_graph(heads, inner, record_property):
         for kernel in kernels.values():
             kernel.close()
         owner.wait_stream(stream)
-
-
 
 
 def test_adapter_reconstruction_above_2gib():

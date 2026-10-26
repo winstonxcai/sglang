@@ -117,8 +117,8 @@ def packed_loader_probe():
 def compile_sm90_variant(case: tuple[int, int]) -> list[PartialVariant]:
     """One independent head/split pair, owned by a CPU compiler process."""
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
-        sparse_mla_fwd_decode_partial_fp8,
         sparse_mla_fwd_decode_combine,
+        sparse_mla_fwd_decode_partial_fp8,
     )
 
     heads, inner = case
@@ -168,6 +168,7 @@ def precompile_sm90() -> None:
     )
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
+
     from sglang.srt.remnant.glm import compile_kernels
 
     store, unpack = compile_kernels()

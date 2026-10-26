@@ -196,6 +196,7 @@ def parser() -> argparse.ArgumentParser:
 def packed_reference(raw, norm):
     """Independent Torch byte/bitmap reference; MSB-first words, ascending values."""
     import torch
+
     from sglang.srt.remnant.reference import topmag_keep_mask
 
     keep = topmag_keep_mask(raw, 0.5)
@@ -294,6 +295,7 @@ class Fixture:
 
     def __init__(self, case: Case, deadline: float):
         import torch
+
         from sglang.srt.layers.layernorm import RMSNorm
         from sglang.srt.remnant.glm import PackedCache, normalize_and_store
 
@@ -429,6 +431,7 @@ class Fixture:
 
     def call(self, mode: str, bank: int):
         import torch
+
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
         from sglang.srt.remnant.glm import attention
 
@@ -446,11 +449,14 @@ class Fixture:
 
     def validate(self, *, reference_device=None) -> None:
         import torch
+
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         cpu = reference_device == "cpu"
         sample = torch.linspace(
-            0, self.case.queries - 1, min(8, self.case.queries),
+            0,
+            self.case.queries - 1,
+            min(8, self.case.queries),
             device="cpu" if cpu else "cuda",
         ).long()
         for bank in range(self.banks):
@@ -462,28 +468,50 @@ class Fixture:
             selected = ids[sample, 0]
             dense, local = selected_packed_reference(
                 cache.values.cpu() if cpu else cache.values,
-                cache.bitmaps.cpu() if cpu else cache.bitmaps, selected)
+                cache.bitmaps.cpu() if cpu else cache.bitmaps,
+                selected,
+            )
             query = self.q.cpu()[sample] if cpu else self.q[sample]
             native_ref = attention_reference(
-                query, self.native[bank].cpu() if cpu else self.native[bank],
-                selected, device=reference_device)
-            direct_ref = attention_reference(query, dense, local, device=reference_device)
+                query,
+                self.native[bank].cpu() if cpu else self.native[bank],
+                selected,
+                device=reference_device,
+            )
+            direct_ref = attention_reference(
+                query, dense, local, device=reference_device
+            )
             for mode, reference in (("native", native_ref), ("direct", direct_ref)):
                 output = self.call(mode, bank)
                 checked = output.cpu() if cpu else output
                 if not bool(torch.isfinite(checked).all()):
-                    raise RuntimeError(f"{self.case.name}/{bank}/{mode}: nonfinite output")
-                torch.testing.assert_close(checked[:, sample], reference, atol=ATOL, rtol=RTOL)
+                    raise RuntimeError(
+                        f"{self.case.name}/{bank}/{mode}: nonfinite output"
+                    )
+                torch.testing.assert_close(
+                    checked[:, sample], reference, atol=ATOL, rtol=RTOL
+                )
                 if mode == "direct":
                     stock = tilelang_sparse_fwd(
                         query.to("cuda") if cpu else query,
-                        (dense.to("cuda") if cpu else dense).view(torch.float8_e4m3fn).unsqueeze(1),
-                        (local.to("cuda") if cpu else local).unsqueeze(1), SCALE, DIM)
+                        (dense.to("cuda") if cpu else dense)
+                        .view(torch.float8_e4m3fn)
+                        .unsqueeze(1),
+                        (local.to("cuda") if cpu else local).unsqueeze(1),
+                        SCALE,
+                        DIM,
+                    )
                     torch.testing.assert_close(
-                        checked[:, sample], stock.cpu() if cpu else stock, atol=ATOL, rtol=RTOL)
+                        checked[:, sample],
+                        stock.cpu() if cpu else stock,
+                        atol=ATOL,
+                        rtol=RTOL,
+                    )
                 del output, checked
 
-    def capture(self, *, warmup_calls: int = 10, capture_stream=None, reference_device=None) -> None:
+    def capture(
+        self, *, warmup_calls: int = 10, capture_stream=None, reference_device=None
+    ) -> None:
         import torch
 
         if warmup_calls < 1:
@@ -497,8 +525,11 @@ class Fixture:
             graph = torch.cuda.CUDAGraph()
             # Tests can capture directly on their explicitly owned stream.
             # Timing leaves this None and preserves Torch's default side stream.
-            capture = (torch.cuda.graph(graph) if capture_stream is None else
-                       torch.cuda.graph(graph, stream=capture_stream))
+            capture = (
+                torch.cuda.graph(graph)
+                if capture_stream is None
+                else torch.cuda.graph(graph, stream=capture_stream)
+            )
             with capture:
                 for bank in range(self.banks):
                     output = self.call(mode, bank)
@@ -585,14 +616,21 @@ def runtime_hashes(root: Path) -> dict[str, str]:
 
 def source_manifest() -> dict:
     import torch
-    import sglang.srt.remnant.glm as codec
-    import sglang.kernels.ops.attention.dsa.tilelang_kernel as tile
+
     import sglang.benchmark.remnant.timing as timing
+    import sglang.kernels.ops.attention.dsa.tilelang_kernel as tile
+    import sglang.srt.remnant.glm as codec
 
     sources = {
         str(Path(p).resolve()): hashlib.sha256(Path(p).read_bytes()).hexdigest()
-        for p in (__file__, codec.__file__, tile.__file__, timing.__file__,
-                  Path(tile.__file__).resolve().parents[3] / "jit/include/sgl_kernel/glm_packed_decode.cuh")
+        for p in (
+            __file__,
+            codec.__file__,
+            tile.__file__,
+            timing.__file__,
+            Path(tile.__file__).resolve().parents[3]
+            / "jit/include/sgl_kernel/glm_packed_decode.cuh",
+        )
     }
     build_path = os.environ.get("REMNANT_BUILD_MANIFEST_PATH")
     return dict(
@@ -656,7 +694,9 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             raise RuntimeError("GLM checkpoint exceeds the required matrix")
         expected = expected[: len(payload["cases"])]
     if [c["name"] for c in payload["cases"]] != [c.name for c in expected]:
-        raise RuntimeError(f"GLM timing requires the ordered {len(cases(phase))}-case {phase} matrix")
+        raise RuntimeError(
+            f"GLM timing requires the ordered {len(cases(phase))}-case {phase} matrix"
+        )
     for case, definition in zip(payload["cases"], expected):
         if (
             not case.get("valid")
@@ -736,28 +776,55 @@ def resume_prefix(previous: dict, source: dict, phase: str = "all") -> list[dict
 
 def weighted_overhead(records: list[dict]) -> dict:
     """Batch-weighted mean of paired round overheads; other axes equal weight."""
+
     def score(rows):
         weight = sum(c["case"]["queries"] for c in rows)
-        return (100 * sum(c["case"]["queries"] *
-                (sum(c["paired_ratios"]["direct_over_native"]["samples"]) / ROUNDS - 1)
-                for c in rows) / weight) if weight else None
+        return (
+            (
+                100
+                * sum(
+                    c["case"]["queries"]
+                    * (
+                        sum(c["paired_ratios"]["direct_over_native"]["samples"])
+                        / ROUNDS
+                        - 1
+                    )
+                    for c in rows
+                )
+                / weight
+            )
+            if weight
+            else None
+        )
+
     rows = [c for c in records if c.get("valid") and c["case"]["phase"] == "decode"]
-    return dict(batch_weighted_overhead_percent=score(rows),
-                by_heads={str(h): score([c for c in rows if c["case"]["heads"] == h])
-                          for h in (16, 8)}, completed_cases=len(rows),
-                unacceptable_2x_cases=[c["name"] for c in rows if
-                    c["paired_ratios"]["direct_over_native"]["mean"] >= 2])
+    return dict(
+        batch_weighted_overhead_percent=score(rows),
+        by_heads={
+            str(h): score([c for c in rows if c["case"]["heads"] == h]) for h in (16, 8)
+        },
+        completed_cases=len(rows),
+        unacceptable_2x_cases=[
+            c["name"]
+            for c in rows
+            if c["paired_ratios"]["direct_over_native"]["mean"] >= 2
+        ],
+    )
 
 
 def main() -> None:
     args = parser().parse_args()
     protocol = DECODE_PROTOCOL if args.phase == "decode" else PROTOCOL
     if args.check_imports:
-        from sglang.srt.remnant.glm import compile_kernels
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+        from sglang.srt.remnant.glm import compile_kernels
 
         assert callable(tilelang_sparse_fwd) and callable(compile_kernels)
-        print(json.dumps(dict(protocol=protocol, cases=len(cases(args.phase)), modes=MODES)))
+        print(
+            json.dumps(
+                dict(protocol=protocol, cases=len(cases(args.phase)), modes=MODES)
+            )
+        )
         return
     if not args.output or not 60 <= args.max_seconds <= 1200:
         raise ValueError("GLM requires --output and --max-seconds between 60 and 1200")

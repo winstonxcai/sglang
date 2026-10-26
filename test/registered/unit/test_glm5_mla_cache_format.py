@@ -4,15 +4,31 @@ Author: Winston Cai.
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-_path = Path(__file__).resolve().parents[3] / "python/sglang/srt/remnant/glm_config.py"
-_spec = importlib.util.spec_from_file_location("glm_config_contract", _path)
-config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(config)
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def load_cpu_module(name, relative):
+    # Both contracts are stdlib-only; avoid importing SGLang's serving package.
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+config = load_cpu_module(
+    "glm_config_contract", "python/sglang/srt/remnant/glm_config.py"
+)
+register_cpu_ci = load_cpu_module(
+    "glm_ci_contract", "python/sglang/test/ci/ci_register.py"
+).register_cpu_ci
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def args(**changes):
@@ -125,3 +141,7 @@ def test_split_dsa_overrides_take_precedence_over_base_backend():
     )
     with pytest.raises(ValueError, match="attention backend must be dsa"):
         config.validate(args(attention_backend="fa3"), MODEL)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

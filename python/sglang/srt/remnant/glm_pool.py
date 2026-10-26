@@ -7,12 +7,13 @@ from contextlib import nullcontext
 
 import torch
 
-from sglang.srt.runtime_context import get_model
 from sglang.srt.mem_cache.memory_pool import (
+    GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
     MLATokenToKVPool,
-    GPU_MEMORY_TYPE_KV_CACHE,
 )
+from sglang.srt.runtime_context import get_model
+
 from .glm import PackedCache, normalize_and_store
 from .glm_config import MAX_QUERY_CHUNK, SELECTION_COLUMNS
 
