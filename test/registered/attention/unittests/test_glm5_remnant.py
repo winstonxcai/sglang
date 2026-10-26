@@ -397,20 +397,43 @@ def test_pool_lifecycle():
 
 
 def test_production_backend_constructor():
+    # Keep the established qualification node while covering both serving phases.
+    for implementation in ("adapter", "direct"):
+        for phase in ("prefill", "decode"):
+            _check_production_producer_and_attention_dispatch(implementation, phase)
+
+
+def _check_production_producer_and_attention_dispatch(implementation, phase):
+    """Exercise real producer/pool/dispatch methods with model-free batch metadata.
+
+    Synthetic physical selections follow the production fused-indexer contract;
+    index selection and page-table transform kernels are outside this test.
+    Packed store and attention kernels are real. The dense oracle comes from
+    the independent reference, not another invocation of the Packed reader.
+    """
     from types import SimpleNamespace
 
     from sglang.srt.configs.glm5_next import Glm5NextConfig
+    from sglang.srt.environ import envs
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+        DeepseekMLAForwardMixin,
+    )
 
-    with get_context().override_server_args(
-        device="cuda",
-        tp_size=8,
-        dsa_prefill_backend="tilelang",
-        dsa_decode_backend="tilelang",
-        dsa_topk_backend="torch",
-        glm5_mla_cache_implementation="direct",
+    with (
+        get_context().override_server_args(
+            device="cuda",
+            tp_size=8,
+            dsa_prefill_backend="tilelang",
+            dsa_decode_backend="tilelang",
+            dsa_topk_backend="sgl-kernel",
+            glm5_mla_cache_format="remnant",
+            glm5_mla_cache_implementation=implementation,
+        ),
+        envs.SGLANG_DSA_FUSE_TOPK.override(True),
     ):
-        pool = make_pool(768, "direct")
+        pool = make_pool(768, implementation, layers=2)
         hf = Glm5NextConfig(
             **json.loads(Path(os.environ["REMNANT_GLM_MODEL_CONFIG"]).read_text())
         )
@@ -440,17 +463,73 @@ def test_production_backend_constructor():
         backend = DeepseekSparseAttnBackend(runner)
         assert backend.num_q_heads == 8
         assert not backend.supports_mha_one_shot
-        raw, norm, _ = fixture()
-        pool.normalize_and_store_glm(
-            3, raw, norm, torch.arange(len(raw), device="cuda")
+        assert backend.use_fused_topk
+        raw, norm, _ = fixture(rows=520)
+        logical_slots = torch.arange(520, device="cuda", dtype=torch.int64)
+        # Reverse the three allocated pages, preserving offsets and dummy page 0.
+        physical = (3 - logical_slots // 256) * 256 + logical_slots % 256
+        producer = DeepseekMLAForwardMixin()
+        producer.layer_id = 7  # Second MLA layer; first MLA layer is model layer 3.
+        producer.kv_a_layernorm = norm
+        batch = SimpleNamespace(
+            token_to_kv_pool=pool,
+            out_cache_loc=physical[:512],
+            forward_mode=ForwardMode.EXTEND
+            if phase == "prefill"
+            else ForwardMode.DECODE,
+        )
+        producer._glm_normalize_and_store(raw[:512], batch)
+        batch.out_cache_loc = physical[512:]
+        current_kv = producer._glm_normalize_and_store(raw[512:], batch).unsqueeze(1)
+        cache = pool.get_glm_packed_buffer(7)
+        _, expected_values, expected_words, dense = expected(raw, norm)
+        assert torch.equal(cache.values[physical], expected_values)
+        assert torch.equal(
+            cache.bitmaps.view(torch.int64)[physical].cpu(),
+            expected_words.view(torch.int64),
+        )
+        assert not bool(pool.get_glm_packed_buffer(3).values.any())
+        assert not bool(pool.get_glm_packed_buffer(3).bitmaps.view(torch.int64).any())
+
+        # Repeated history selections and a live current token cover duplicates,
+        # invalids, and the tail columns that the public dispatch must pad.
+        topk_indices = torch.full((8, 2051), -1, dtype=torch.int32, device="cuda")
+        topk_indices[:, :2048] = physical[
+            torch.arange(2048, device="cuda").remainder(512)
+        ]
+        topk_indices[0, :128] = -1
+        topk_indices[:, 2048] = physical[512:]
+        backend.forward_metadata = SimpleNamespace()
+        layer = SimpleNamespace(
+            layer_id=7,
+            is_cross_attention=False,
+            tp_q_head_num=8,
+            head_dim=512,
+            v_head_dim=512,
+            scaling=ATTENTION_SCALE,
         )
         q = torch.randn(8, 8, 512, dtype=torch.bfloat16, device="cuda")
-        cache = pool.get_glm_packed_buffer(3)
-        out = backend._forward_tilelang(
-            q, cache, 512, selection(8, 3)[:, 0, :2051], ATTENTION_SCALE
+        forward = (
+            backend.forward_extend if phase == "prefill" else backend.forward_decode
         )
-        ref = attention(q, cache, selection(8, 3), ATTENTION_SCALE)
-        torch.testing.assert_close(out, ref, atol=0, rtol=0)
+        # A duplicate Native store would call the Packed pool's raising setter.
+        out = forward(
+            q,
+            current_kv,
+            current_kv,
+            layer,
+            batch,
+            save_kv_cache=True,
+            topk_indices=topk_indices,
+        )
+        dense_cache = torch.zeros((1024, 1, 512), dtype=torch.uint8, device="cuda")
+        dense_cache[physical, 0] = dense
+        selected = torch.full((8, 1, 2112), -1, dtype=torch.int32, device="cuda")
+        selected[:, 0, :2051] = topk_indices
+        ref = tilelang_sparse_fwd(
+            q, dense_cache.view(torch.float8_e4m3fn), selected, ATTENTION_SCALE
+        )
+        torch.testing.assert_close(out, ref, atol=0.02, rtol=0.02)
 
 
 def test_allocator_accounting():

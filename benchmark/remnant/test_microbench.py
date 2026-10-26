@@ -1438,12 +1438,12 @@ def _glm_complete_timing_payload():
                     memory_limit_bytes=2,
                     common_inputs_sha256="0" * 64,
                 ),
-                paths={m: dict(samples=[1.0] * 30) for m in glm.MODES},
+                paths={m: cases.summary([1.0] * 30) for m in glm.MODES},
                 round_orders=[["native", "direct"], ["direct", "native"]] * 15,
                 execution="cuda_graph",
                 cycles_per_sample=100 // banks,
                 calls_per_sample=100,
-                paired_ratios={"direct_over_native": {"samples": [1.0] * 30}},
+                paired_ratios={"direct_over_native": cases.summary([1.0] * 30)},
             )
         )
     return dict(protocol=glm.PROTOCOL, status="passed", cases=records)
@@ -1522,10 +1522,41 @@ def test_glm_selected_initialization_covers_real_backing_locations():
     )
 
 
-def test_glm_resume_requires_identical_valid_ordered_prefix():
+def _glm_source_with_artifacts(tmp_path):
+    import hashlib
+
+    binary = tmp_path / "runtime.so"
+    cubin = tmp_path / "partial.cubin"
+    binary.write_bytes(b"runtime artifact")
+    cubin.write_bytes(b"TileLang artifact")
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    versions = dict(torch="torch", cuda="cuda", triton="triton", tilelang="tilelang")
+    return dict(
+        sources=glm.benchmark_source_hashes(ROOT / "python/sglang"),
+        compiled_build=dict(
+            model_family="glm53",
+            sources={"sglang": "source-tree"},
+            source_identities={"sglang": {"commit": "source-commit"}},
+            binaries={str(binary): digest(binary)},
+            glm_compile=dict(
+                attention_scale=glm.SCALE,
+                triton=["store", "unpack"],
+                tilelang=[dict(cubin_path=str(cubin), cubin_sha256=digest(cubin))],
+                cache_files={str(cubin): digest(cubin)},
+            ),
+            **versions,
+        ),
+        **versions,
+    )
+
+
+def test_glm_resume_requires_identical_valid_ordered_prefix(tmp_path):
     import copy
 
-    source = dict(sources={"fixture": "hash"}, compiled_build={"artifact": "hash"})
+    source = _glm_source_with_artifacts(tmp_path)
     previous = _glm_complete_timing_payload()
     previous.update(
         source=source, seed=glm.SEED, rounds=glm.ROUNDS, status="incomplete"
@@ -1551,6 +1582,127 @@ def test_glm_resume_requires_identical_valid_ordered_prefix():
     changed["cases"][0]["paths"]["native"]["samples"] = [1.0] * 29
     with pytest.raises(RuntimeError, match="rounds"):
         glm.resume_prefix(changed, source)
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    [
+        "srt/remnant/reference.py",
+        "srt/layers/layernorm.py",
+        "benchmark/remnant/cases.py",
+        "srt/remnant/config.py",
+        "srt/remnant/glm_config.py",
+        "srt/remnant/bitmap.py",
+    ],
+)
+def test_glm_resume_rejects_changed_fixture_dependencies(
+    dependency, tmp_path, monkeypatch
+):
+    import copy
+
+    source = _glm_source_with_artifacts(tmp_path)
+    previous = _glm_complete_timing_payload()
+    previous.update(source=source, seed=glm.SEED, rounds=glm.ROUNDS)
+    root = ROOT / "python/sglang"
+    changed_path = root / dependency
+    original_read = Path.read_bytes
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda path: (
+            b"changed fixture dependency"
+            if path == changed_path
+            else original_read(path)
+        ),
+    )
+    changed_source = copy.deepcopy(source)
+    changed_source["sources"] = glm.benchmark_source_hashes(root)
+    assert {
+        name
+        for name, digest in changed_source["sources"].items()
+        if digest != source["sources"][name]
+    } == {dependency}
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        glm.resume_prefix(previous, changed_source)
+
+
+def test_glm_fresh_diagnostic_identity_needs_no_build_manifest(monkeypatch):
+    import torch
+
+    monkeypatch.delenv("REMNANT_BUILD_MANIFEST_PATH", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "H100")
+    monkeypatch.setattr(glm.importlib.metadata, "version", lambda name: name)
+    source = glm.source_manifest()
+    assert source["compiled_build"] == {}
+    assert source["sources"] == glm.benchmark_source_hashes(ROOT / "python/sglang")
+    previous = _glm_complete_timing_payload()
+    previous.update(source=source, seed=glm.SEED, rounds=glm.ROUNDS)
+    with pytest.raises(RuntimeError, match="REMNANT_BUILD_MANIFEST_PATH"):
+        glm.resume_prefix(previous, source)
+
+
+@pytest.mark.parametrize(
+    "missing", ["sources", "source_identities", "binaries", "glm_compile"]
+)
+def test_glm_resume_rejects_incomplete_build_manifest(missing, tmp_path):
+    source = _glm_source_with_artifacts(tmp_path)
+    source["compiled_build"].pop(missing)
+    previous = _glm_complete_timing_payload()
+    previous.update(source=source, seed=glm.SEED, rounds=glm.ROUNDS)
+    with pytest.raises(RuntimeError, match="complete GLM build manifest"):
+        glm.resume_prefix(previous, source)
+
+
+def test_glm_resume_rejects_other_model_manifest(tmp_path):
+    source = _glm_source_with_artifacts(tmp_path)
+    source["compiled_build"].update(model_family="dsv4", glm_compile=None)
+    with pytest.raises(RuntimeError, match="complete GLM build manifest"):
+        glm.verify_resume_artifacts(source)
+
+
+@pytest.mark.parametrize("artifact", ["runtime.so", "partial.cubin"])
+@pytest.mark.parametrize("change", ["missing", "modified"])
+def test_glm_resume_verifies_current_artifact_bytes(artifact, change, tmp_path):
+    source = _glm_source_with_artifacts(tmp_path)
+    previous = _glm_complete_timing_payload()
+    previous.update(source=source, seed=glm.SEED, rounds=glm.ROUNDS)
+    path = tmp_path / artifact
+    if change == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"different build")
+    with pytest.raises(
+        RuntimeError, match=f"artifact missing or changed: .*{artifact}"
+    ):
+        glm.resume_prefix(previous, source)
+
+
+@pytest.mark.parametrize("mode", ["native", "direct", "direct_over_native"])
+@pytest.mark.parametrize("statistic", ["mean", "median", "p95", "stdev"])
+def test_glm_validation_and_resume_reject_inconsistent_statistics(
+    mode, statistic, tmp_path
+):
+    source = _glm_source_with_artifacts(tmp_path)
+    previous = _glm_complete_timing_payload()
+    previous.update(source=source, seed=glm.SEED, rounds=glm.ROUNDS)
+    record = previous["cases"][0]
+    stats = record["paired_ratios"] if mode == "direct_over_native" else record["paths"]
+    stats[mode][statistic] = 1234.0
+    with pytest.raises(RuntimeError, match="derived"):
+        glm.validate_timing(previous)
+    with pytest.raises(RuntimeError, match="derived"):
+        glm.resume_prefix(previous, source)
+
+
+def test_glm_twofold_gate_uses_raw_ratios():
+    records = _glm_complete_timing_payload()["cases"][:2]
+    records[0]["paired_ratios"]["direct_over_native"]["mean"] = 3.0
+    records[1]["paired_ratios"]["direct_over_native"].update(
+        samples=[2.1] * glm.ROUNDS, mean=1.0
+    )
+    assert glm.weighted_overhead(records)["unacceptable_2x_cases"] == [
+        records[1]["name"]
+    ]
 
 
 def test_glm_measured_capture_preserves_ten_warmups():
@@ -1587,6 +1739,7 @@ def test_glm_decode_scope_and_weighting():
         phase="decode",
         cases=[c for c in payload["cases"] if c["case"]["phase"] == "decode"],
     )
+    payload["summary"] = glm.weighted_overhead(payload["cases"])
     glm.validate_timing(payload)
     with pytest.raises(RuntimeError):
         glm.validate_timing({**payload, "protocol": glm.PROTOCOL})
@@ -1604,6 +1757,68 @@ def test_glm_decode_scope_and_weighting():
         glm.resume_prefix(
             {**payload, "source": {}, "seed": glm.SEED, "rounds": 30}, {}, "all"
         )
+
+
+def test_glm_decode_summary_must_match_raw_samples(tmp_path):
+    source = _glm_source_with_artifacts(tmp_path)
+    payload = _glm_complete_timing_payload()
+    payload.update(
+        protocol=glm.DECODE_PROTOCOL,
+        phase="decode",
+        cases=[c for c in payload["cases"] if c["case"]["phase"] == "decode"],
+        source=source,
+        seed=glm.SEED,
+        rounds=glm.ROUNDS,
+    )
+    payload["summary"] = glm.weighted_overhead(payload["cases"])
+    payload["summary"]["batch_weighted_overhead_percent"] = 999.0
+    with pytest.raises(RuntimeError, match="derived decode summary"):
+        glm.validate_timing(payload)
+    with pytest.raises(RuntimeError, match="derived decode summary"):
+        glm.resume_prefix(payload, source, "decode")
+
+
+def test_glm_completed_resume_retains_derived_decode_summary(tmp_path, monkeypatch):
+    import json
+
+    source = _glm_source_with_artifacts(tmp_path)
+    payload = _glm_complete_timing_payload()
+    payload.update(
+        protocol=glm.DECODE_PROTOCOL,
+        phase="decode",
+        cases=[c for c in payload["cases"] if c["case"]["phase"] == "decode"],
+        source=source,
+        seed=glm.SEED,
+        rounds=glm.ROUNDS,
+    )
+    payload["summary"] = glm.weighted_overhead(payload["cases"])
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps(payload))
+    base = tmp_path / "resumed"
+    monkeypatch.setattr(glm, "source_manifest", lambda: source)
+    monkeypatch.setattr(
+        glm,
+        "Fixture",
+        lambda *args: pytest.fail("A complete checkpoint must not rerun GPU cases"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "microbench",
+            "--phase",
+            "decode",
+            "--resume",
+            str(checkpoint),
+            "--output",
+            str(base),
+        ],
+    )
+    glm.main()
+    result = json.loads(base.with_suffix(".json").read_text())
+    assert result["status"] == "passed"
+    assert result["summary"] == payload["summary"]
+    assert result["resumed_from"]["accepted_cases"] == 48
 
 
 def test_glm_selected_packed_reference_preserves_bytes_and_duplicates():

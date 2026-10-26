@@ -330,7 +330,14 @@ Native and Packed share those raw latents; all written Packed bytes are checked.
 This changes setup cost and fixture hashes, not rotation footprints or timed calls.
 `--resume <prior-timing.json>` accepts only a valid ordered prefix with identical
 source/artifact identity, seed, rounds and per-case coverage. It discards only an
-unfinished final case. A completed aggregate still requires all 128 cases.
+unfinished final case. A completed aggregate still requires every case in the
+selected scope (128 for `all`, 48 for `decode`). Resume requires
+`REMNANT_BUILD_MANIFEST_PATH` to the complete build manifest emitted by the
+maintained parent CPU workflow. It verifies source/toolchain identity and recorded
+binary/cache hashes on disk. Fresh standalone diagnostic runs may omit it;
+they cannot resume without the verified build identity. Local source hashes also
+cover the independent reference, RMSNorm, configuration, bitmap and statistics
+modules. Derived case/aggregate statistics are recomputed from the raw samples.
 
 
 Focused sanitizer bank probes use Q2/Q8, banks2/4, heads8/16 and explicitly
@@ -354,7 +361,9 @@ its GPU oracle. JUnit records reference device and exact representative geometry
 ### GLM implementation and artifact ownership
 
 The serving startup contract requires resolved DSA prefill/decode dispatch with
-TileLang implementations. Explicit dense attention overrides are rejected.
+TileLang implementations and BF16 model activations after dtype resolution
+(including `auto`). Explicit dense attention overrides and resolved non-BF16
+Packed activations are rejected before pool allocation; Native is unchanged.
 Adapter reconstruction widens physical indices to int64 before byte offsets;
 its large-address regression covers the 2 GiB boundary, duplicates and invalids.
 Direct's loader and attention arithmetic are unchanged by these review fixes.
@@ -384,6 +393,8 @@ CPU regression command (no weights or GPU):
 PYTHONPATH=python python -m pytest -q test/registered/unit/test_glm5_mla_cache_format.py benchmark/remnant/test_microbench.py
 ```
 
-The new Adapter boundary regression still requires an H100 run. Historical
-Native/Direct results retain their recorded source identities and are not new
-qualification of subsequent commits.
+The Adapter boundary regression passed at the source recorded in the parent
+ledger. The expanded production integration test exercises the actual model
+producer, hybrid pool, and public prefill/decode methods for both readers; that
+expanded test still requires H100 validation. Historical Native/Direct results
+retain their recorded source identities and do not qualify subsequent commits.

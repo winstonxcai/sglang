@@ -15,7 +15,13 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.runtime_context import get_model
 
 from .glm import PackedCache, normalize_and_store
-from .glm_config import MAX_QUERY_CHUNK, SELECTION_COLUMNS
+from .glm_config import (
+    BITMAP_WORDS,
+    KEEP_COUNT,
+    LATENT_DIM,
+    MAX_QUERY_CHUNK,
+    SELECTION_COLUMNS,
+)
 
 
 class GLMPackedTokenToKVPool(DSATokenToKVPool):
@@ -24,7 +30,7 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
     def _create_buffers(self) -> None:
         if (self.dtype, self.kv_lora_rank, self.qk_rope_head_dim) != (
             torch.float8_e4m3fn,
-            512,
+            LATENT_DIM,
             0,
         ):
             raise ValueError("GLM Packed pool requires raw E4M3 512-dimensional MLA")
@@ -41,7 +47,7 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
             ):
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 256),
+                        (self.size + self.page_size, KEEP_COUNT),
                         dtype=torch.uint8,
                         device=self.device,
                     )
@@ -49,7 +55,7 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
                 ]
                 self.bitmap_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 8),
+                        (self.size + self.page_size, BITMAP_WORDS),
                         dtype=torch.uint64,
                         device=self.device,
                     )
@@ -58,7 +64,7 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
                 # One shared Adapter scratch, reused serially by all MLA layers.
                 self.adapter_workspace = (
                     torch.empty(
-                        (MAX_QUERY_CHUNK * SELECTION_COLUMNS, 512),
+                        (MAX_QUERY_CHUNK * SELECTION_COLUMNS, LATENT_DIM),
                         dtype=torch.uint8,
                         device=self.device,
                     )

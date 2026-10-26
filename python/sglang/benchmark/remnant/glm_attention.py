@@ -17,7 +17,9 @@ import json
 import math
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from functools import cache
 from pathlib import Path
 
 PROTOCOL = "remnant-glm-attention-v1"
@@ -185,7 +187,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--modes", choices=("native,direct",), default="native,direct")
     p.add_argument(
         "--resume",
-        help="Prior timing JSON from identical source/artifacts; resume its valid ordered prefix",
+        help="Prior timing JSON from identical source/artifacts; requires REMNANT_BUILD_MANIFEST_PATH",
     )
     p.add_argument("--output")
     p.add_argument("--max-seconds", type=int, default=850)
@@ -614,27 +616,33 @@ def runtime_hashes(root: Path) -> dict[str, str]:
     return {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths}
 
 
+def benchmark_source_hashes(root: Path) -> dict[str, str]:
+    """Bind fixture producers and statistics as well as the measured runtime.
+
+    A diagnostic run may lack a build manifest, so its local source identity must
+    still include shared selection, normalization and configuration dependencies.
+    The complete compiled artifact identity is additionally required for resume.
+    """
+    paths = (
+        "benchmark/remnant/glm_attention.py",
+        "benchmark/remnant/timing.py",
+        "benchmark/remnant/cases.py",
+        "srt/remnant/config.py",
+        "srt/remnant/glm_config.py",
+        "srt/remnant/bitmap.py",
+    )
+    return {
+        **runtime_hashes(root),
+        **{p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths},
+    }
+
+
 def source_manifest() -> dict:
     import torch
 
-    import sglang.benchmark.remnant.timing as timing
-    import sglang.kernels.ops.attention.dsa.tilelang_kernel as tile
-    import sglang.srt.remnant.glm as codec
-
-    sources = {
-        str(Path(p).resolve()): hashlib.sha256(Path(p).read_bytes()).hexdigest()
-        for p in (
-            __file__,
-            codec.__file__,
-            tile.__file__,
-            timing.__file__,
-            Path(tile.__file__).resolve().parents[3]
-            / "jit/include/sgl_kernel/glm_packed_decode.cuh",
-        )
-    }
     build_path = os.environ.get("REMNANT_BUILD_MANIFEST_PATH")
     return dict(
-        sources=sources,
+        sources=benchmark_source_hashes(Path(__file__).resolve().parents[2]),
         compiled_build=json.loads(Path(build_path).read_text()) if build_path else {},
         device=torch.cuda.get_device_name(),
         torch=torch.__version__,
@@ -642,6 +650,51 @@ def source_manifest() -> dict:
         triton=importlib.metadata.version("triton"),
         tilelang=importlib.metadata.version("tilelang"),
     )
+
+
+def verify_resume_artifacts(source: dict) -> None:
+    """Require the maintained build identity and verify its artifacts in place."""
+    build = source.get("compiled_build", {})
+    compiled = build.get("glm_compile") or {}
+    variants = compiled.get("tilelang", [])
+    if (
+        build.get("model_family") != "glm53"
+        or not build.get("sources")
+        or not build.get("source_identities")
+        or not build.get("binaries")
+        or not compiled.get("cache_files")
+        or compiled.get("attention_scale") != SCALE
+        or len(compiled.get("triton", [])) != 2
+        or not variants
+    ):
+        raise RuntimeError(
+            "GLM --resume requires REMNANT_BUILD_MANIFEST_PATH pointing to a "
+            "complete GLM build manifest with source identity, binaries and "
+            "Triton/TileLang artifacts. Prepare it through the maintained GLM "
+            "CPU workflow in scripts/modal/kernels.py, or start a fresh "
+            "diagnostic run without --resume."
+        )
+    for key in ("torch", "cuda", "triton", "tilelang"):
+        if not source.get(key) or build.get(key) != source[key]:
+            raise RuntimeError(f"GLM resume build/runtime {key} identity mismatch")
+    for variant in variants:
+        if (
+            not variant.get("cubin_sha256")
+            or compiled["cache_files"].get(variant.get("cubin_path"))
+            != variant["cubin_sha256"]
+        ):
+            raise RuntimeError(f"GLM resume has an unbound TileLang cubin: {variant}")
+    for artifacts in (build["binaries"], compiled["cache_files"]):
+        for name, expected in artifacts.items():
+            path = Path(name)
+            if (
+                not path.is_file()
+                or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+            ):
+                raise RuntimeError(
+                    f"GLM resume artifact missing or changed: {path}; "
+                    "restore the verified build or start a fresh diagnostic run"
+                )
 
 
 def write_results(payload: dict, base: Path) -> None:
@@ -679,6 +732,26 @@ def write_results(payload: dict, base: Path) -> None:
                         fixture=json.dumps(case["fixture"]),
                     )
                 )
+
+
+@cache
+def _summary_function() -> Callable[[list[float]], dict]:
+    """Load the shared CPU statistics without executing SGLang's package startup.
+
+    Local preflights import this contract by file path on hosts with no serving
+    dependencies. Keep the same summary implementation as GPU measurement.
+    """
+    import importlib.util
+    import sys
+
+    name = __name__ + "_cases"
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).with_name("cases.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.summary
 
 
 def validate_timing(payload: dict, *, prefix: bool = False) -> None:
@@ -739,11 +812,15 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             or case["calls_per_sample"] < 100
         ):
             raise RuntimeError(f"Invalid GLM sample normalization {case['name']}")
-        for path in case["paths"].values():
+        for mode, path in case["paths"].items():
             if len(path["samples"]) != ROUNDS or any(
                 not math.isfinite(x) or x <= 0 for x in path["samples"]
             ):
                 raise RuntimeError(f"Missing/invalid GLM rounds {case['name']}")
+            if path != _summary_function()(path["samples"]):
+                raise RuntimeError(
+                    f"Invalid GLM derived statistics {case['name']}/{mode}"
+                )
         ratios = case["paired_ratios"]["direct_over_native"]["samples"]
         if ratios != [
             d / n
@@ -752,6 +829,11 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             )
         ]:
             raise RuntimeError(f"Invalid GLM paired ratios {case['name']}")
+        if case["paired_ratios"]["direct_over_native"] != _summary_function()(ratios):
+            raise RuntimeError(f"Invalid GLM derived paired statistics {case['name']}")
+    if phase == "decode" and (not prefix or "summary" in payload):
+        if payload.get("summary") != weighted_overhead(payload["cases"]):
+            raise RuntimeError("Invalid GLM derived decode summary")
 
 
 def resume_prefix(previous: dict, source: dict, phase: str = "all") -> list[dict]:
@@ -765,6 +847,7 @@ def resume_prefix(previous: dict, source: dict, phase: str = "all") -> list[dict
         raise RuntimeError(
             "GLM checkpoint source/artifact/seed/round identity mismatch"
         )
+    verify_resume_artifacts(source)
     records = list(previous.get("cases", []))
     # A killed/failed final case has no accepted measurement. Interior failures
     # are never skipped or converted into coverage.
@@ -807,7 +890,7 @@ def weighted_overhead(records: list[dict]) -> dict:
         unacceptable_2x_cases=[
             c["name"]
             for c in rows
-            if c["paired_ratios"]["direct_over_native"]["mean"] >= 2
+            if sum(c["paired_ratios"]["direct_over_native"]["samples"]) / ROUNDS >= 2
         ],
     )
 
@@ -855,6 +938,8 @@ def main() -> None:
             sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
             accepted_cases=len(payload["cases"]),
         )
+        if args.phase == "decode":
+            payload["summary"] = weighted_overhead(payload["cases"])
     deadline = time.monotonic() + args.max_seconds
     fixture = None
     try:

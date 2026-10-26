@@ -261,9 +261,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             and num_layers
             and get_model().glm5_mla_cache_implementation == "adapter"
         ):
-            from sglang.srt.remnant.glm_config import MAX_QUERY_CHUNK, SELECTION_COLUMNS
+            from sglang.srt.remnant.glm_config import (
+                LATENT_DIM,
+                MAX_QUERY_CHUNK,
+                SELECTION_COLUMNS,
+            )
 
-            self._fixed_overhead_bytes += MAX_QUERY_CHUNK * SELECTION_COLUMNS * 512
+            self._fixed_overhead_bytes += (
+                MAX_QUERY_CHUNK * SELECTION_COLUMNS * LATENT_DIM
+            )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -394,10 +400,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * kv_size
             )
             # Author: Winston Cai. Indexer accounting below remains unchanged.
+            from sglang.srt.remnant.glm_config import ROW_BYTES
             from sglang.srt.remnant.glm_config import enabled as glm_packed_enabled
 
             if glm_packed_enabled():
-                cell_size = 320 * effective_num_layers
+                cell_size = ROW_BYTES * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

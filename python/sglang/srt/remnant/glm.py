@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .glm_config import MAX_QUERY_CHUNK, SELECTION_COLUMNS
+from .glm_config import KEEP_COUNT, LATENT_DIM, MAX_QUERY_CHUNK, SELECTION_COLUMNS
 from .reference import topmag_keep_mask
 
 
@@ -115,8 +115,8 @@ def normalize_and_store(
     bitmaps: torch.Tensor,
 ) -> torch.Tensor:
     """Compose original Native norm/conversion with one raw-latent selection."""
-    raw = raw.reshape(-1, 512)
-    keep = topmag_keep_mask(raw, 0.5)
+    raw = raw.reshape(-1, LATENT_DIM)
+    keep = topmag_keep_mask(raw, KEEP_COUNT / LATENT_DIM)
     normalized = norm(raw.masked_fill(~keep, 0))
     if (
         normalized.dtype != torch.bfloat16
@@ -143,7 +143,7 @@ def reconstruct(
         unpack[(indices.numel(), 1, 1)](
             cache.values, cache.bitmaps, indices, output, cache.values.shape[0]
         )
-    return output.view(torch.float8_e4m3fn).reshape(-1, 1, 512)
+    return output.view(torch.float8_e4m3fn).reshape(-1, 1, LATENT_DIM)
 
 
 def attention(
@@ -152,14 +152,16 @@ def attention(
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
     if indices.shape[-1] != SELECTION_COLUMNS:
-        raise ValueError("GLM Packed expects 2112 padded history/tail columns")
+        raise ValueError(
+            f"GLM Packed expects {SELECTION_COLUMNS} padded history/tail columns"
+        )
     if cache.implementation == "direct":
         return tilelang_sparse_fwd(
             q,
             cache.values.view(torch.float8_e4m3fn).unsqueeze(1),
             indices,
             sm_scale,
-            512,
+            LATENT_DIM,
             packed_bitmap=cache.bitmaps,
         )
     if cache.workspace is None:
@@ -179,5 +181,7 @@ def attention(
         local = torch.where(
             (selected >= 0) & (selected < cache.values.shape[0]), local, -1
         )
-        chunks.append(tilelang_sparse_fwd(q[start:end], kv, local, sm_scale, 512))
+        chunks.append(
+            tilelang_sparse_fwd(q[start:end], kv, local, sm_scale, LATENT_DIM)
+        )
     return torch.cat(chunks, dim=1)

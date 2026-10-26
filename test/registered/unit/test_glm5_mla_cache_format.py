@@ -59,14 +59,38 @@ MODEL = SimpleNamespace(
 )
 
 
-def test_native_default_is_unrestricted():
-    config.validate(args(glm5_mla_cache_format="native"), SimpleNamespace())
+@pytest.mark.parametrize("model_dtype", [None, "float16", "float32", "bfloat16"])
+def test_native_default_is_unrestricted(model_dtype):
+    config.validate(
+        args(glm5_mla_cache_format="native"), SimpleNamespace(), model_dtype=model_dtype
+    )
 
 
 def test_raw_fp8_tilelang_is_supported():
-    config.validate(args(), SimpleNamespace(text_config=MODEL))
+    config.validate(args(), SimpleNamespace(text_config=MODEL), model_dtype="bfloat16")
     assert config.ROW_BYTES == 256 + 8 * 8
     assert 11 * (512 + 33) / (11 * (config.ROW_BYTES + 33)) == 545 / 353
+
+
+@pytest.mark.parametrize("requested_dtype", ["auto", "bfloat16"])
+def test_resolved_bfloat16_activations_are_supported(requested_dtype):
+    config.validate(args(dtype=requested_dtype), MODEL, model_dtype="torch.bfloat16")
+
+
+@pytest.mark.parametrize(
+    "requested_dtype,model_dtype",
+    [
+        ("auto", "torch.float16"),
+        ("auto", "torch.float32"),
+        ("half", "torch.float16"),
+        ("float16", "torch.float16"),
+        ("float", "torch.float32"),
+        ("float32", "torch.float32"),
+    ],
+)
+def test_rejects_resolved_non_bfloat16_activations(requested_dtype, model_dtype):
+    with pytest.raises(ValueError, match="model activation dtype must be bfloat16"):
+        config.validate(args(dtype=requested_dtype), MODEL, model_dtype=model_dtype)
 
 
 @pytest.mark.parametrize(
@@ -91,19 +115,21 @@ def test_raw_fp8_tilelang_is_supported():
 )
 def test_rejects_unqualified_combinations(name, value):
     with pytest.raises(ValueError, match="unsupported"):
-        config.validate(args(**{name: value}), MODEL)
+        config.validate(args(**{name: value}), MODEL, model_dtype="bfloat16")
 
 
 def test_rejects_other_models():
     with pytest.raises(ValueError, match="GLM-5.3"):
-        config.validate(args(), SimpleNamespace(model_type="deepseek_v4"))
+        config.validate(
+            args(), SimpleNamespace(model_type="deepseek_v4"), model_dtype="bfloat16"
+        )
 
 
 def test_multimodal_checkpoint_requires_text_only_launch():
     multimodal = SimpleNamespace(text_config=MODEL, vision_config=object())
     with pytest.raises(ValueError, match="language-model-only"):
-        config.validate(args(), multimodal)
-    config.validate(args(language_model_only=True), multimodal)
+        config.validate(args(), multimodal, model_dtype="bfloat16")
+    config.validate(args(language_model_only=True), multimodal, model_dtype="bfloat16")
 
 
 @pytest.mark.parametrize(
@@ -120,14 +146,18 @@ def test_rejects_unqualified_geometry(name, value):
     fields = vars(MODEL).copy()
     fields[name] = value
     with pytest.raises(ValueError, match="unqualified geometry"):
-        config.validate(args(), SimpleNamespace(**fields))
+        config.validate(args(), SimpleNamespace(**fields), model_dtype="bfloat16")
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
 @pytest.mark.parametrize("backend", ["fa3", "triton", "flashinfer"])
 def test_rejects_effective_outer_backend_overrides(phase, backend):
     with pytest.raises(ValueError, match=f"{phase} attention backend must be dsa"):
-        config.validate(args(**{f"{phase}_attention_backend": backend}), MODEL)
+        config.validate(
+            args(**{f"{phase}_attention_backend": backend}),
+            MODEL,
+            model_dtype="bfloat16",
+        )
 
 
 def test_split_dsa_overrides_take_precedence_over_base_backend():
@@ -138,9 +168,10 @@ def test_split_dsa_overrides_take_precedence_over_base_backend():
             decode_attention_backend="dsa",
         ),
         MODEL,
+        model_dtype="bfloat16",
     )
     with pytest.raises(ValueError, match="attention backend must be dsa"):
-        config.validate(args(attention_backend="fa3"), MODEL)
+        config.validate(args(attention_backend="fa3"), MODEL, model_dtype="bfloat16")
 
 
 if __name__ == "__main__":

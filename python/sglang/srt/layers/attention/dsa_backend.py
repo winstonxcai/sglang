@@ -3391,15 +3391,18 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+        from sglang.srt.remnant.glm_config import SELECTION_COLUMNS
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
         # so mask-pad the tail-extended table to the next complete block.
         packed = getattr(self.token_to_kv_pool, "glm_packed", False)
-        if packed and page_table_1.shape[-1] > 2112:
-            raise ValueError("GLM Packed history/tails exceed 2112 columns")
+        if packed and page_table_1.shape[-1] > SELECTION_COLUMNS:
+            raise ValueError(
+                f"GLM Packed history/tails exceed {SELECTION_COLUMNS} columns"
+            )
         padding = (
-            (2112 - page_table_1.shape[-1])
+            (SELECTION_COLUMNS - page_table_1.shape[-1])
             if packed
             else (-page_table_1.shape[-1]) % 64
         )

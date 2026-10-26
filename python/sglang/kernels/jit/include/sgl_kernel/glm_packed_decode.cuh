@@ -3,10 +3,19 @@
 #pragma once
 #include <stdint.h>
 
+// The four bitmap bits describe coordinates in MSB-first order. Each output
+// selector nibble (low nibble first) counts retained coordinates BEFORE that
+// coordinate. Contributions 0x222, 0x440 and 0x800 add one to all later ranks;
+// the final bitmap bit cannot affect a preceding-coordinate count.
+// Example: mask 0b1011 -> ranks [0, 1, 1, 2] -> selectors 0x2110.
+// Selecting compact bytes [a, b, c, ...] and then masking emits [a, 0, b, c].
 __device__ __forceinline__ uint32_t glm_nibble_ranks(uint32_t x) {
   return (x & 8u) * 0x222u + (x & 4u) * 0x440u + (x & 2u) * 0x800u;
 }
 __device__ __forceinline__ uint32_t glm_expand4(uint32_t a, uint32_t b, uint32_t selectors, uint32_t mask) {
+  // Scatter bitmap bits 3..0 into the sign bits of output bytes 0..3.
+  // PRMT selectors 8,9,a,b replicate those sign bits to whole 0xff/0x00 bytes.
+  // AND after byte selection supplies raw FP8 zero without a numerical cast.
   uint32_t signs = (mask * 0x80402010u) & 0x80808080u;
   uint32_t bytes;
   asm("prmt.b32 %0, %1, %2, 0xba98;" : "=r"(bytes) : "r"(signs), "r"(0u));
@@ -25,6 +34,8 @@ __device__ __forceinline__ uint2 glm_expand8(const uint8_t* row, int rank, uint3
   uint32_t shift = (rank & 3) * 8;
   uint32_t lo = __funnelshift_r(w0, w1, shift);
   uint32_t hi = __funnelshift_r(w1, w2, shift);
+  // The upper bitmap nibble describes the first four output coordinates.
+  // The second four start after popcount(upper), added to each selector nibble.
   uint32_t selectors =
       (glm_nibble_ranks(mask >> 4) << 16) | (glm_nibble_ranks(mask & 15) + __popc(mask >> 4) * 0x1111u);
   return uint2{glm_expand4(lo, hi, selectors >> 16, mask >> 4), glm_expand4(lo, hi, selectors & 0xffff, mask & 15)};

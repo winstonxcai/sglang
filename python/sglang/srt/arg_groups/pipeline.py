@@ -361,7 +361,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.model_override_base import model_config_of
     from sglang.srt.remnant.glm_config import validate as validate_glm_packed
 
+    model_config = model_config_of(server_args)
     validate_glm_packed(
-        resolving_view(server_args), model_config_of(server_args).hf_config
+        resolving_view(server_args),
+        model_config.hf_config,
+        model_dtype=model_config.dtype,
     )
     server_args._resolution_finished = True

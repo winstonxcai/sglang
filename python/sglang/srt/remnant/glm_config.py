@@ -10,7 +10,7 @@ from typing import Any
 LATENT_DIM = 512
 KEEP_COUNT = 256
 BITMAP_WORDS = 8
-ROW_BYTES = 320
+ROW_BYTES = KEEP_COUNT + BITMAP_WORDS * 8
 MAX_QUERY_CHUNK = 128
 SELECTION_COLUMNS = 2112
 
@@ -21,7 +21,13 @@ def enabled() -> bool:
     return get_model().glm5_mla_cache_format == "remnant"
 
 
-def validate(args: Any, hf_config: Any) -> None:
+def validate(args: Any, hf_config: Any, *, model_dtype: Any) -> None:
+    """Validate final dispatch and the activation dtype resolved by ModelConfig.
+
+    The CLI spelling (especially ``auto``) is not the resolved activation dtype.
+    Accept its canonical string form too, keeping this contract CPU-testable
+    without importing the serving stack or duplicating dtype resolution.
+    """
     if args.glm5_mla_cache_format == "native":
         return
     text = getattr(hf_config, "text_config", hf_config)
@@ -30,7 +36,7 @@ def validate(args: Any, hf_config: Any) -> None:
     if (
         getattr(text, "kv_lora_rank", None),
         getattr(text, "qk_rope_head_dim", None),
-    ) != (512, 0):
+    ) != (LATENT_DIM, 0):
         raise ValueError("GLM Packed requires latent dimension 512 and no RoPE tail")
     geometry = {
         "qk_nope_head_dim": 256,
@@ -51,6 +57,11 @@ def validate(args: Any, hf_config: Any) -> None:
     if mismatched:
         raise ValueError("GLM Packed unqualified geometry: " + ", ".join(mismatched))
     unsupported = []
+    if str(model_dtype).removeprefix("torch.") != "bfloat16":
+        unsupported.append(
+            f"model activation dtype must be bfloat16 (resolved to {model_dtype!s}); "
+            "set --dtype bfloat16"
+        )
     if (
         getattr(args, "tp_size", 1) not in (1, 2, 4, 8)
         or getattr(args, "pp_size", 1) != 1
