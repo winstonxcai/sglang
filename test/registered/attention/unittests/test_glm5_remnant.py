@@ -704,7 +704,8 @@ def _benchmark_bank_graph(heads, banks, queries, *, warmup_calls=10, reference_d
                                    attention_reference(*args, device="cpu"),
                                    atol=0.02, rtol=0.02)
     f.validate(reference_device=reference_device)
-    f.capture(warmup_calls=warmup_calls)
+    f.capture(warmup_calls=warmup_calls,
+              capture_stream=torch.cuda.current_stream() if phase == "decode" else None)
     f.q.normal_()
     for ids in f.ids:
         ids[1] = -1

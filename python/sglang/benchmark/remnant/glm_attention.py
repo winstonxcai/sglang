@@ -473,7 +473,7 @@ class Fixture:
                     )
                 del output
 
-    def capture(self, *, warmup_calls: int = 10) -> None:
+    def capture(self, *, warmup_calls: int = 10, capture_stream=None) -> None:
         import torch
 
         if warmup_calls < 1:
@@ -485,7 +485,11 @@ class Fixture:
                 del output
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            # Tests can capture directly on their explicitly owned stream.
+            # Timing leaves this None and preserves Torch's default side stream.
+            capture = (torch.cuda.graph(graph) if capture_stream is None else
+                       torch.cuda.graph(graph, stream=capture_stream))
+            with capture:
                 for bank in range(self.banks):
                     output = self.call(mode, bank)
                     if bank != self.banks - 1:
