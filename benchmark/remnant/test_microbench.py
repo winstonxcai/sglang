@@ -1289,12 +1289,12 @@ def test_v41_fp4_matrix_and_timing_gate():
         (64, b, 512) for b in (8, 16, 24, 28, 32)
     }
     assert {(c.swa_length, c.swa_page_size, c.global_page_size) for c in matrix} == {
-        (128, 128, 256),
-        (128, 128, 128),
+        (128, 256, 256),
+        (128, 256, 128),
     }
     payload = {
         "status": "passed",
-        "protocol": "remnant-v41-fp4-decode-v2",
+        "protocol": "remnant-v41-fp4-decode-v3",
         "config": vars(args),
         "cases": [],
     }
@@ -1332,6 +1332,7 @@ def test_v41_fp4_matrix_and_timing_gate():
         "wrong-layout",
         "wrong-geometry",
         "nonproduction-swa",
+        "window-as-page",
         "nonproduction-heads",
         "old-protocol",
     ):
@@ -1348,9 +1349,11 @@ def test_v41_fp4_matrix_and_timing_gate():
             broken["cases"][0]["case"]["swa_page_size"] = 64 + 128
         elif fault == "nonproduction-swa":
             broken["cases"][0]["case"]["swa_length"] = 64
+        elif fault == "window-as-page":
+            broken["cases"][0]["case"]["swa_page_size"] = 128
         elif fault == "nonproduction-heads":
             broken["cases"][0]["case"]["heads"] = 128
         else:
-            broken["protocol"] = "remnant-v41-fp4-decode-v1"
+            broken["protocol"] = "remnant-v41-fp4-decode-v2"
         with pytest.raises((RuntimeError, ValueError)):
             cases.validate_timing(broken, suite="v41-fp4-decode")

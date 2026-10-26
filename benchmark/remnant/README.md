@@ -17,15 +17,18 @@ serving TPOT, TTFT, SLO capacity, or task quality.
 ## V4.1 FP4 Native / Packed Direct follow-up
 
 Author: Winston Cai. `--suite v41-fp4-decode` uses V4.1 production H100
-geometry: **64 query heads, SWA128/page128, Q1/K512**, with batches
+geometry: **64 query heads, SWA128/page256, Q1/K512**, with batches
 8/16/24/28/32. Both compressed global page sizes are covered: **C1/page256**
 and **C2/page128**, for ten cases. The model has one KV head and a separate
 32-head indexer; the indexer is outside this attention timing. Tensor-parallel
 shards with fewer query heads are padded to 64 by this SM90 runtime. Batches
 remain a synthetic sweep, not measured production traffic.
 
-Protocol `remnant-v41-fp4-decode-v2` supersedes the historical 20-case matrix
-that included SWA64 and H128. Historical receipts retain their original protocol;
+Protocol `remnant-v41-fp4-decode-v3` distinguishes the 128-token attention
+window from the 256-token paged SWA allocation. The runtime factory
+`kv_cache_configurator.py` requires 256-token SWA pages.
+It supersedes the historical v1 20-case matrix and the untimed v2 fixture
+that incorrectly used page128. Historical receipts retain their original protocol;
 they do not qualify this matrix. SWA64/H128 remain correctness coverage only.
 Native uses dense 288-byte FP4; Packed Direct uses 224-byte keep256 records.
 An independent CPU quantization/pruning/attention oracle validates each path.

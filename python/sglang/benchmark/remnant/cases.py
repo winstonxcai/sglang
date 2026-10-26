@@ -19,7 +19,7 @@ from pathlib import Path
 
 PROTOCOL = "remnant-three-modes-v1"
 PREFILL_PROTOCOL = "remnant-prefill-read-v1"
-FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v2"
+FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v3"
 SEED = 20260919
 MODES = ("native", "triton", "kernel")
 DEFAULT_DECODE_BATCHES = (8, 16, 24, 28, 32)
@@ -51,7 +51,7 @@ class FP4DecodeCase(DecodeCase):
     swa_length: int = 128
 
     global_page_size: int = 256
-    swa_page_size: int = 128
+    swa_page_size: int = 256
 
     @property
     def name(self) -> str:
