@@ -1097,9 +1097,9 @@ def sparse_mla_fwd_decode_partial_fp8(
 ):
     assert not packed or (d_v == 512 and d_tail == 0)
     assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    virtual_padding = packed and block_I in (64, 128)
+    if not virtual_padding:
+        assert topk % block_I == 0, "topk must be divisible by block_I"
 
     # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
     # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
@@ -1117,7 +1117,9 @@ def sparse_mla_fwd_decode_partial_fp8(
     has_tail = d_tail > 0
     dim_quant_fp8 = d_v + d_tail
     rope_offset_fp8 = d_v
-    n_groups = topk // (BI * inner_iter)
+    tile_count = (topk + BI - 1) // BI
+    assert virtual_padding or tile_count % inner_iter == 0
+    n_groups = (tile_count + inner_iter - 1) // inner_iter
 
     if sm_scale is None:
         sm_scale = (1.0 / (d_v + d_tail)) ** 0.5 * 1.44269504
@@ -1155,7 +1157,13 @@ def sparse_mla_fwd_decode_partial_fp8(
         if packed
         else ""
     )
-    assert not packed or (BI == 32 and threads == 128)
+    assert not packed or (BI in (32, 64, 128) and threads == 128)
+    direct_indices = packed and BI == 64 and topk % BI == 0
+    packed_loader = (
+        "remnant_glm_expand_tile"
+        if BI == 32
+        else f"remnant_glm_expand_wide_tile<{BI}, {str(direct_indices).lower()}>"
+    )
 
     @T.prim_func
     def main(
@@ -1199,16 +1207,16 @@ def sparse_mla_fwd_decode_partial_fp8(
                 T.annotate_layout(
                     {
                         kv_tile0: T.Layout(
-                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                            [BI, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
                         ),
                         kv_tile1: T.Layout(
-                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                            [BI, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
                         ),
                         kv_tile2: T.Layout(
-                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                            [BI, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
                         ),
                         kv_tile3: T.Layout(
-                            [32, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
+                            [BI, 128], lambda i, j: (i, j ^ ((i & 7) << 4))
                         ),
                     }
                 )
@@ -1252,15 +1260,35 @@ def sparse_mla_fwd_decode_partial_fp8(
                     q_tile3,
                 )
 
-            for k_i in T.serial(inner_iter):
+            # The last split can contain fewer physical tiles. The bound
+            # is uniform across the CTA, including the loader's warp barriers.
+            for k_i in T.serial(
+                T.min(inner_iter, tile_count - group_i * inner_iter)
+                if virtual_padding
+                else inner_iter
+            ):
                 topk_block_i = group_i * inner_iter + k_i
 
                 for bi_i in T.Parallel(BI):
-                    idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    valid = (idx >= 0) & (idx < num_pages) if packed else idx >= 0
-                    page_idx_shared[bi_i] = (
-                        idx if packed else T.if_then_else(valid, idx, 0)
-                    )
+                    column = topk_block_i * BI + bi_i
+                    # The loop already excludes whole virtual tiles. Only
+                    # a partial final tile needs a per-column bounds check.
+                    if virtual_padding and topk % BI != 0:
+                        idx = T.if_then_else(
+                            column < topk, indices[b_i, s_i, g_i, column], -1
+                        )
+                    else:
+                        idx = indices[b_i, s_i, g_i, column]
+                    if direct_indices:
+                        valid = T.Cast("uint64", T.Cast("int64", idx)) < T.Cast(
+                            "uint64", num_pages
+                        )
+                    else:
+                        valid = (idx >= 0) & (idx < num_pages) if packed else idx >= 0
+                    if not direct_indices:
+                        page_idx_shared[bi_i] = (
+                            idx if packed else T.if_then_else(valid, idx, 0)
+                        )
                     mask[bi_i] = valid
 
                 if packed:
@@ -1268,20 +1296,27 @@ def sparse_mla_fwd_decode_partial_fp8(
                     T.evaluate(
                         T.call_extern(
                             "int32",
-                            "remnant_glm_expand_tile",
+                            packed_loader,
                             T.access_ptr(
                                 kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256
                             ),
                             T.access_ptr(
                                 bitmap, "r", extent=T.Cast("int64", num_pages) * 8
                             ),
-                            T.access_ptr(page_idx_shared, "r"),
+                            T.access_ptr(
+                                indices, "r"
+                            )
+                            if direct_indices
+                            else T.access_ptr(page_idx_shared, "r"),
                             T.access_ptr(packed_scratch, "rw"),
                             T.access_ptr(kv_tile0, "w"),
                             T.access_ptr(kv_tile1, "w"),
                             T.access_ptr(kv_tile2, "w"),
                             T.access_ptr(kv_tile3, "w"),
                             T.Cast("int64", num_pages),
+                            T.Cast("int64", s_i) * topk + topk_block_i * BI
+                            if direct_indices
+                            else T.Cast("int64", 0),
                         )
                     )
                     T.sync_threads()
@@ -1429,6 +1464,7 @@ def tilelang_sparse_fwd(
     d_v: int = 512,
     *,
     packed_bitmap: torch.Tensor | None = None,
+    packed_prefill_tile: int = 32,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1438,6 +1474,17 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if packed_prefill_tile != 32 and (
+        packed_prefill_tile not in (64, 128)
+        or packed_bitmap is None
+        or not is_fp8_kv
+        or _is_hip
+        or num_heads not in (8, 16)
+        or q.shape[0] not in (128, 512, 1536, 4096, 8192)
+        or (packed_prefill_tile == 128 and (num_heads != 16 or q.shape[0] > 512))
+        or topk != 2112
+    ):
+        raise ValueError("Wide Packed tile requires a supported GLM prefill benchmark shape")
     if _is_hip or is_fp8_kv:
         if is_fp8_kv:
             if q.dtype != kv.dtype:
@@ -1449,8 +1496,13 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
-            ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            if packed_prefill_tile != 32:
+                block_I = packed_prefill_tile
+            ni = (topk + block_I - 1) // block_I
+            inner_iter = (
+                (ni + 1) // 2 if packed_prefill_tile != 32
+                else _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            )
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1493,7 +1545,7 @@ def tilelang_sparse_fwd(
             partial_o_batched, partial_lse_batched = kernel_partial(
                 q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
             )
-        n_groups = ni // inner_iter
+        n_groups = (ni + inner_iter - 1) // inner_iter
         kernel_combine = sparse_mla_fwd_decode_combine(
             num_heads,
             d_v,

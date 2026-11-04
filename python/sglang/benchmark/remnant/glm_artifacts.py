@@ -31,6 +31,7 @@ class PartialVariant(TypedDict):
     heads: int
     inner: int
     packed: bool
+    block_i: NotRequired[int]
     source_sha256: str
     cubin_path: NotRequired[str]
     cubin_sha256: NotRequired[str]
@@ -114,16 +115,16 @@ def packed_loader_probe():
     return probe
 
 
-def compile_sm90_variant(case: tuple[int, int]) -> list[PartialVariant]:
+def compile_sm90_variant(case: tuple[int, int, int]) -> list[PartialVariant]:
     """One independent head/split pair, owned by a CPU compiler process."""
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         sparse_mla_fwd_decode_combine,
         sparse_mla_fwd_decode_partial_fp8,
     )
 
-    heads, inner = case
+    heads, inner, block_i = case
     variants = []
-    for packed in (False, True):
+    for packed in ((False, True) if block_i == 32 else (True,)):
         kernel = sparse_mla_fwd_decode_partial_fp8(
             heads,
             512,
@@ -131,7 +132,7 @@ def compile_sm90_variant(case: tuple[int, int]) -> list[PartialVariant]:
             2112,
             packed=packed,
             sm_scale=ATTENTION_SCALE,
-            block_I=32,
+            block_I=block_i,
             inner_iter=inner,
             threads=128,
         )
@@ -140,13 +141,15 @@ def compile_sm90_variant(case: tuple[int, int]) -> list[PartialVariant]:
                 heads=heads,
                 inner=inner,
                 packed=packed,
+                block_i=block_i,
                 source_sha256=hashlib.sha256(
                     kernel.get_kernel_source().encode()
                 ).hexdigest(),
             )
         )
     sparse_mla_fwd_decode_combine(
-        heads, 512, (66 // inner) * 32, head_per_block=4, block_I=32, threads=128
+        heads, 512, ((2112 + block_i * inner - 1) // (block_i * inner)) * block_i,
+        head_per_block=4, block_I=block_i, threads=128,
     )
     return variants
 
@@ -178,7 +181,8 @@ def precompile_sm90() -> None:
         "triton": [store.hash, unpack.hash],
         "tilelang": [],
     }
-    cases = [(heads, inner) for heads in (8, 16, 32, 64) for inner in (1, 2, 33, 66)]
+    cases = [(heads, inner, 32) for heads in (8, 16, 32, 64) for inner in (1, 2, 33, 66)]
+    cases.extend([(8, 17, 64), (16, 17, 64), (16, 9, 128)])
     # Separate processes isolate TVM compiler state; each pair owns its combine
     # variant. The maintained runner supplies the overall bounded subprocess.
     with ProcessPoolExecutor(
@@ -188,7 +192,7 @@ def precompile_sm90() -> None:
             artifacts["tilelang"].extend(variants)
             print(
                 "Compiled GLM variants",
-                [(v["heads"], v["inner"], v["packed"]) for v in variants],
+                [(v["heads"], v["inner"], v["block_i"], v["packed"]) for v in variants],
                 flush=True,
             )
     packed_loader_probe()(8388610)

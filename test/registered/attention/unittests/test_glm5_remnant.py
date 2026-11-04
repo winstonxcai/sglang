@@ -779,6 +779,7 @@ def _benchmark_bank_graph(
     raw, norm, cache = fixture()
     f = Fixture.__new__(Fixture)
     f.case = Case(phase, heads, queries, 3, "independent", "rotating")
+    f.packed_prefill_tile = 32
     f.deadline = time.monotonic() + 1200
     f.banks, f.memory_limit = (
         banks,
@@ -789,7 +790,11 @@ def _benchmark_bank_graph(
     inner = _pick_inner_iter(
         queries, 66, torch.cuda.get_device_properties(0).multi_processor_count, 1
     )
-    f.identity = {"inner_iter": inner}
+    f.identity = {
+        "path_geometry": {
+            mode: {"partial_groups": 66 // inner} for mode in ("native", "direct")
+        }
+    }
     for bank in range(banks):
         changed = raw.roll(bank, 0).contiguous()
         values, bitmaps = (
@@ -976,6 +981,13 @@ class _CachedPartial:
                     C.byref(self.function), self.module, variant["symbol"].encode()
                 )
             )
+            if variant["dynamic_shared"] > 48 * 1024:
+                # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
+                self._check(
+                    self.driver.cuFuncSetAttribute(
+                        self.function, 8, variant["dynamic_shared"]
+                    )
+                )
         except BaseException:
             self.close()
             raise
@@ -1029,6 +1041,19 @@ def test_decode_partial_graph(heads, inner, record_property):
     Native on independently reconstructed Packed rows as its control. The full
     66/33-partition attention and combine path has a separate uninstrumented gate.
     """
+    _check_cached_partial_graph(heads, inner, record_property, packed_tile=32)
+
+
+@pytest.mark.parametrize("packed_tile", [32, 64, 128])
+def test_prefill_partial_graph(packed_tile, record_property):
+    _check_cached_partial_graph(16, 66 if packed_tile == 32 else 33, record_property, packed_tile=packed_tile)
+
+
+def test_prefill_partial_graph_h8(record_property):
+    _check_cached_partial_graph(8, 33, record_property, packed_tile=64)
+
+
+def _check_cached_partial_graph(heads, inner, record_property, *, packed_tile):
     import numpy as np
 
     manifest = os.environ.get("REMNANT_GLM_COMPILE_MANIFEST")
@@ -1038,11 +1063,17 @@ def test_decode_partial_graph(heads, inner, record_property):
             "python -m sglang.benchmark.remnant.glm_artifacts before focused tests"
         )
     compiled = json.loads(Path(manifest).read_text())
-    variants = {
-        v["packed"]: v
-        for v in compiled["tilelang"]
-        if v["heads"] == heads and v["inner"] == inner
-    }
+    variants = {}
+    for packed in (False, True):
+        tile = packed_tile if packed else 32
+        expected = (heads, (inner * 32 + tile - 1) // tile, packed, tile)
+        matches = [
+            v
+            for v in compiled["tilelang"]
+            if (v["heads"], v["inner"], v["packed"], v.get("block_i", 32)) == expected
+        ]
+        assert len(matches) == 1, f"Expected one cached GLM partial for {expected}"
+        variants[packed] = matches[0]
     record_property(
         "decode_geometry",
         json.dumps(

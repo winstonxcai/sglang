@@ -24,6 +24,14 @@ from pathlib import Path
 
 PROTOCOL = "remnant-glm-attention-v1"
 DECODE_PROTOCOL = "remnant-glm-decode-v1"
+PREFILL_PROTOCOL = "remnant-glm-prefill-v1"
+PREFILL_SMALL_PROTOCOL = "remnant-glm-prefill-small-v1"
+PROTOCOLS = {
+    "all": PROTOCOL,
+    "decode": DECODE_PROTOCOL,
+    "prefill": PREFILL_PROTOCOL,
+    "prefill-small": PREFILL_SMALL_PROTOCOL,
+}
 MODES = ("native", "direct")
 SEED = 20261024
 HISTORY, PAGE, DIM, KEEP, COLUMNS, GROUPS = 131072, 256, 512, 256, 2112, 512
@@ -57,7 +65,13 @@ class Case:
 
 
 def cases(phase_scope: str = "all") -> list[Case]:
-    if phase_scope not in ("all", "decode"):
+    if phase_scope == "prefill-small":
+        return [
+            Case("prefill", 16, queries, 0, locality, "warm")
+            for queries in (128, 512)
+            for locality in ("independent", "shared")
+        ]
+    if phase_scope not in PROTOCOLS:
         raise ValueError(f"Unsupported GLM phase: {phase_scope}")
     return [
         Case(phase, heads, queries, tail, locality, policy)
@@ -106,16 +120,16 @@ def logical_selection(case: Case, bank: int = 0):
         if case.locality == "shared"
         else None
     )
+    offsets = np.arange(4)
+    if shared is not None:
+        out[:, :2048] = (shared[:, None] * 4 + offsets).reshape(-1)
     for q in range(case.queries):
         length = first_length + (q if case.phase == "prefill" else 0)
-        chosen = (
-            shared
-            if shared is not None
-            else rng.choice(length // 4, GROUPS, replace=False)
-        )
         req = q if case.phase == "decode" else 0
         offset = req * case.request_slots
-        out[q, :2048] = (chosen[:, None] * 4 + np.arange(4)).reshape(-1) + offset
+        if shared is None:
+            chosen = rng.choice(length // 4, GROUPS, replace=False)
+            out[q, :2048] = (chosen[:, None] * 4 + offsets).reshape(-1) + offset
         tail = length % 4
         out[q, 2048 : 2048 + tail] = np.arange(length - tail, length) + offset
     return out
@@ -131,18 +145,25 @@ def physical_selection(case: Case, bank: int = 0):
     mapping = np.concatenate(
         [rng.permutation(pages) + r * pages for r in range(case.requests)]
     )
-    valid = logical >= 0
-    physical = np.full_like(logical, -1)
-    physical[valid] = (
-        PAGE + mapping[logical[valid] // PAGE] * PAGE + logical[valid] % PAGE
-    )
-    return physical
+    shared = case.locality == "shared"
+    # Shared prefill selects the same 2,048 history rows for every query.
+    # Map them once, then map the changing tails and broadcast the history.
+    parts = (logical[:1, :2048], logical[:, 2048:2051]) if shared else (logical,)
+    for part in parts:
+        valid = part >= 0
+        positions = part[valid]
+        part[valid] = PAGE + mapping[positions // PAGE] * PAGE + positions % PAGE
+    if shared:
+        logical[1:, :2048] = logical[0, :2048]
+    return logical
 
 
-def selected_physical_rows(indices):
+def selected_physical_rows(indices, *, shared_history: bool = False):
     """Sorted distinct valid locations; padding is never initialized or loaded."""
     import numpy as np
 
+    if shared_history:
+        indices = np.concatenate((indices[0, :2048], indices[:, 2048:2051].ravel()))
     return np.unique(indices[indices >= 0])
 
 
@@ -183,7 +204,8 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-family", choices=("glm53",), default="glm53")
     p.add_argument("--suite", choices=("glm-attention",), default="glm-attention")
-    p.add_argument("--phase", choices=("all", "decode"), default="all")
+    p.add_argument("--phase", choices=tuple(PROTOCOLS), default="all")
+    p.add_argument("--packed-prefill-tile", type=int, choices=(32, 64, 128), default=32)
     p.add_argument("--modes", choices=("native,direct",), default="native,direct")
     p.add_argument(
         "--resume",
@@ -268,16 +290,16 @@ def _hash_tensor(digest, tensor) -> None:
     )
 
 
-def _device_contract() -> tuple[int, int]:
+def _device_contract(gpu_family: str = "H100") -> tuple[int, int]:
     import torch
     from cuda.bindings import driver
 
     if (
         not torch.cuda.is_available()
         or torch.cuda.get_device_capability() != (9, 0)
-        or "H100" not in torch.cuda.get_device_name()
+        or gpu_family not in torch.cuda.get_device_name()
     ):
-        raise RuntimeError("GLM attention benchmark requires one H100/SM90")
+        raise RuntimeError(f"GLM attention benchmark requires one {gpu_family}/SM90")
     result, l2 = driver.cuDeviceGetAttribute(
         driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
         torch.cuda.current_device(),
@@ -295,39 +317,37 @@ class Fixture:
     remain dummy. No Adapter workspace, KDA pool or model weights are allocated.
     """
 
-    def __init__(self, case: Case, deadline: float):
+    def __init__(
+        self, case: Case, deadline: float, *, packed_prefill_tile: int = 32,
+        gpu_family: str = "H100",
+    ):
+        self.packed_prefill_tile = packed_prefill_tile
         import torch
 
         from sglang.srt.layers.layernorm import RMSNorm
         from sglang.srt.remnant.glm import PackedCache, normalize_and_store
 
         self.case, self.deadline = case, deadline
-        self.l2, total = _device_contract()
+        self.l2, total = _device_contract(gpu_family)
         first = physical_selection(case)
-        selected_rows = len(selected_physical_rows(first))
-        self.banks = (
-            1 if case.policy == "warm" else rotation_count(selected_rows, self.l2)
-        )
+        shared_history = case.locality == "shared"
+        first_rows = selected_physical_rows(first, shared_history=shared_history)
+        selected_rows = len(first_rows)
         self.slots = PAGE + case.requests * case.request_slots
         # Bank-specific random selections can have different union sizes. Make
         # the rotation bound exact using all actual selections, not just bank 0.
         selections = [first]
+        locations_by_bank = [first_rows]
         touched = [selected_rows]
-        while len(selections) < self.banks:
+        # Actual union sizes can differ across banks. Stop at the smallest
+        # prefix of disjoint banks whose selected Packed bytes exceed 2*L2.
+        while case.policy == "rotating" and sum(touched) * 320 <= 2 * self.l2:
             self.check()
             ids = physical_selection(case, len(selections))
+            locations = selected_physical_rows(ids, shared_history=shared_history)
             selections.append(ids)
-            touched.append(len(selected_physical_rows(ids)))
-        if case.policy == "rotating":
-            while sum(touched) * 320 <= 2 * self.l2:
-                self.check()
-                ids = physical_selection(case, len(selections))
-                selections.append(ids)
-                touched.append(len(selected_physical_rows(ids)))
-            # Remove a final unnecessary bank: smallest prefix exceeding 2*L2.
-            while len(touched) > 1 and sum(touched[:-1]) * 320 > 2 * self.l2:
-                touched.pop()
-                selections.pop()
+            locations_by_bank.append(locations)
+            touched.append(len(locations))
         self.banks = len(selections)
         cache_bytes = self.banks * self.slots * (512 + 320)
         input_bytes = (
@@ -347,7 +367,7 @@ class Fixture:
             torch.cuda.get_device_properties(0).multi_processor_count,
             1,
         )
-        output_budget //= inner
+        output_budget //= min(inner, 33) if packed_prefill_tile != 32 else inner
         self.projected_bytes = cache_bytes + input_bytes + output_budget + 512 * 1024**2
         if self.projected_bytes >= self.memory_limit:
             raise RuntimeError(
@@ -367,14 +387,13 @@ class Fixture:
         norm = RMSNorm(DIM, eps=1e-5).cuda().to(torch.bfloat16)
         norm.weight.data.copy_(torch.linspace(0.5, 1.5, DIM, device="cuda"))
         _hash_tensor(self.digest, norm.weight)
-        for bank, selected in enumerate(selections):
+        for bank, (selected, locations) in enumerate(zip(selections, locations_by_bank)):
             self.check()
             ids = torch.from_numpy(selected).cuda().unsqueeze(1)
             native = torch.zeros(self.slots, DIM, dtype=torch.uint8, device="cuda")
             values = torch.zeros(self.slots, KEEP, dtype=torch.uint8, device="cuda")
             bitmap = torch.zeros(self.slots, 8, dtype=torch.uint64, device="cuda")
             gen = torch.Generator(device="cuda").manual_seed(case_seed(case, bank))
-            locations = selected_physical_rows(selected)
             for start in range(0, len(locations), 65536):
                 self.check()
                 end = min(start + 65536, len(locations))
@@ -405,7 +424,7 @@ class Fixture:
             self.native.append(native)
             self.packed.append(PackedCache(values, bitmap, None, "direct"))
             _hash_tensor(self.digest, ids)
-        del selections, norm
+        del selections, locations_by_bank, norm
         self.identity = dict(
             common_inputs_sha256=self.digest.hexdigest(),
             initialization="selected-physical-union-v1; unselected backing rows zero",
@@ -421,6 +440,14 @@ class Fixture:
             memory_limit_bytes=self.memory_limit,
             inner_iter=inner,
             partial_groups=66 // inner,
+            path_geometry={
+                "native": dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner),
+                "direct": dict(
+                    tile_rows=packed_prefill_tile,
+                    inner_iter={64: 17, 128: 9}.get(packed_prefill_tile, inner),
+                    partial_groups=2 if packed_prefill_tile != 32 else 66 // inner,
+                ),
+            },
             first_query_sequence_length=HISTORY + (4 if case.tail == 0 else 3),
         )
         self.graphs = {}
@@ -447,7 +474,18 @@ class Fixture:
             )
         if mode != "direct":
             raise ValueError(f"Unsupported GLM path {mode}")
-        return attention(self.q, self.packed[bank], self.ids[bank], SCALE)
+        cache = self.packed[bank]
+        if self.packed_prefill_tile == 32:
+            return attention(self.q, cache, self.ids[bank], SCALE)
+        return tilelang_sparse_fwd(
+            self.q,
+            cache.values.view(torch.float8_e4m3fn).unsqueeze(1),
+            self.ids[bank],
+            SCALE,
+            DIM,
+            packed_bitmap=cache.bitmaps,
+            packed_prefill_tile=self.packed_prefill_tile,
+        )
 
     def validate(self, *, reference_device=None) -> None:
         import torch
@@ -549,7 +587,7 @@ class Fixture:
                 * self.case.heads
                 * DIM
                 * 2
-                * (66 // self.identity["inner_iter"])
+                * self.identity["path_geometry"][mode]["partial_groups"]
                 + 64 * 1024**2
             )
             if graph_bytes > bound or torch.cuda.memory_reserved() >= self.memory_limit:
@@ -756,11 +794,13 @@ def _summary_function() -> Callable[[list[float]], dict]:
 
 def validate_timing(payload: dict, *, prefix: bool = False) -> None:
     phase = payload.get("phase", "all")
-    protocol = DECODE_PROTOCOL if phase == "decode" else PROTOCOL
+    protocol = PROTOCOLS[phase]
     if payload.get("protocol") != protocol or (
         not prefix and payload.get("status") != "passed"
     ):
         raise RuntimeError("GLM timing protocol incomplete")
+    if phase == "prefill" and payload.get("packed_prefill_tile") != 64:
+        raise RuntimeError("Full GLM prefill requires the 64-row Packed tile")
     expected = cases(phase)
     if prefix:
         if len(payload["cases"]) > len(expected):
@@ -778,6 +818,13 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
         ):
             raise RuntimeError(f"Incomplete GLM case {case['name']}")
         fixture = case["fixture"]
+        if phase == "prefill":
+            native_inner = fixture.get("inner_iter")
+            if native_inner not in (33, 66) or fixture.get("path_geometry") != {
+                "native": dict(tile_rows=32, inner_iter=native_inner, partial_groups=66 // native_inner),
+                "direct": dict(tile_rows=64, inner_iter=17, partial_groups=2),
+            }:
+                raise RuntimeError(f"Invalid full GLM prefill geometry {case['name']}")
         banks = fixture["banks"]
         touched = fixture["selected_rows_per_bank"]
         if (
@@ -836,13 +883,16 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             raise RuntimeError("Invalid GLM derived decode summary")
 
 
-def resume_prefix(previous: dict, source: dict, phase: str = "all") -> list[dict]:
+def resume_prefix(
+    previous: dict, source: dict, phase: str = "all", *, packed_prefill_tile: int = 32
+) -> list[dict]:
     """Reuse only validated cases from an identical fixture/toolchain snapshot."""
     if (
         previous.get("phase", "all") != phase
         or previous.get("source") != source
         or previous.get("seed") != SEED
         or previous.get("rounds") != ROUNDS
+        or previous.get("packed_prefill_tile", 32) != packed_prefill_tile
     ):
         raise RuntimeError(
             "GLM checkpoint source/artifact/seed/round identity mismatch"
@@ -897,7 +947,12 @@ def weighted_overhead(records: list[dict]) -> dict:
 
 def main() -> None:
     args = parser().parse_args()
-    protocol = DECODE_PROTOCOL if args.phase == "decode" else PROTOCOL
+    protocol = PROTOCOLS[args.phase]
+    if args.phase == "prefill":
+        if args.packed_prefill_tile != 64:
+            raise ValueError("Full GLM prefill requires --packed-prefill-tile 64")
+    elif args.packed_prefill_tile != 32 and (args.phase != "prefill-small" or args.resume):
+        raise ValueError("Wide Packed tile requires prefill or a fresh prefill-small run")
     if args.check_imports:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
         from sglang.srt.remnant.glm import compile_kernels
@@ -909,8 +964,9 @@ def main() -> None:
             )
         )
         return
-    if not args.output or not 60 <= args.max_seconds <= 1200:
-        raise ValueError("GLM requires --output and --max-seconds between 60 and 1200")
+    limit = 2400 if args.phase == "prefill" else 1200
+    if not args.output or not 60 <= args.max_seconds <= limit:
+        raise ValueError(f"GLM requires --output and --max-seconds between 60 and {limit}")
     import torch
 
     base = Path(args.output)
@@ -921,6 +977,7 @@ def main() -> None:
     payload = dict(
         protocol=protocol,
         phase=args.phase,
+        packed_prefill_tile=args.packed_prefill_tile,
         status="running",
         seed=SEED,
         rounds=ROUNDS,
@@ -931,7 +988,8 @@ def main() -> None:
     if args.resume:
         checkpoint = Path(args.resume)
         payload["cases"] = resume_prefix(
-            json.loads(checkpoint.read_text()), payload["source"], args.phase
+            json.loads(checkpoint.read_text()), payload["source"], args.phase,
+            packed_prefill_tile=args.packed_prefill_tile,
         )
         payload["resumed_from"] = dict(
             path=str(checkpoint),
@@ -944,17 +1002,23 @@ def main() -> None:
     fixture = None
     try:
         with torch.inference_mode():
-            for case in cases(args.phase)[len(payload["cases"]) :]:
+            matrix = cases(args.phase)
+            for case in matrix[len(payload["cases"]) :]:
                 record = dict(name=case.name, case=asdict(case), valid=False)
                 payload["cases"].append(record)
                 write_results(payload, base)
-                fixture = Fixture(case, deadline)
+                fixture = Fixture(
+                    case, deadline, packed_prefill_tile=args.packed_prefill_tile,
+                    gpu_family="H200" if args.phase in ("prefill", "prefill-small") else "H100",
+                )
                 record["fixture"] = fixture.identity
                 record.update(fixture.time())
                 record["valid"] = True
                 if args.phase == "decode":
                     payload["summary"] = weighted_overhead(payload["cases"])
                 write_results(payload, base)
+                if args.phase == "prefill":
+                    print(f"{len(payload['cases'])}/{len(matrix)} {case.name}", flush=True)
                 del fixture
                 fixture = None
                 gc.collect()

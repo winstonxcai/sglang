@@ -1759,6 +1759,51 @@ def test_glm_decode_scope_and_weighting():
         )
 
 
+def test_glm_full_prefill_scope_and_resume(tmp_path):
+    import numpy as np
+
+    matrix = glm.cases("prefill")
+    assert len(matrix) == 80
+    assert matrix == [case for case in glm.cases() if case.phase == "prefill"]
+    assert glm.parser().parse_args(["--phase", "prefill"]).phase == "prefill"
+    for case in (matrix[2], matrix[-1]):
+        indices = glm.physical_selection(case, bank=1)
+        np.testing.assert_array_equal(
+            glm.selected_physical_rows(indices, shared_history=True),
+            glm.selected_physical_rows(indices),
+        )
+
+    source = _glm_source_with_artifacts(tmp_path)
+    payload = _glm_complete_timing_payload()
+    payload.update(
+        protocol=glm.PREFILL_PROTOCOL,
+        phase="prefill",
+        packed_prefill_tile=64,
+        cases=[c for c in payload["cases"] if c["case"]["phase"] == "prefill"],
+        source=source,
+        seed=glm.SEED,
+        rounds=glm.ROUNDS,
+    )
+    for case in payload["cases"]:
+        case["fixture"].update(
+            inner_iter=66,
+            path_geometry={
+                "native": dict(tile_rows=32, inner_iter=66, partial_groups=1),
+                "direct": dict(tile_rows=64, inner_iter=17, partial_groups=2),
+            },
+        )
+    glm.validate_timing(payload)
+    checkpoint = {**payload, "cases": payload["cases"][:3]}
+    assert (
+        glm.resume_prefix(checkpoint, source, "prefill", packed_prefill_tile=64)
+        == checkpoint["cases"]
+    )
+    with pytest.raises(RuntimeError, match="identity"):
+        glm.resume_prefix(checkpoint, source, "prefill")
+    with pytest.raises(RuntimeError, match="80-case"):
+        glm.validate_timing(checkpoint)
+
+
 def test_glm_decode_summary_must_match_raw_samples(tmp_path):
     source = _glm_source_with_artifacts(tmp_path)
     payload = _glm_complete_timing_payload()
