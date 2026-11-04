@@ -417,6 +417,7 @@ def _check_production_producer_and_attention_dispatch(implementation, phase):
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
     from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
         DeepseekMLAForwardMixin,
     )
@@ -472,15 +473,16 @@ def _check_production_producer_and_attention_dispatch(implementation, phase):
         producer.layer_id = 7  # Second MLA layer; first MLA layer is model layer 3.
         producer.kv_a_layernorm = norm
         batch = SimpleNamespace(
-            token_to_kv_pool=pool,
             out_cache_loc=physical[:512],
             forward_mode=ForwardMode.EXTEND
             if phase == "prefill"
             else ForwardMode.DECODE,
         )
-        producer._glm_normalize_and_store(raw[:512], batch)
-        batch.out_cache_loc = physical[512:]
-        current_kv = producer._glm_normalize_and_store(raw[512:], batch).unsqueeze(1)
+        context = ForwardContext(attn_backend=backend)
+        with forward_context(context):
+            producer._glm_normalize_and_store(raw[:512], batch)
+            batch.out_cache_loc = physical[512:]
+            current_kv = producer._glm_normalize_and_store(raw[512:], batch).unsqueeze(1)
         cache = pool.get_glm_packed_buffer(7)
         _, expected_values, expected_words, dense = expected(raw, norm)
         assert torch.equal(cache.values[physical], expected_values)
@@ -513,15 +515,16 @@ def _check_production_producer_and_attention_dispatch(implementation, phase):
             backend.forward_extend if phase == "prefill" else backend.forward_decode
         )
         # A duplicate Native store would call the Packed pool's raising setter.
-        out = forward(
-            q,
-            current_kv,
-            current_kv,
-            layer,
-            batch,
-            save_kv_cache=True,
-            topk_indices=topk_indices,
-        )
+        with forward_context(context):
+            out = forward(
+                q,
+                current_kv,
+                current_kv,
+                layer,
+                batch,
+                save_kv_cache=True,
+                topk_indices=topk_indices,
+            )
         dense_cache = torch.zeros((1024, 1, 512), dtype=torch.uint8, device="cuda")
         dense_cache[physical, 0] = dense
         selected = torch.full((8, 1, 2112), -1, dtype=torch.int32, device="cuda")

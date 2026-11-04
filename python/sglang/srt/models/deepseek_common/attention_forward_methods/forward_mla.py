@@ -302,7 +302,7 @@ class DeepseekMLAForwardMixin:
 
     # Author: Winston Cai. Pass the original mask directly from selection to store.
     def _glm_normalize_and_store(self, raw, forward_batch):
-        pool = forward_batch.token_to_kv_pool
+        pool = get_token_to_kv_pool()
         if getattr(pool, "glm_packed", False):
             return pool.normalize_and_store_glm(
                 self.layer_id, raw, self.kv_a_layernorm, forward_batch.out_cache_loc
