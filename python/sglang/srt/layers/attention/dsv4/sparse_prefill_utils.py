@@ -32,7 +32,6 @@ For SWA-only layers callers pass ``topk=0``, ``compressed_base = 0`` (the
 compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
 
-import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -64,15 +63,9 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
     variable remains as a debug override while the runtime path is being
     hardened: truthy values force Q8 on, falsy values force it off.
     """
-    env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
-    if env_value is not None:
-        return env_value.lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-    return dsv4_prefill_backend == "flashmla_sparse_q8"
+    from sglang.srt.remnant.config import resolve_dsv4_prefill_backend
+
+    return resolve_dsv4_prefill_backend(dsv4_prefill_backend) == "flashmla_sparse_q8"
 
 
 class SparsePrefillWorkspace:

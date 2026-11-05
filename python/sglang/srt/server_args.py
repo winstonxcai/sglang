@@ -249,6 +249,25 @@ class ServerArgs:
 
         cfg = resolving_view(self)
         remnant.configure_from_args(cfg, publish=False)
+        if getattr(cfg, "dsv41_main_kv_cache_format", "auto") != "auto":
+            from sglang.srt.runtime_context import get_platform
+
+            hf_config = model_config_of(self).hf_config
+            ratios = getattr(hf_config, "compress_ratios", ())
+            if not any(r in (1, 2) for r in ratios) or not getattr(
+                hf_config, "kv_source_layer_ids", None
+            ):
+                raise ValueError(
+                    "Explicit V4.1 FP4 requires low-ratio caches with kv_source_layers"
+                )
+            if any(r not in (0, 1, 2) for r in ratios):
+                raise ValueError(
+                    "Explicit V4.1 FP4 requires only ratio-1/2 global caches"
+                )
+            if "DSpark" in str(getattr(hf_config, "architectures", ())):
+                raise ValueError("Explicit V4.1 FP4 does not support DSpark")
+            if not get_platform().is_sm90:
+                raise ValueError("Explicit V4.1 FP4 currently requires H100/SM90")
         if cfg.dsv4_c4_cache_format != "remnant":
             return
 

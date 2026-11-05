@@ -1,3 +1,5 @@
+"""Paged KV reconstruction. Author: Winston Cai. (SM90 FP4 dispatch.)"""
+
 from typing import Optional, Union
 
 import torch
@@ -46,6 +48,18 @@ def dequantize_k_cache_paged(
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
     """
     layout = KVLayout.parse(layout)
+    if layout is KVLayout.V41_FP4_REMNANT or (
+        layout is KVLayout.V41_FP4 and get_jit_cuda_arch().major == 9
+    ):
+        from .fp4_cache import read_fp4_cache
+
+        return read_fp4_cache(
+            quant_k_cache.view(torch.uint8),
+            page_table_1_flattened,
+            page_size,
+            packed=layout is KVLayout.V41_FP4_REMNANT,
+            out=out,
+        )
     if layout is not KVLayout.V4:
         return dequantize_k_cache_paged_v41(
             quant_k_cache, page_table_1_flattened, page_size, out=out, layout=layout
