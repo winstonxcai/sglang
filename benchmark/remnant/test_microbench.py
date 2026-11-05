@@ -1318,6 +1318,32 @@ def test_glm_matrix_order_and_baseline_identity():
     assert glm.MODES == ("native", "direct")
 
 
+def test_glm_graph_probe_metadata():
+    """Validate the lightweight graph fixture's public metadata without CUDA."""
+    import ast
+
+    source = ROOT / "test/registered/attention/unittests/test_glm5_remnant.py"
+    helper = next(
+        node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_benchmark_bank_graph"
+    )
+    identity = next(
+        node.value
+        for node in helper.body
+        if isinstance(node, ast.Assign)
+        and any(ast.unparse(target) == "f.identity" for target in node.targets)
+    )
+    expression = compile(ast.Expression(identity), str(source), "eval")
+    for inner in (1, 2, 33, 66):
+        metadata = eval(expression, {"inner": inner})
+        assert metadata["inner_iter"] == inner
+        assert metadata["path_geometry"] == {
+            mode: dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner)
+            for mode in ("native", "direct")
+        }
+
+
 def test_glm_grouped_causal_prefill_and_shared_prefix():
     import numpy as np
 

@@ -800,9 +800,15 @@ def _benchmark_bank_graph(
         queries, 66, torch.cuda.get_device_properties(0).multi_processor_count, 1
     )
     f.identity = {
+        "inner_iter": inner,
         "path_geometry": {
-            mode: {"partial_groups": 66 // inner} for mode in ("native", "direct")
-        }
+            mode: {
+                "tile_rows": 32,
+                "inner_iter": inner,
+                "partial_groups": 66 // inner,
+            }
+            for mode in ("native", "direct")
+        },
     }
     for bank in range(banks):
         changed = raw.roll(bank, 0).contiguous()
