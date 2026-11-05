@@ -2096,3 +2096,27 @@ def test_v41_fp4_matrix_and_timing_gate():
             broken["protocol"] = "remnant-v41-fp4-decode-v2"
         with pytest.raises((RuntimeError, ValueError)):
             cases.validate_timing(broken, suite="v41-fp4-decode")
+
+
+def test_shared_statistics_preserve_exact_summary_and_paired_rounds():
+    import statistics
+
+    samples = [4.0, 1.0, 3.0, 2.0]
+    expected = dict(
+        samples=samples,
+        mean=2.5,
+        median=2.5,
+        stdev=statistics.stdev(samples),
+        p95=3.8499999999999996,
+    )
+    assert shared_timing.summary(samples) == cases.summary(samples) == expected
+    assert shared_timing.paired_ratio_summary(
+        [2.0, 3.0], [1.0, 2.0]
+    ) == shared_timing.summary([2.0, 1.5])
+    for left, right in (
+        ([1.0, 2.0], [1.0]),
+        ([1.0, float("nan")], [1.0, 2.0]),
+        ([1.0, 2.0], [0.0, 2.0]),
+    ):
+        with pytest.raises(ValueError):
+            shared_timing.paired_ratio_summary(left, right)

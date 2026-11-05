@@ -318,7 +318,11 @@ class Fixture:
     """
 
     def __init__(
-        self, case: Case, deadline: float, *, packed_prefill_tile: int = 32,
+        self,
+        case: Case,
+        deadline: float,
+        *,
+        packed_prefill_tile: int = 32,
         gpu_family: str = "H100",
     ):
         self.packed_prefill_tile = packed_prefill_tile
@@ -387,7 +391,9 @@ class Fixture:
         norm = RMSNorm(DIM, eps=1e-5).cuda().to(torch.bfloat16)
         norm.weight.data.copy_(torch.linspace(0.5, 1.5, DIM, device="cuda"))
         _hash_tensor(self.digest, norm.weight)
-        for bank, (selected, locations) in enumerate(zip(selections, locations_by_bank)):
+        for bank, (selected, locations) in enumerate(
+            zip(selections, locations_by_bank)
+        ):
             self.check()
             ids = torch.from_numpy(selected).cuda().unsqueeze(1)
             native = torch.zeros(self.slots, DIM, dtype=torch.uint8, device="cuda")
@@ -441,7 +447,9 @@ class Fixture:
             inner_iter=inner,
             partial_groups=66 // inner,
             path_geometry={
-                "native": dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner),
+                "native": dict(
+                    tile_rows=32, inner_iter=inner, partial_groups=66 // inner
+                ),
                 "direct": dict(
                     tile_rows=packed_prefill_tile,
                     inner_iter={64: 17, 128: 9}.get(packed_prefill_tile, inner),
@@ -610,7 +618,7 @@ class Fixture:
 
     def time(self) -> dict:
         from sglang.benchmark.remnant.cases import summary
-        from sglang.benchmark.remnant.timing import paired_samples
+        from sglang.benchmark.remnant.timing import paired_ratio_summary, paired_samples
 
         self.capture()
         repeats = cycles_per_sample(self.banks)
@@ -632,8 +640,8 @@ class Fixture:
             execution="cuda_graph",
             paths={m: summary(t) for m, t in samples.items()},
             paired_ratios={
-                "direct_over_native": summary(
-                    [d / n for d, n in zip(samples["direct"], samples["native"])]
+                "direct_over_native": paired_ratio_summary(
+                    samples["direct"], samples["native"]
                 )
             },
             round_orders=orders,
@@ -784,7 +792,7 @@ def _summary_function() -> Callable[[list[float]], dict]:
 
     name = __name__ + "_cases"
     spec = importlib.util.spec_from_file_location(
-        name, Path(__file__).with_name("cases.py")
+        name, Path(__file__).with_name("timing.py")
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -821,7 +829,11 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
         if phase == "prefill":
             native_inner = fixture.get("inner_iter")
             if native_inner not in (33, 66) or fixture.get("path_geometry") != {
-                "native": dict(tile_rows=32, inner_iter=native_inner, partial_groups=66 // native_inner),
+                "native": dict(
+                    tile_rows=32,
+                    inner_iter=native_inner,
+                    partial_groups=66 // native_inner,
+                ),
                 "direct": dict(tile_rows=64, inner_iter=17, partial_groups=2),
             }:
                 raise RuntimeError(f"Invalid full GLM prefill geometry {case['name']}")
@@ -951,8 +963,12 @@ def main() -> None:
     if args.phase == "prefill":
         if args.packed_prefill_tile != 64:
             raise ValueError("Full GLM prefill requires --packed-prefill-tile 64")
-    elif args.packed_prefill_tile != 32 and (args.phase != "prefill-small" or args.resume):
-        raise ValueError("Wide Packed tile requires prefill or a fresh prefill-small run")
+    elif args.packed_prefill_tile != 32 and (
+        args.phase != "prefill-small" or args.resume
+    ):
+        raise ValueError(
+            "Wide Packed tile requires prefill or a fresh prefill-small run"
+        )
     if args.check_imports:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
         from sglang.srt.remnant.glm import compile_kernels
@@ -966,7 +982,9 @@ def main() -> None:
         return
     limit = 2400 if args.phase == "prefill" else 1200
     if not args.output or not 60 <= args.max_seconds <= limit:
-        raise ValueError(f"GLM requires --output and --max-seconds between 60 and {limit}")
+        raise ValueError(
+            f"GLM requires --output and --max-seconds between 60 and {limit}"
+        )
     import torch
 
     base = Path(args.output)
@@ -988,7 +1006,9 @@ def main() -> None:
     if args.resume:
         checkpoint = Path(args.resume)
         payload["cases"] = resume_prefix(
-            json.loads(checkpoint.read_text()), payload["source"], args.phase,
+            json.loads(checkpoint.read_text()),
+            payload["source"],
+            args.phase,
             packed_prefill_tile=args.packed_prefill_tile,
         )
         payload["resumed_from"] = dict(
@@ -1008,8 +1028,12 @@ def main() -> None:
                 payload["cases"].append(record)
                 write_results(payload, base)
                 fixture = Fixture(
-                    case, deadline, packed_prefill_tile=args.packed_prefill_tile,
-                    gpu_family="H200" if args.phase in ("prefill", "prefill-small") else "H100",
+                    case,
+                    deadline,
+                    packed_prefill_tile=args.packed_prefill_tile,
+                    gpu_family="H200"
+                    if args.phase in ("prefill", "prefill-small")
+                    else "H100",
                 )
                 record["fixture"] = fixture.identity
                 record.update(fixture.time())
@@ -1018,7 +1042,9 @@ def main() -> None:
                     payload["summary"] = weighted_overhead(payload["cases"])
                 write_results(payload, base)
                 if args.phase == "prefill":
-                    print(f"{len(payload['cases'])}/{len(matrix)} {case.name}", flush=True)
+                    print(
+                        f"{len(payload['cases'])}/{len(matrix)} {case.name}", flush=True
+                    )
                 del fixture
                 fixture = None
                 gc.collect()

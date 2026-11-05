@@ -13,7 +13,6 @@ import math
 import os
 import random
 import re
-import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -235,19 +234,16 @@ def benchmark_modes(keep_count: int = 256, modes: str | None = None) -> tuple[st
     return result
 
 
-def summary(samples: list[float]) -> dict:
-    if len(samples) < 2 or any(not math.isfinite(x) or x <= 0 for x in samples):
-        raise ValueError("timing requires at least two positive finite samples")
-    ordered = sorted(samples)
-    position = (len(samples) - 1) * 0.95
-    lo, hi = math.floor(position), math.ceil(position)
-    return {
-        "samples": samples,
-        "mean": statistics.mean(samples),
-        "median": statistics.median(samples),
-        "stdev": statistics.stdev(samples),
-        "p95": ordered[lo] + (ordered[hi] - ordered[lo]) * (position - lo),
-    }
+# CPU contracts also import this file directly without serving dependencies.
+import importlib.util as _import_util
+
+_timing_spec = _import_util.spec_from_file_location(
+    "_remnant_timing_statistics", Path(__file__).with_name("timing.py")
+)
+_timing = _import_util.module_from_spec(_timing_spec)
+_timing_spec.loader.exec_module(_timing)
+summary = _timing.summary
+paired_ratio_summary = _timing.paired_ratio_summary
 
 
 def paired_ratios(samples: dict[str, list[float]]) -> dict:
@@ -261,13 +257,8 @@ def paired_ratios(samples: dict[str, list[float]]) -> dict:
         ("packed192", "packed256"),
     ):
         if numerator in samples and denominator in samples:
-            a, b = samples[numerator], samples[denominator]
-            if len(a) != len(b):
-                raise ValueError("paired timings must have equal round counts")
-            summary(a)
-            summary(b)
-            result[f"{numerator}_over_{denominator}"] = summary(
-                [x / y for x, y in zip(a, b)]
+            result[f"{numerator}_over_{denominator}"] = paired_ratio_summary(
+                samples[numerator], samples[denominator]
             )
     return result
 

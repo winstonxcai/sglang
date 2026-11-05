@@ -5,7 +5,9 @@ Author: Winston Cai.
 
 from __future__ import annotations
 
+import math
 import random
+import statistics
 from collections.abc import Callable, Mapping
 
 
@@ -70,3 +72,27 @@ def paired_samples(
                 before(key)
             samples[key].append(sample(calls[key], repeats))
     return samples, orders
+
+
+def summary(samples: list[float]) -> dict:
+    if len(samples) < 2 or any(not math.isfinite(x) or x <= 0 for x in samples):
+        raise ValueError("timing requires at least two positive finite samples")
+    ordered = sorted(samples)
+    position = (len(samples) - 1) * 0.95
+    lo, hi = math.floor(position), math.ceil(position)
+    return {
+        "samples": samples,
+        "mean": statistics.mean(samples),
+        "median": statistics.median(samples),
+        "stdev": statistics.stdev(samples),
+        "p95": ordered[lo] + (ordered[hi] - ordered[lo]) * (position - lo),
+    }
+
+
+def paired_ratio_summary(numerator: list[float], denominator: list[float]) -> dict:
+    """Summarize ratios from corresponding complete-call timing rounds."""
+    if len(numerator) != len(denominator):
+        raise ValueError("paired timings must have equal round counts")
+    summary(numerator)
+    summary(denominator)
+    return summary([a / b for a, b in zip(numerator, denominator)])
