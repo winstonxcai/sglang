@@ -18,7 +18,10 @@ SELECTION_COLUMNS = 2112
 def enabled() -> bool:
     from sglang.srt.runtime_context import get_model
 
-    return get_model().glm5_mla_cache_format == "remnant"
+    return (
+        get_model().cache_model_family == "glm53"
+        and get_model().kv_cache_format == "direct"
+    )
 
 
 def validate(args: Any, hf_config: Any, *, model_dtype: Any) -> None:
@@ -28,7 +31,7 @@ def validate(args: Any, hf_config: Any, *, model_dtype: Any) -> None:
     Accept its canonical string form too, keeping this contract CPU-testable
     without importing the serving stack or duplicating dtype resolution.
     """
-    if args.glm5_mla_cache_format == "native":
+    if args.kv_cache_format == "native":
         return
     text = getattr(hf_config, "text_config", hf_config)
     if getattr(text, "model_type", None) != "glm5_next_text":

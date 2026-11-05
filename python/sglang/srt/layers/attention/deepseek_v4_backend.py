@@ -1213,10 +1213,7 @@ class DeepseekV4AttnBackend(
         self._q8kv8_sparse_prefill = use_dsv4_q8kv8_sparse_prefill(
             self.dsv4_prefill_backend
         )
-        if (
-            self._q8kv8_sparse_prefill
-            and get_model().dsv41_main_kv_cache_format != "auto"
-        ):
+        if self._q8kv8_sparse_prefill and get_model().cache_model_family == "dsv41":
             raise ValueError("Explicit V4.1 FP4 requires BF16 sparse prefill")
         if self._q8kv8_sparse_prefill:
             if not get_platform().is_sm90:
@@ -4033,9 +4030,7 @@ class DeepseekV4AttnBackend(
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
-        elif (
-            get_platform().is_sm90 and get_model().dsv41_main_kv_cache_format != "auto"
-        ):
+        elif get_platform().is_sm90 and get_model().cache_model_family == "dsv41":
             # Author: Winston Cai. All explicit-FP4 layers, including C0/SWA,
             # share the role-divergent prefill synchronization specialization.
             from sgl_kernel.flash_mla import (

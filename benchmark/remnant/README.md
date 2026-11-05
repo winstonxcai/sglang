@@ -437,3 +437,19 @@ ledger. The expanded production integration test exercises the actual model
 producer, hybrid pool, and public prefill/decode methods for both readers; that
 expanded test still requires H100 validation. Historical Native/Direct results
 retain their recorded source identities and do not qualify subsequent commits.
+
+
+### Serving selector after the GLM/V4.1 integration
+
+The v0.5.22 serving interface is `--kv-cache-format native|direct` (default
+`native`). Direct selects Packed C4/FlashMLA for V4, Packed FP4/FlashMLA for
+V4.1, or 320-byte Packed MLA/TileLang for GLM. V4.1 Native always uses its FP4
+global-cache path; SWA and indexer are unchanged. The former model-specific
+format and reader options have been removed and are unknown CLI options.
+For example, replace `--glm5-mla-cache-format remnant
+--glm5-mla-cache-implementation direct` with `--kv-cache-format direct`.
+
+Adapter and reconstruction are explicit internal benchmark/test choices. Their
+benchmark mode names and historical protocol identities remain unchanged.
+Non-256 C4 profiles remain available to internal Triton reconstruction tests;
+serving Direct rejects profiles without a supported Direct implementation.

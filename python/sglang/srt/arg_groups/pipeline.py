@@ -219,7 +219,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_model_specific_adjustments, server_args)
-    server_args._configure_dsv4_c4_cache_format()
+    server_args._configure_cache_format()
     run_hook(default_unset_prefill_decode_interval, server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)
@@ -362,9 +362,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.remnant.glm_config import validate as validate_glm_packed
 
     model_config = model_config_of(server_args)
-    validate_glm_packed(
-        resolving_view(server_args),
-        model_config.hf_config,
-        model_dtype=model_config.dtype,
-    )
+    if server_args._kv_cache_model_family == "glm53":
+        validate_glm_packed(
+            resolving_view(server_args),
+            model_config.hf_config,
+            model_dtype=model_config.dtype,
+        )
     server_args._resolution_finished = True

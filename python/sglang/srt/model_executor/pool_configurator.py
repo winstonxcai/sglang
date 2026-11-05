@@ -259,7 +259,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             glm_packed_enabled()
             and num_layers
-            and get_model().glm5_mla_cache_implementation == "adapter"
+            and getattr(kvc, "glm_cache_implementation", "direct") == "adapter"
         ):
             from sglang.srt.remnant.glm_config import (
                 LATENT_DIM,
@@ -1476,7 +1476,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         full-page prefix plus their own physical page. SWA reserves its own
         logical page. Workspaces/activations are budgeted by the caller.
         """
-        if get_model().dsv41_main_kv_cache_format == "auto":
+        if get_model().cache_model_family != "dsv41":
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
 

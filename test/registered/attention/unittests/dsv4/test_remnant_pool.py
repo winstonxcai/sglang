@@ -208,10 +208,15 @@ def test_real_gpu_allocations(tmp_path):
             max_running_requests=32,
             chunked_prefill_size=8192,
             page_size=256,
-            dsv4_c4_cache_format="native" if mode == "native" else "remnant",
-            dsv4_c4_cache_implementation="triton" if mode == "triton" else "kernel",
+            kv_cache_format="native" if mode == "native" else "direct",
+            _kv_cache_model_family="dsv4",
             _dsv4_c4_cache_compression_ratios=ratios,
         ):
+            remnant.configure_cache_format(
+                "native" if mode == "native" else "remnant",
+                "triton" if mode == "triton" else "kernel",
+                compression_ratios=ratios,
+            )
             hf = SimpleNamespace(**model, kv_source_layer_ids=())
             metadata = SimpleNamespace(
                 qk_nope_head_dim=448,
@@ -326,11 +331,13 @@ def test_real_gpu_allocations(tmp_path):
             clean()
             for batch in (8, 24, 32):
                 with get_context().override_server_args(
-                    dsv4_c4_cache_format="native" if mode == "native" else "remnant",
-                    dsv4_c4_cache_implementation=(
-                        "triton" if mode == "triton" else "kernel"
-                    ),
+                    kv_cache_format="native" if mode == "native" else "direct",
+                    _kv_cache_model_family="dsv4",
                 ):
+                    remnant.configure_cache_format(
+                        "native" if mode == "native" else "remnant",
+                        "triton" if mode == "triton" else "kernel",
+                    )
                     workspace = (
                         None
                         if mode == "native"

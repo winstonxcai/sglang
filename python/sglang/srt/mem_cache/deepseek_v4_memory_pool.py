@@ -183,14 +183,14 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
     AITER attention."""
-    fp4_mode = get_model().dsv41_main_kv_cache_format
-    if fp4_mode != "auto":
-        if (
-            not get_platform().is_sm90
-            or get_exec().kernel.dsv4_attn_backend != "flashmla"
+    fp4_mode = get_model().kv_cache_format
+    if get_model().cache_model_family == "dsv41":
+        if not get_platform().is_sm90 or get_exec().kernel.dsv4_attn_backend not in (
+            "auto",
+            "flashmla",
         ):
             raise ValueError("Explicit V4.1 FP4 requires SM90 FlashMLA")
-        return KVLayout.V4, "sm90_remnant" if fp4_mode == "remnant" else "sm90_fp4"
+        return KVLayout.V4, "sm90_remnant" if fp4_mode == "direct" else "sm90_fp4"
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
     if get_exec().kernel.dsv4_attn_backend == "trtllm":

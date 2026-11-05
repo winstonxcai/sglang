@@ -9,6 +9,33 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+CACHE_FORMATS = ("native", "direct")
+
+
+def model_family_of(args: Any) -> str:
+    """Read the resolved family carried with ServerArgs into child workers."""
+    return getattr(args, "_kv_cache_model_family", "unknown")
+
+
+def resolve_model_family(config: Any) -> str:
+    text = getattr(config, "text_config", config)
+    model_type = getattr(text, "model_type", None)
+    if model_type == "glm5_next_text":
+        return "glm53"
+    if model_type == "deepseek_v41":
+        return "dsv41"
+    if model_type == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
+        getattr(text, "architectures", None) or ()
+    ):
+        return "dsv4"
+    return "unknown"
+
+
+def validate_cache_format(value: str) -> None:
+    if value not in CACHE_FORMATS:
+        raise ValueError(f"kv_cache_format must be native or direct, got {value!r}")
+
+
 # --- compressed-latent geometry (fixed by DeepSeek-V4) ----------------------
 HEAD_DIM = 512  # full compressed-latent dimension
 ROPE_DIM = 64  # rotary tail dims
@@ -167,11 +194,11 @@ def configure_cache_format(
     """Set startup configuration; Native ignores the Packed implementation."""
     if cache_format not in {"native", "remnant"}:
         raise ValueError(
-            f"dsv4_c4_cache_format must be 'native' or 'remnant', got {cache_format!r}"
+            f"internal cache_format must be 'native' or 'remnant', got {cache_format!r}"
         )
     if implementation not in {"triton", "kernel"}:
         raise ValueError(
-            "dsv4_c4_cache_implementation must be 'triton' or 'kernel', "
+            "internal implementation must be 'triton' or 'kernel', "
             f"got {implementation!r}"
         )
     if store_implementation not in {None, "triton", "kernel"}:
@@ -187,9 +214,7 @@ def configure_cache_format(
     if cache_format == "native" and (
         keep_count != PACKED_KEPT_VALUES or layer_keep_counts is not None
     ):
-        raise ValueError(
-            "Packed survivor options require --dsv4-c4-cache-format remnant"
-        )
+        raise ValueError("Packed survivor options require --kv-cache-format direct")
     if profile.compression_ratios is not None:
         profile.layouts(profile.compression_ratios)
     store = store_implementation or implementation
@@ -222,10 +247,33 @@ def configure_from_args(
     publish: bool = True,
 ) -> None:
     """Publish startup geometry atomically, including in spawned workers."""
+    mode = getattr(args, "kv_cache_format", "native")
+    validate_cache_format(mode)
+    family = model_family_of(args)
+    if mode == "direct" and family == "unknown" and publish:
+        raise ValueError("Direct requires a resolved supported model family")
     validate_v41_cache_args(args)
+    is_c4_direct = mode == "direct" and family == "dsv4"
+    ratios = (
+        compression_ratios
+        if compression_ratios is not None
+        else getattr(args, "_dsv4_c4_cache_compression_ratios", None)
+    )
+    if is_c4_direct:
+        profile = PackedProfile(
+            validate_keep_count(
+                getattr(args, "dsv4_c4_cache_keep_count", PACKED_KEPT_VALUES)
+            ),
+            parse_layer_keep_counts(
+                getattr(args, "dsv4_c4_cache_layer_keep_counts", None)
+            ),
+            None if ratios is None else tuple(ratios),
+        )
+        if profile.nondefault:
+            raise ValueError("Direct C4 requires 256 survivors in every layer")
     configure_cache_format(
-        getattr(args, "dsv4_c4_cache_format", "native"),
-        getattr(args, "dsv4_c4_cache_implementation", "kernel"),
+        "remnant" if is_c4_direct else "native",
+        "kernel",
         getattr(args, "dsv4_c4_cache_store_implementation", None),
         keep_count=getattr(args, "dsv4_c4_cache_keep_count", PACKED_KEPT_VALUES),
         layer_keep_counts=getattr(args, "dsv4_c4_cache_layer_keep_counts", None),
@@ -305,17 +353,14 @@ def resolve_dsv4_prefill_backend(backend: str = "auto") -> str:
 
 def validate_v41_cache_args(args: Any) -> None:
     """Validate opt-in FP4 independently of V4 C4 dispatch publication."""
-    mode = getattr(args, "dsv41_main_kv_cache_format", "auto")
-    if mode not in ("auto", "fp4", "remnant"):
-        raise ValueError("dsv41_main_kv_cache_format must be auto, fp4 or remnant")
-    if mode == "auto":
+    mode = getattr(args, "kv_cache_format", "native")
+    validate_cache_format(mode)
+    if model_family_of(args) != "dsv41":
         return
     conflicts = []
     for name, default in (
-        ("dsv4_c4_cache_format", "native"),
         ("dsv4_c4_cache_keep_count", 256),
         ("dsv4_c4_cache_layer_keep_counts", None),
-        ("dsv4_c4_cache_implementation", "kernel"),
         ("dsv4_c4_cache_store_implementation", None),
     ):
         if getattr(args, name, default) != default:
@@ -366,7 +411,7 @@ def validate_v41_cache_args(args: Any) -> None:
         conflicts.append("unified KV storage")
     if conflicts:
         raise ValueError(
-            "--dsv41-main-kv-cache-format "
+            "V4.1 --kv-cache-format "
             + mode
             + " is incompatible with "
             + ", ".join(conflicts)

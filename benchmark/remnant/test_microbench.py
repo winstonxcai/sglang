@@ -1254,7 +1254,7 @@ def test_context_dispatch_snapshot_is_atomic_without_runtime_imports():
     config._restore_dispatch(previous)
     assert config.packed_profile().default_count == 192
     with pytest.raises(ValueError):
-        config._dispatch_from_args(SimpleNamespace(dsv4_c4_cache_format="invalid"))
+        config._dispatch_from_args(SimpleNamespace(kv_cache_format="invalid"))
     assert config._snapshot_dispatch() == previous
     config._restore_dispatch(None)
     assert not config.packed_enabled()
@@ -1280,7 +1280,10 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
         n
         for n in model.body
         if isinstance(n, ast.AnnAssign)
-        and (n.target.id == "model_path" or n.target.id.startswith("dsv4_c4_cache_"))
+        and (
+            n.target.id in ("model_path", "kv_cache_format")
+            or n.target.id.startswith("dsv4_c4_cache_")
+        )
     ]
     namespace = {"msgspec": msgspec, "A": args.A, "Arg": args.Arg, "Optional": Optional}
     exec(
@@ -1288,7 +1291,7 @@ def test_packed_cli_fields_build_as_real_msgspec_declarations():
         namespace,
     )
     record = namespace["Model"](model_path="dummy")
-    assert record.dsv4_c4_cache_format == "native"
+    assert record.kv_cache_format == "native"
     assert record.dsv4_c4_cache_keep_count == 256
     assert record.dsv4_c4_cache_store_implementation is None
 
@@ -1897,7 +1900,12 @@ def test_single_mode_benchmark_timing(mode):
         if isinstance(node, ast.FunctionDef) and node.name == "time_case"
     )
     operation = SimpleNamespace(
-        key=mode, mode=mode, keep_count=256, call=lambda: 3.0, validate=Mock()
+        key=mode,
+        mode=mode,
+        keep_count=256,
+        call=lambda: 3.0,
+        validate=Mock(),
+        validate_output=None,
     )
     namespace = dict(
         Operation=object,
@@ -1997,6 +2005,8 @@ def test_glm_cpu_preparation_requires_explicit_cache_paths(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(RuntimeError, match="requires explicit paths"):
         artifacts.precompile_sm90()
+
+
 def test_v41_fp4_matrix_and_timing_gate():
     """Production V4.1 geometry only; stale or incomplete timing cannot qualify."""
     import copy

@@ -244,8 +244,8 @@ class TestRemnantHiCache(CustomTestCase):
         with get_context().override_server_args(
             device="cuda",
             dsv4_attn_backend="flashmla",
-            dsv4_c4_cache_format="remnant",
-            dsv4_c4_cache_implementation="kernel",
+            kv_cache_format="direct",
+            _kv_cache_model_family="dsv4",
         ):
             token_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=1,

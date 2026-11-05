@@ -87,10 +87,16 @@ def test_fp4_startup_contract(monkeypatch):
         monkeypatch.delenv(field.name, raising=False)
     monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL", raising=False)
     validate_v41_cache_args(SimpleNamespace())
-    for mode in ("fp4", "remnant"):
-        validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format=mode))
+    for mode in ("native", "direct"):
         validate_v41_cache_args(
-            SimpleNamespace(dsv41_main_kv_cache_format=mode, dsv4_attn_backend="auto")
+            SimpleNamespace(_kv_cache_model_family="dsv41", kv_cache_format=mode)
+        )
+        validate_v41_cache_args(
+            SimpleNamespace(
+                _kv_cache_model_family="dsv41",
+                kv_cache_format=mode,
+                dsv4_attn_backend="auto",
+            )
         )
         for cli in ("auto", "flashmla_sparse"):
             for override in ("1", "true", "yes", "on"):
@@ -99,14 +105,18 @@ def test_fp4_startup_contract(monkeypatch):
                 with pytest.raises(ValueError, match="SGLANG_DSV4_Q8KV8_PREFILL"):
                     validate_v41_cache_args(
                         SimpleNamespace(
-                            dsv41_main_kv_cache_format=mode, dsv4_prefill_backend=cli
+                            _kv_cache_model_family="dsv41",
+                            kv_cache_format=mode,
+                            dsv4_prefill_backend=cli,
                         )
                     )
             monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", "0")
             assert resolve_dsv4_prefill_backend(cli) == "flashmla_sparse"
             validate_v41_cache_args(
                 SimpleNamespace(
-                    dsv41_main_kv_cache_format=mode, dsv4_prefill_backend=cli
+                    _kv_cache_model_family="dsv41",
+                    kv_cache_format=mode,
+                    dsv4_prefill_backend=cli,
                 )
             )
         monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL")
@@ -116,27 +126,36 @@ def test_fp4_startup_contract(monkeypatch):
         ):
             with field.override("auto"):
                 validate_v41_cache_args(
-                    SimpleNamespace(dsv41_main_kv_cache_format=mode)
+                    SimpleNamespace(
+                        _kv_cache_model_family="dsv41", kv_cache_format=mode
+                    )
                 )
             with field.override("v4"):
                 with pytest.raises(ValueError, match="legacy SGLANG_DSV4"):
                     validate_v41_cache_args(
-                        SimpleNamespace(dsv41_main_kv_cache_format=mode)
+                        SimpleNamespace(
+                            _kv_cache_model_family="dsv41", kv_cache_format=mode
+                        )
                     )
         for key, value in [
             ("enable_hierarchical_cache", True),
             ("speculative_algorithm", "DSpark"),
-            ("dsv4_c4_cache_format", "remnant"),
             ("dsv4_c4_cache_keep_count", 192),
             ("disaggregation_mode", "decode"),
             ("enable_encoder_swa_bounded_replay", True),
         ]:
             with pytest.raises(ValueError, match=key):
                 validate_v41_cache_args(
-                    SimpleNamespace(dsv41_main_kv_cache_format=mode, **{key: value})
+                    SimpleNamespace(
+                        _kv_cache_model_family="dsv41",
+                        kv_cache_format=mode,
+                        **{key: value},
+                    )
                 )
     with pytest.raises(ValueError):
-        validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format="fp8"))
+        validate_v41_cache_args(
+            SimpleNamespace(_kv_cache_model_family="dsv41", kv_cache_format="fp8")
+        )
     import argparse
 
     from sglang.srt.runtime_context import get_context, get_model
@@ -145,13 +164,13 @@ def test_fp4_startup_contract(monkeypatch):
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     args = ServerArgs.from_cli_args(
-        parser.parse_args(
-            ["--model", "dummy", "--dsv41-main-kv-cache-format", "remnant"]
-        )
+        parser.parse_args(["--model", "dummy", "--kv-cache-format", "direct"])
     )
-    assert args.dsv41_main_kv_cache_format == "remnant"
-    with get_context().override_server_args(dsv41_main_kv_cache_format="remnant"):
-        assert get_model().dsv41_main_kv_cache_format == "remnant"
+    assert args.kv_cache_format == "direct"
+    with get_context().override_server_args(
+        _kv_cache_model_family="dsv41", kv_cache_format="direct"
+    ):
+        assert get_model().kv_cache_format == "direct"
     assert KVLayout.V41_FP4.bytes_per_token == 288
     assert KVLayout.V41_FP4_REMNANT.bytes_per_token == 224
     for p in (128, 256):
@@ -573,14 +592,15 @@ def test_fp4_pool_allocations(tmp_path):
                         )
                     )
                     del pool
-    for mode in ("fp4", "remnant"):
+    for mode in ("native", "direct"):
         with get_context().override_server_args(
             device="cuda",
             dsv4_attn_backend="flashmla",
             page_size=256,
             max_running_requests=8,
             chunked_prefill_size=512,
-            dsv41_main_kv_cache_format=mode,
+            _kv_cache_model_family="dsv41",
+            kv_cache_format=mode,
         ):
             metadata = SimpleNamespace(
                 qk_nope_head_dim=448,
@@ -945,7 +965,7 @@ def test_fp4_backend_dispatch():
             )
             assert direct.call_args.args[3].shape[-1] == layout.bytes_per_token
 
-    for mode in ("auto", "fp4", "remnant"):
+    for family, mode in (("dsv4", "native"), ("dsv41", "native"), ("dsv41", "direct")):
         for ratio in (0, 1, 2):
             q = torch.ones((1, 1, 64, 512), dtype=torch.bfloat16)
             workspace = torch.zeros((2, 1, 512), dtype=torch.bfloat16)
@@ -979,7 +999,10 @@ def test_fp4_backend_dispatch():
                 mock.patch.object(
                     module,
                     "get_model",
-                    return_value=SimpleNamespace(dsv41_main_kv_cache_format=mode),
+                    return_value=SimpleNamespace(
+                        cache_model_family=family,
+                        kv_cache_format=mode,
+                    ),
                 ),
                 mock.patch.object(module, "dequantize_k_cache_paged"),
                 mock.patch.dict(
@@ -1001,8 +1024,8 @@ def test_fp4_backend_dispatch():
                     SimpleNamespace(),
                     torch.zeros(64),
                 )
-            (stock if mode == "auto" else fp4).assert_called_once()
-            (fp4 if mode == "auto" else stock).assert_not_called()
+            (stock if family == "dsv4" else fp4).assert_called_once()
+            (fp4 if family == "dsv4" else stock).assert_not_called()
 
 
 @GPU

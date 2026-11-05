@@ -8,6 +8,7 @@ python -m sglang.benchmark.remnant.glm_artifacts; no parent metadata is needed. 
 reference reads independently expanded codes with stock FP8 TileLang arithmetic.
 """
 
+import functools
 import gc
 import hashlib
 import json
@@ -338,14 +339,18 @@ def make_pool(size, implementation="native", layers=11, mamba=None):
         index_kpool_compress=True,
         max_running_requests=33,  # req_to_token.shape[0], including its dummy row
         full_kv_pool_class=(
-            DSATokenToKVPool if implementation == "native" else GLMPackedTokenToKVPool
+            DSATokenToKVPool
+            if implementation == "native"
+            else functools.partial(
+                GLMPackedTokenToKVPool, implementation=implementation
+            )
         ),
     )
 
 
 def test_pool_lifecycle():
     with get_context().override_server_args(
-        device="cuda", glm5_mla_cache_implementation="direct"
+        device="cuda", _kv_cache_model_family="glm53"
     ):
         pool = make_pool(768, "direct", layers=1)
         raw, norm, _ = fixture()
@@ -417,7 +422,10 @@ def _check_production_producer_and_attention_dispatch(implementation, phase):
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+    )
     from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
         DeepseekMLAForwardMixin,
     )
@@ -429,8 +437,8 @@ def _check_production_producer_and_attention_dispatch(implementation, phase):
             dsa_prefill_backend="tilelang",
             dsa_decode_backend="tilelang",
             dsa_topk_backend="sgl-kernel",
-            glm5_mla_cache_format="remnant",
-            glm5_mla_cache_implementation=implementation,
+            kv_cache_format="direct",
+            _kv_cache_model_family="glm53",
         ),
         envs.SGLANG_DSA_FUSE_TOPK.override(True),
     ):
@@ -482,7 +490,9 @@ def _check_production_producer_and_attention_dispatch(implementation, phase):
         with forward_context(context):
             producer._glm_normalize_and_store(raw[:512], batch)
             batch.out_cache_loc = physical[512:]
-            current_kv = producer._glm_normalize_and_store(raw[512:], batch).unsqueeze(1)
+            current_kv = producer._glm_normalize_and_store(raw[512:], batch).unsqueeze(
+                1
+            )
         cache = pool.get_glm_packed_buffer(7)
         _, expected_values, expected_words, dense = expected(raw, norm)
         assert torch.equal(cache.values[physical], expected_values)
@@ -578,11 +588,10 @@ def test_allocator_accounting():
                 tp_size=8,
                 dsa_prefill_backend="tilelang",
                 dsa_decode_backend="tilelang",
-                glm5_mla_cache_format="native" if mode == "native" else "remnant",
-                glm5_mla_cache_implementation=(
-                    "adapter" if mode == "adapter" else "direct"
-                ),
+                kv_cache_format="native" if mode == "native" else "direct",
+                _kv_cache_model_family="glm53",
             ):
+                kvc.glm_cache_implementation = mode
                 profile = DefaultPoolConfigurator(kvc)
                 overhead = 128 * 2112 * 512 if mode == "adapter" else 0
                 assert profile._cell_size == cell, (mode, profile._cell_size, cell)
@@ -651,8 +660,8 @@ def test_real_gpu_allocations(tmp_path):
                 tp_size=8,
                 dsa_prefill_backend="tilelang",
                 dsa_decode_backend="tilelang",
-                glm5_mla_cache_implementation=mode if mode != "native" else "direct",
-                glm5_mla_cache_format="native" if mode == "native" else "remnant",
+                _kv_cache_model_family="glm53",
+                kv_cache_format="native" if mode == "native" else "direct",
             ):
                 row_bytes = 512 if mode == "native" else 320
                 for size in (0, 1, 255, 256, 257, 131072):
@@ -1046,7 +1055,9 @@ def test_decode_partial_graph(heads, inner, record_property):
 
 @pytest.mark.parametrize("packed_tile", [32, 64, 128])
 def test_prefill_partial_graph(packed_tile, record_property):
-    _check_cached_partial_graph(16, 66 if packed_tile == 32 else 33, record_property, packed_tile=packed_tile)
+    _check_cached_partial_graph(
+        16, 66 if packed_tile == 32 else 33, record_property, packed_tile=packed_tile
+    )
 
 
 def test_prefill_partial_graph_h8(record_property):

@@ -12,7 +12,6 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.runtime_context import get_model
 
 from .glm import PackedCache, normalize_and_store
 from .glm_config import (
@@ -27,6 +26,13 @@ from .glm_config import (
 class GLMPackedTokenToKVPool(DSATokenToKVPool):
     glm_packed = True
 
+    def __init__(self, *args, implementation="direct", **kwargs):
+        # Internal Adapter fixtures explicitly own their reconstruction workspace.
+        if implementation not in ("direct", "adapter"):
+            raise ValueError(f"Unsupported internal GLM reader: {implementation}")
+        self.implementation = implementation
+        super().__init__(*args, **kwargs)
+
     def _create_buffers(self) -> None:
         if (self.dtype, self.kv_lora_rank, self.qk_rope_head_dim) != (
             torch.float8_e4m3fn,
@@ -38,7 +44,6 @@ class GLMPackedTokenToKVPool(DSATokenToKVPool):
             raise ValueError("GLM Packed is qualified only for H100/SM90")
         if self.dcp_replicated:
             raise ValueError("GLM Packed does not support DCP")
-        self.implementation = get_model().glm5_mla_cache_implementation
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
