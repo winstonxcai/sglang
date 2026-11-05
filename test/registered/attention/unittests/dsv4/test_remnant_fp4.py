@@ -38,6 +38,39 @@ register_cuda_ci(
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Modal H100")
 RATIOS = [0] * 2 + [2] * 18 + [1] * 20
 SOURCES = (2, 8, 14, 20)
+# Independent expected ABI: serving mode, row bytes, pool layout, report label.
+_FP4_POOL_CASES = (
+    ("native", 288, "sm90_fp4", "Native"),
+    ("direct", 224, "sm90_remnant", "Packed"),
+)
+
+
+def _fp4_pool_configurator():
+    """Production sizing with the same model geometry in CPU and GPU checks."""
+    from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    metadata = SimpleNamespace(
+        qk_nope_head_dim=448,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        context_len=131072,
+        compress_ratios=RATIOS,
+        window_size=128,
+        hf_config=SimpleNamespace(kv_source_layer_ids=SOURCES),
+    )
+    return DSV4PoolConfigurator(
+        SimpleNamespace(
+            kv_cache_dtype_str="fp8_e4m3",
+            model_config=metadata,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=40),
+            pp_size=1,
+            attn_dp_size=1,
+            page_size=256,
+            sliding_window_size=128,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+    )
 
 
 def _oracle(x: torch.Tensor, packed: bool) -> tuple[torch.Tensor, torch.Tensor]:
@@ -158,7 +191,8 @@ def test_fp4_startup_contract(monkeypatch):
         )
     import argparse
 
-    from sglang.srt.runtime_context import get_context, get_model
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import select_dsv4_kv_layout
+    from sglang.srt.runtime_context import get_context, get_model, override_platform
     from sglang.srt.server_args import ServerArgs
 
     parser = argparse.ArgumentParser()
@@ -175,6 +209,25 @@ def test_fp4_startup_contract(monkeypatch):
     assert KVLayout.V41_FP4_REMNANT.bytes_per_token == 224
     for p in (128, 256):
         assert KVLayout.V41_FP4_REMNANT.page_bytes(p) == p * 224
+    # Exercise the actual selector and sizing before reserving a GPU. Only the
+    # platform fact is overridden; expected ABI widths remain independent.
+    for mode, row_bytes, layout, _ in _FP4_POOL_CASES:
+        with (
+            override_platform(is_sm90=True),
+            get_context().override_server_args(
+                device="cpu",
+                dsv4_attn_backend="flashmla",
+                page_size=256,
+                max_running_requests=8,
+                chunked_prefill_size=512,
+                _kv_cache_model_family="dsv41",
+                kv_cache_format=mode,
+            ),
+        ):
+            assert select_dsv4_kv_layout() == (KVLayout.V4, layout)
+            sizing = _fp4_pool_configurator()
+            assert sizing._compressed_bytes_per_full_token(1) == row_bytes + 68
+            assert sizing._compressed_bytes_per_full_token(2) == (row_bytes + 68) / 2
 
 
 @GPU
@@ -514,9 +567,7 @@ def test_fp4_pool_allocations(tmp_path):
         DeepSeekV4SingleKVPool,
         DeepSeekV4TokenToKVPool,
     )
-    from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
     from sglang.srt.runtime_context import get_context
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     direct_peaks = []
     for packed in (False, True):
@@ -592,7 +643,7 @@ def test_fp4_pool_allocations(tmp_path):
                         )
                     )
                     del pool
-    for mode in ("native", "direct"):
+    for mode, record_bytes, layout, report_mode in _FP4_POOL_CASES:
         with get_context().override_server_args(
             device="cuda",
             dsv4_attn_backend="flashmla",
@@ -602,28 +653,7 @@ def test_fp4_pool_allocations(tmp_path):
             _kv_cache_model_family="dsv41",
             kv_cache_format=mode,
         ):
-            metadata = SimpleNamespace(
-                qk_nope_head_dim=448,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                context_len=131072,
-                compress_ratios=RATIOS,
-                window_size=128,
-                hf_config=SimpleNamespace(kv_source_layer_ids=SOURCES),
-            )
-            sizing = DSV4PoolConfigurator(
-                SimpleNamespace(
-                    kv_cache_dtype_str="fp8_e4m3",
-                    model_config=metadata,
-                    layer_info=SimpleNamespace(start_layer=0, end_layer=40),
-                    pp_size=1,
-                    attn_dp_size=1,
-                    page_size=256,
-                    sliding_window_size=128,
-                    spec_algorithm=SpeculativeAlgorithm.NONE,
-                )
-            )
-            record_bytes = 288 if mode == "fp4" else 224
+            sizing = _fp4_pool_configurator()
             assert sizing._compressed_bytes_per_full_token(1) == record_bytes + 68
             assert sizing._compressed_bytes_per_full_token(2) == (record_bytes + 68) / 2
             workspace_bytes = 1024 * 512 * 2 + direct_workspace_bytes
@@ -653,7 +683,7 @@ def test_fp4_pool_allocations(tmp_path):
                 kv_source_layers=SOURCES,
                 full_size=full,
                 kv_layout=KVLayout.V4,
-                compressed_kv_layout="sm90_fp4" if mode == "fp4" else "sm90_remnant",
+                compressed_kv_layout=layout,
             )
             assert pool.kv_pools[2].layer_num == 3 and pool.kv_pools[1].layer_num == 1
             assert (
@@ -768,7 +798,7 @@ def test_fp4_pool_allocations(tmp_path):
             assert total_bytes + 256 * sizing.bytes_per_full_token > byte_budget
             report["modes"].append(
                 dict(
-                    mode="Native" if mode == "fp4" else "Packed",
+                    mode=report_mode,
                     groups=groups,
                     prefill_workspace_bytes=workspace.nbytes,
                     direct_workspace_bytes=direct_workspace.nbytes,
