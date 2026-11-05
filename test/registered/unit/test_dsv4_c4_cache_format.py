@@ -407,7 +407,9 @@ class TestDSV4C4CacheFormat(CustomTestCase):
             "sglang.srt.server_args.model_config_of",
             return_value=SimpleNamespace(
                 hf_config=SimpleNamespace(
-                    model_type="deepseek_v4", compress_ratios=(0, 128, 4)
+                    model_type="deepseek_v4",
+                    architectures=["DeepseekV4ForCausalLM"],
+                    compress_ratios=(0, 128, 4),
                 )
             ),
         ):
