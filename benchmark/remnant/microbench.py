@@ -25,6 +25,7 @@ from typing import Callable
 
 import torch
 from sgl_kernel import flash_mla
+
 from sglang.benchmark.remnant.cases import (
     FP4_DECODE_MODES,
     FP4_DECODE_PROTOCOL,
