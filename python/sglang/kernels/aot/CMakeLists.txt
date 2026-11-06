@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
+# Remnant additions authored by Winston Cai.
+
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 include(FetchContent)
@@ -20,7 +22,8 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(SGL_KERNEL_CXX_STANDARD "17" CACHE STRING "C++ standard used for host and CUDA compilation")
+# Torch 2.14 headers reject anything below C++20 with a hard #error.
+set(SGL_KERNEL_CXX_STANDARD "20" CACHE STRING "C++ standard used for host and CUDA compilation")
 set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
@@ -66,8 +69,8 @@ FetchContent_Populate(repo-fmt)
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.1.tar.gz
-    URL_HASH SHA256=7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.8.0.tar.gz
+    URL_HASH SHA256=d50981f98bf61a5ce21d2a0c6ac067c20b7f741acf3bee4b8370edc3b63fd337
 )
 FetchContent_Populate(repo-triton)
 
@@ -309,6 +312,27 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+
+# ============================ Remnant Adapter ============================== #
+list(APPEND SOURCES "csrc/remnant/packed_to_native.cu")
+# Keep the fused Packed -> Native adapter independently buildable.  The full
+# common_ops targets also contain this source for normal SGLang packaging, but
+# model-free validation images should not rebuild every unrelated kernel.
+set(REMNANT_SOURCES
+    "csrc/remnant/packed_to_native.cu"
+    "csrc/remnant_extension.cc"
+)
+Python_add_library(remnant_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${REMNANT_SOURCES})
+set(REMNANT_CUDA_FLAGS ${SGL_KERNEL_CUDA_FLAGS})
+list(FILTER REMNANT_CUDA_FLAGS EXCLUDE REGEX "^-gencode=")
+list(APPEND REMNANT_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
+target_compile_options(remnant_ops PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-std=c++${SGL_KERNEL_CXX_STANDARD}>
+    $<$<COMPILE_LANGUAGE:CUDA>:${REMNANT_CUDA_FLAGS}>
+)
+target_include_directories(remnant_ops PRIVATE ${INCLUDES})
+target_link_libraries(remnant_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+install(TARGETS remnant_ops LIBRARY DESTINATION "sgl_kernel")
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)

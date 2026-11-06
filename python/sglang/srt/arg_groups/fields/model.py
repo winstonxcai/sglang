@@ -1,10 +1,6 @@
 """Config fields of the ``model`` namespace.
 
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``model`` bag, which is what ``get_model()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
+Author: Winston Cai. (Packed cache options.)
 """
 
 from __future__ import annotations
@@ -56,6 +52,44 @@ class Model(msgspec.Struct):
             aliases=["--model"],
         ),
     ]
+    # Author: Winston Cai. Family is resolved from model metadata, then serialized.
+    cache_model_family = Derived(
+        fn="sglang.srt.remnant.config.model_family_of",
+        doc="Resolved model family for Native/Direct cache dispatch.",
+    )
+    kv_cache_format: A[
+        str,
+        Arg(
+            help="KV storage and attention path. Native uses the model's dense layout; "
+            "Direct reads the model's Packed layout inside attention.",
+            choices=["native", "direct"],
+        ),
+    ] = "native"
+    dsv4_c4_cache_keep_count: A[
+        int,
+        Arg(
+            help="Packed C4 survivors per layer. Serving Direct requires 256; other counts remain internal reconstruction profiles."
+        ),
+    ] = 256
+    dsv4_c4_cache_layer_keep_counts: A[
+        Optional[str],
+        Arg(
+            help='Packed C4 overrides as JSON keyed by zero-based model layer ID, e.g. {"2":192}.'
+        ),
+    ] = None
+    dsv4_c4_cache_store_implementation: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Override Packed C4 storage independently of decode. 'triton' "
+                "uses explicit selection plus packing; 'kernel' uses fused "
+                "selection and packing. Defaults to the Direct producer. "
+                "Ignored for the native cache format."
+            ),
+            choices=["triton", "kernel"],
+        ),
+    ] = None
+
     load_format: A[
         str,
         Arg(
@@ -65,6 +99,8 @@ class Model(msgspec.Struct):
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" will load Safetensors weights using '
+            "InstantTensor's high-performance distributed loader. "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
@@ -214,9 +250,19 @@ class Model(msgspec.Struct):
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
-                "fp4_e2m1",
             ],
             resolvable=True,
+        ),
+    ] = "auto"
+    qsa_indexer_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Storage dtype of the compressed QSA indexer cache and index query "
+                '(Qwen4-Exp). "fp8_e4m3" stores them as plain e4m3 and scores blocks '
+                "with fp8 GEMMs (CUDA SM90+). The main KV cache is unaffected."
+            ),
+            choices=["auto", "bfloat16", "fp8_e4m3"],
         ),
     ] = "auto"
     modelopt_quant: A[

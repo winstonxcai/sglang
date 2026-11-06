@@ -1,3 +1,8 @@
+"""Python bindings and dispatch for the Remnant FlashMLA extension.
+
+Author: Winston Cai.
+"""
+
 import dataclasses
 from typing import Optional, Tuple
 
@@ -13,6 +18,9 @@ else:
 _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
+
+# 512 fp8 values + 4 fp32 scales; FlashMLA's V4.1 format has the same size.
+_V32_NO_ROPE_BYTES_PER_TOKEN = 528
 
 
 @dataclasses.dataclass
@@ -103,6 +111,10 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    kv_format: Optional[str] = None,
+    remnant_buffers: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    remnant_raw_indices: Optional[torch.Tensor] = None,
+    remnant_freqs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -119,6 +131,7 @@ def flash_mla_with_kvcache(
         descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
         is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
         indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
+        kv_format: Optional[str]. Sparse attention only: the layout of `k_cache` ("V32", "V32_NO_ROPE", "V4", "V41"). When omitted it is detected from the shape. V3.2-no-RoPE and V4.1 are both 528 bytes per token with head_dim 512: with FlashMLASchedMeta such a cache is read as V41, with tensor tile_scheduler_metadata as V32_NO_ROPE.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -147,8 +160,16 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
+            kv_format=kv_format,
+            remnant_buffers=remnant_buffers,
+            remnant_raw_indices=remnant_raw_indices,
+            remnant_freqs=remnant_freqs,
         )
 
+    if remnant_buffers is not None:
+        raise ValueError(
+            "Packed Direct requires FlashMLASchedMeta, not legacy tensor metadata"
+        )
     assert num_splits is not None
     assert block_table is not None
     assert cache_seqlens is not None
@@ -163,7 +184,34 @@ def flash_mla_with_kvcache(
         "descale_q and descale_k should be both None or both not None"
     )
 
-    if indices is None and q.element_size() == 1:
+    if indices is not None:
+        assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
+        # The tensor-metadata API predates V4.1, so its 528 B/token cache is V3.2 without RoPE.
+        if (
+            kv_format is None
+            and q.shape[-1] == 512
+            and k_cache.shape[-1] == _V32_NO_ROPE_BYTES_PER_TOKEN
+        ):
+            kv_format = "V32_NO_ROPE"
+        out, softmax_lse, _, _ = torch.ops.sgl_kernel.sparse_decode_fwd.default(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            tile_scheduler_metadata,
+            num_splits,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            head_dim_v,
+            softmax_scale,
+            kv_format,
+        )
+        return out, softmax_lse
+
+    assert kv_format is None, "kv_format only applies to sparse attention"
+    if q.element_size() == 1:
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
             q,
             k_cache,
@@ -189,7 +237,7 @@ def flash_mla_with_kvcache(
             tile_scheduler_metadata,
             num_splits,
             is_fp8_kvcache,
-            indices,
+            None,
             attn_sink,
             extra_k_cache,
             extra_indices_in_kvcache,
@@ -216,6 +264,10 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    kv_format: Optional[str],
+    remnant_buffers: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    remnant_raw_indices: Optional[torch.Tensor],
+    remnant_freqs: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -265,6 +317,33 @@ def _flash_mla_with_kvcache_sched_meta(
     if topk is not None:
         assert not causal, "causal must be False when sparse attention is enabled"
         assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
+        if remnant_buffers is not None:
+            assert extra_k_cache is None
+            assert remnant_raw_indices is not None and remnant_freqs is not None
+            values, bitmaps, scales = remnant_buffers
+            out, lse, new_tile_scheduler_metadata, new_num_splits = (
+                torch.ops.sgl_kernel.remnant_sparse_decode_fwd.default(
+                    q,
+                    k_cache,
+                    indices,
+                    topk_length,
+                    attn_sink,
+                    sched_meta.tile_scheduler_metadata,
+                    sched_meta.num_splits,
+                    extra_indices_in_kvcache,
+                    extra_topk_length,
+                    values,
+                    bitmaps,
+                    scales,
+                    remnant_raw_indices,
+                    remnant_freqs,
+                    head_dim_v,
+                    softmax_scale,
+                )
+            )
+            sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
+            sched_meta.num_splits = new_num_splits
+            return out, lse
         out, lse, new_tile_scheduler_metadata, new_num_splits = (
             torch.ops.sgl_kernel.sparse_decode_fwd.default(
                 q,
@@ -279,9 +358,11 @@ def _flash_mla_with_kvcache_sched_meta(
                 extra_topk_length,
                 head_dim_v,
                 softmax_scale,
+                kv_format,
             )
         )
     else:
+        assert kv_format is None, "kv_format only applies to sparse attention"
         assert block_table is not None and cache_seqlens is not None
         assert attn_sink is None
         assert extra_k_cache is None
@@ -340,3 +421,64 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length
     )
     return results
+
+
+def flash_mla_fp4_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """BF16 D512 SM90 prefill for explicit FP4 caches, including SWA-only layers.
+
+    Author: Winston Cai. Inputs use the stock sparse prefill tensor contract;
+    separate instantiations allow role-divergent named-barrier participation.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
+    return torch.ops.sgl_kernel.fp4_sparse_prefill_fwd.default(
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )
+
+
+def flash_mla_with_fp4_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    extra_k_cache: torch.Tensor,
+    extra_indices_in_kvcache: torch.Tensor,
+    *,
+    packed: bool = False,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SM90 Direct over V4 SWA and post-RoPE V4.1 FP4 global pages.
+
+    Author: Winston Cai.
+    Pages are uint8 [pages,P,1,288 or 224] views over SoA bytes: P data
+    rows (256 Native; 128 codes + 64 bitmap Packed), then P 32-byte E4M3
+    scale rows. Eight bitmap words are MSB-first. Indices are physical int32
+    [B,S,K] padded to 64; lengths [B] mask poison outside valid selections.
+    Scheduling is regenerated on the current stream on every invocation,
+    including graph replay with changing lengths. No cache reconstruction.
+    """
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    out, lse, _, _ = torch.ops.sgl_kernel.fp4_sparse_decode_fwd.default(
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        attn_sink,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        packed,
+        scale,
+    )
+    return out, lse

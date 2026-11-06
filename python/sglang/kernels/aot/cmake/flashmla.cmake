@@ -1,20 +1,22 @@
+# Authored by Winston Cai.
+
 # flash_mla
-# DeepSeek v4.1 kernels merged into the SGLang fork (sgl-project/FlashMLA@3e18517).
+# Build the selected local fork, never silently fetch a different FlashMLA.
+set(REMNANT_FLASHMLA_SOURCE_DIR "$ENV{REMNANT_FLASHMLA_SOURCE_DIR}" CACHE PATH
+    "Local Remnant FlashMLA v0.5.22 source tree")
+if(NOT EXISTS "${REMNANT_FLASHMLA_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h64.cu")
+    message(FATAL_ERROR "REMNANT_FLASHMLA_SOURCE_DIR must point to the v0.5.22 Packed fork")
+endif()
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3e18517fb055a6c9608eef5a1f1347fb1a047bbd.tar.gz
-    URL_HASH SHA256=ab2af4657683a1bbaa707a2781a5e2c2792eba574ff36905f1832598e67fea79
+    SOURCE_DIR ${REMNANT_FLASHMLA_SOURCE_DIR}
 )
 FetchContent_Populate(repo-flashmla)
 
-# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
-FetchContent_Declare(
-    repo-flashmla-cutlass
-    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
-    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
-    SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
-)
-FetchContent_Populate(repo-flashmla-cutlass)
+if(NOT EXISTS "${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include/cutlass/bfloat16.h")
+    message(FATAL_ERROR
+        "Initialize third_party/flashmla/csrc/cutlass before building FlashMLA")
+endif()
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
@@ -25,6 +27,8 @@ set(FLASHMLA_CUDA_FLAGS
 )
 
 set(FLASHMLA_ENABLE_SM100 OFF)
+option(SGL_KERNEL_ENABLE_FLASHMLA_SM100
+    "Build FlashMLA's SM100 targets in addition to SM90" OFF)
 
 # The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
 # Only build FlashMLA kernels if we are building for something compatible with
@@ -34,14 +38,14 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(${CUDA_VERSION} VERSION_GREATER 12.8 AND SGL_KERNEL_ENABLE_FLASHMLA_SM100)
     # sm_100f is compatible with all sm_10x
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100f,code=sm_100f"
     )
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+if(FLASHMLA_ENABLE_SM100 AND ${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # B300 is sm_103; sm_100f is family-compatible so it runs there, but ptxas emits
     # better SASS for the native arch. FlashMLA's setup.py picks sm_100a + sm_103a
     # over sm_100f for the same reason. The cutlass patch below is what lets a TU
@@ -107,8 +111,14 @@ set(FlashMLA_SOURCES
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/dense/instantiations/bf16.cu
 
     # sm90 sparse decode.
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_native_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_native_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_packed_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v41_fp4_packed_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_remnant_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu
@@ -116,6 +126,8 @@ set(FlashMLA_SOURCES
 
     # sm90 sparse prefill.
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/fp4_prefill_k512.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/fp4_prefill_k512_topklen.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu
@@ -127,6 +139,7 @@ set(FlashMLA_SOURCES
 
 if(FLASHMLA_ENABLE_SM100)
     list(APPEND FlashMLA_SOURCES
+        "csrc/flashmla_mega_extension.cc"
         # sm100 dense prefill/bwd.
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
@@ -155,6 +168,21 @@ if(FLASHMLA_ENABLE_SM100)
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu
         ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu
+    )
+    set(FLASHMLA_MEGA_ROOT ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd)
+    foreach(HEADS 64 128)
+        foreach(NORM norm nonorm)
+            list(APPEND FlashMLA_SOURCES
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v4_h${HEADS}_prefill_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v4_h${HEADS}_decode_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41_h${HEADS}_decode_${NORM}.cu
+                ${FLASHMLA_MEGA_ROOT}/core_attn/instantiations/v41fp4_h${HEADS}_decode_${NORM}.cu
+            )
+        endforeach()
+    endforeach()
+    list(APPEND FlashMLA_SOURCES
+        ${FLASHMLA_MEGA_ROOT}/permute_q_b_proj/kernel.cu
+        ${FLASHMLA_MEGA_ROOT}/permute_wv_proj/kernel.cu
     )
 endif()
 
