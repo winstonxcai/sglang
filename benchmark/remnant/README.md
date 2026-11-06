@@ -14,7 +14,7 @@ than a matched Packed control. The old ≤2% Native gate remains with the archiv
 benchmark; current timing is descriptive. Microbenchmarks do not establish
 serving TPOT, TTFT, SLO capacity, or task quality.
 
-## V4.1 FP4 Native / Packed Direct follow-up
+## V4.1 upstream Native / dense FP4 / Packed Direct
 
 Author: Winston Cai. `--suite v41-fp4-decode` uses V4.1 production H100
 geometry: **64 query heads, SWA128/page256, Q1/K512**, with batches
@@ -24,16 +24,25 @@ and **C2/page128**, for ten cases. The model has one KV head and a separate
 shards with fewer query heads are padded to 64 by this SM90 runtime. Batches
 remain a synthetic sweep, not measured production traffic.
 
-Protocol `remnant-v41-fp4-decode-v3` distinguishes the 128-token attention
+Protocol `remnant-v41-fp4-decode-v4` distinguishes the 128-token attention
 window from the 256-token paged SWA allocation. The runtime factory
 `kv_cache_configurator.py` requires 256-token SWA pages.
 It supersedes the historical v1 20-case matrix and the untimed v2 fixture
 that incorrectly used page128. Historical receipts retain their original protocol;
 they do not qualify this matrix. SWA64/H128 remain correctness coverage only.
-Native uses dense 288-byte FP4; Packed Direct uses 224-byte keep256 records.
+Native uses the unchanged upstream H100 `auto` path: 584-byte FP8/BF16 global
+records and the original FlashMLA package at `3620b63fc4ebe33950c50e1b7701b6607f44150e`.
+It is compiled separately on Modal CPU, including the original Python wrapper,
+scheduler and synchronization. The fork's stock entry point already contains
+prior synchronization changes and is not substituted for this control.
+`dense_fp4` retains our custom 288-byte dense FP4 Direct path as a diagnostic;
+Packed Direct uses 224-byte keep256 records. Historical protocols v1–v3 called
+the custom dense FP4 path Native; their measurements are not upstream comparisons.
 An independent CPU quantization/pruning/attention oracle validates each path.
+The upstream producer rounds its unpruned latent to FP4 before the H100 FP8
+store; Native's reference includes this requantization and keeps its BF16 tail.
 Shared post-normalization/post-RoPE BF16 rows, query/indices/SWA/sink hashes bind
-both paths. Selection/store, setup, allocation, references and capture are
+all three paths. Selection/store, setup, allocation, references and capture are
 untimed. Complete Direct, including scheduling/split/combine, is timed in CUDA
 graphs with10 warmups,30 randomized paired rounds and100 replays per sample.
 Existing JSON/CSV retain raw samples and per-case ratios; p95 is a round-average
@@ -43,6 +52,7 @@ From the parent, after identical source/binary/tool-qualified strict checks:
 
 ```bash
 REMNANT_INTEGRATION=v0.5.22 REMNANT_VALIDATION_SUITE=v41-fp4 \
+  REMNANT_UPSTREAM_FLASHMLA_SOURCE=<clean-isolated-3620b63-checkout> \
   modal run scripts/modal/kernels.py::benchmark_kernels \
   --run-id <unique-id> --suite v41-fp4-decode \
   --qualification-runs <validation-run-id>[,<validation-run-id>]

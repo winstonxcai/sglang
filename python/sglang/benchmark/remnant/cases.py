@@ -19,7 +19,9 @@ from pathlib import Path
 
 PROTOCOL = "remnant-three-modes-v1"
 PREFILL_PROTOCOL = "remnant-prefill-read-v1"
-FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v3"
+FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v4"
+FP4_DECODE_MODES = ("native", "dense_fp4", "kernel")
+UPSTREAM_FLASHMLA_SHA = "3620b63fc4ebe33950c50e1b7701b6607f44150e"
 SEED = 20260919
 MODES = ("native", "triton", "kernel")
 DEFAULT_DECODE_BATCHES = (8, 16, 24, 28, 32)
@@ -256,6 +258,8 @@ def paired_ratios(samples: dict[str, list[float]]) -> dict:
         ("triton", "native"),
         ("kernel", "native"),
         ("kernel", "triton"),
+        ("dense_fp4", "native"),
+        ("kernel", "dense_fp4"),
         ("packed192", "native"),
         ("packed256", "native"),
         ("packed192", "packed256"),
@@ -424,7 +428,11 @@ def selected_cases(args) -> list:
         raise ValueError("--prefill-reader fused requires --suite prefill-read")
     if args.profile_replay_id and not args.profile_path:
         raise ValueError("--profile-replay-id requires a prefill --profile-path")
-    modes = benchmark_modes(args.keep_count, args.modes)
+    modes = (
+        FP4_DECODE_MODES
+        if args.suite == "v41-fp4-decode"
+        else benchmark_modes(args.keep_count, args.modes)
+    )
     if args.profile_mode and args.profile_mode not in modes:
         raise ValueError("--profile-mode must be included in the supported --modes")
     h = positive_ints(
@@ -446,8 +454,13 @@ def selected_cases(args) -> list:
             tuple(positive_ints(args.query_chunks, "--query-chunks")),
         )
     if args.suite == "v41-fp4-decode":
-        if args.modes not in (None, "native,kernel") or args.keep_count != 256:
-            raise ValueError("V4.1 FP4 compares dense Native and Packed Direct keep256")
+        if (
+            args.modes not in (None, ",".join(FP4_DECODE_MODES))
+            or args.keep_count != 256
+        ):
+            raise ValueError(
+                "V4.1 compares upstream Native, custom dense FP4 and Packed Direct keep256"
+            )
         if args.profile_mode or args.profile_path:
             raise ValueError("V4.1 FP4 profiling is deferred")
         if h != [64] or tuple(b) != DEFAULT_DECODE_BATCHES or k != [512]:
@@ -525,14 +538,30 @@ def validate_timing(
                 or record.get("case") != definitions[record["name"]]
                 or record.get("execution") != "cuda_graph"
                 or record.get("repeats") != 100
-                or set(record.get("paths", {})) != {"native", "kernel"}
+                or set(record.get("paths", {})) != {"native", "dense_fp4", "kernel"}
+                or record.get("baseline") != "upstream H100 auto FP8/BF16"
+                or record.get("native_control", {}).get("source_commit")
+                != UPSTREAM_FLASHMLA_SHA
+                or record.get("native_control", {}).get("architectures") != ["sm_90a"]
+                or any(
+                    not re.fullmatch(
+                        r"[a-f0-9]{64}", record.get("native_control", {}).get(key, "")
+                    )
+                    for key in ("source_sha256", "binary_sha256", "python_sha256")
+                )
+                or record.get("native_control") != records[0].get("native_control")
                 or not re.fullmatch(
                     r"[a-f0-9]{64}", record.get("common_inputs_sha256", "")
                 )
                 or record.get("path_layouts")
                 != {
                     "native": {
-                        "implementation": "Native FP4 Direct",
+                        "implementation": "Upstream H100 auto FP8/BF16",
+                        "record_bytes": 584,
+                        "packed_keep_count": 512,
+                    },
+                    "dense_fp4": {
+                        "implementation": "Custom dense FP4 Direct",
                         "record_bytes": 288,
                         "packed_keep_count": 512,
                     },
