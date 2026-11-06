@@ -1421,7 +1421,7 @@ def test_v41_fp4_matrix_and_timing_gate():
     }
     payload = {
         "status": "passed",
-        "protocol": "remnant-v41-fp4-decode-v4",
+        "protocol": "remnant-v41-fp4-decode-v5",
         "config": vars(args),
         "cases": [],
     }
@@ -1433,7 +1433,7 @@ def test_v41_fp4_matrix_and_timing_gate():
                 "valid": True,
                 "execution": "cuda_graph",
                 "repeats": 100,
-                "baseline": "upstream H100 auto FP8/BF16",
+                "baseline": "upstream H100 auto FP8/BF16; synchronization corrected",
                 "native_scheduler": "first use per ratio; regenerated inside graph",
                 "native_control": {
                     "source_commit": cases.UPSTREAM_FLASHMLA_SHA,

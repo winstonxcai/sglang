@@ -372,7 +372,7 @@ def upstream_native_control():
 def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
     """Upstream Native versus custom dense/Packed FP4; setup is outside timing.
 
-    Author: Winston Cai. Native is the unchanged H100 auto FP8/BF16 path.
+    Author: Winston Cai. Native preserves upstream H100 FP8/BF16 arithmetic with synchronization fixes.
     Dense FP4 is a diagnostic control, with its own name and independent oracle.
     """
     upstream_flash_mla, native_control = upstream_native_control()
@@ -581,7 +581,7 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
             },
         },
         "global_page_size": page,
-        "baseline": "upstream H100 auto FP8/BF16",
+        "baseline": "upstream H100 auto FP8/BF16; synchronization corrected",
         "native_control": native_control,
         "native_scheduler": "first use per ratio; regenerated inside graph",
     }

@@ -19,9 +19,9 @@ from pathlib import Path
 
 PROTOCOL = "remnant-three-modes-v1"
 PREFILL_PROTOCOL = "remnant-prefill-read-v1"
-FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v4"
+FP4_DECODE_PROTOCOL = "remnant-v41-fp4-decode-v5"
 FP4_DECODE_MODES = ("native", "dense_fp4", "kernel")
-UPSTREAM_FLASHMLA_SHA = "3620b63fc4ebe33950c50e1b7701b6607f44150e"
+UPSTREAM_FLASHMLA_SHA = "ee0f8718fdaab4eaaef9f3bb61cdd470ff650d32"
 SEED = 20260919
 MODES = ("native", "triton", "kernel")
 DEFAULT_DECODE_BATCHES = (8, 16, 24, 28, 32)
@@ -539,7 +539,7 @@ def validate_timing(
                 or record.get("execution") != "cuda_graph"
                 or record.get("repeats") != 100
                 or set(record.get("paths", {})) != {"native", "dense_fp4", "kernel"}
-                or record.get("baseline") != "upstream H100 auto FP8/BF16"
+                or record.get("baseline") != "upstream H100 auto FP8/BF16; synchronization corrected"
                 or record.get("native_scheduler")
                 != "first use per ratio; regenerated inside graph"
                 or record.get("native_control", {}).get("source_commit")
