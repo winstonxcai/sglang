@@ -472,9 +472,6 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
             (len(cache), page, 1, record_bytes),
             (cache.stride(0), record_bytes, record_bytes, 1),
         )
-        scheduler = (
-            upstream_flash_mla.get_mla_metadata()[0] if mode == "native" else None
-        )
         gathered = values[physical_cpu.long()]
         kv = torch.cat((swa_values[:, None], gathered), dim=2).float()
         scores = torch.einsum("bshd,bskd->bshk", q_cpu.float(), kv) * 512**-0.5
@@ -487,8 +484,12 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
             lse.transpose(1, 2),
         )
 
-        def call(cache_view=cache_view, packed=packed, mode=mode, scheduler=scheduler):
+        def call(cache_view=cache_view, packed=packed, mode=mode):
             if mode == "native":
+                # SGLang resets metadata after graph warmup, so capture records
+                # the first use of each ratio's schedule. Create it here to
+                # include scheduling in every replay of this standalone call.
+                scheduler = upstream_flash_mla.get_mla_metadata()[0]
                 return upstream_flash_mla.flash_mla_with_kvcache(
                     q,
                     swa_view,
@@ -543,7 +544,6 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
                     sink,
                     lengths,
                     swa_lengths,
-                    scheduler,
                 ),
                 validate=validate,
                 expected_kernels=(),
@@ -582,6 +582,7 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
         "global_page_size": page,
         "baseline": "upstream H100 auto FP8/BF16",
         "native_control": native_control,
+        "native_scheduler": "first use per ratio; regenerated inside graph",
     }
 
 

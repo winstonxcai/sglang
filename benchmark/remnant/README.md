@@ -45,6 +45,10 @@ Shared post-normalization/post-RoPE BF16 rows, query/indices/SWA/sink hashes bin
 all three paths. Selection/store, setup, allocation, references and capture are
 untimed. Complete Direct, including scheduling/split/combine, is timed in CUDA
 graphs with10 warmups,30 randomized paired rounds and100 replays per sample.
+Native creates fresh scheduling metadata at the recorded call boundary,
+matching SGLang's reset after graph warmup. Scheduling, attention and combine
+therefore run inside the graph. Later layers may reuse a ratio's schedule;
+these standalone first-use measurements are not a weighted model average.
 Existing JSON/CSV retain raw samples and per-case ratios; p95 is a round-average
 graph timing statistic. No minimum speedup or serving claim is implied.
 

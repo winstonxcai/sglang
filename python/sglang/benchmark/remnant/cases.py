@@ -540,6 +540,8 @@ def validate_timing(
                 or record.get("repeats") != 100
                 or set(record.get("paths", {})) != {"native", "dense_fp4", "kernel"}
                 or record.get("baseline") != "upstream H100 auto FP8/BF16"
+                or record.get("native_scheduler")
+                != "first use per ratio; regenerated inside graph"
                 or record.get("native_control", {}).get("source_commit")
                 != UPSTREAM_FLASHMLA_SHA
                 or record.get("native_control", {}).get("architectures") != ["sm_90a"]

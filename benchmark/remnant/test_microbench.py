@@ -1309,6 +1309,56 @@ def test_v41_three_path_ratios():
     assert ratios["kernel_over_dense_fp4"]["mean"] == 1.5
 
 
+def test_v41_native_call_does_not_reuse_warmup_metadata():
+    """Exercise the actual callback without CUDA; fresh schedules must reach the API."""
+    import ast
+    from types import SimpleNamespace
+
+    tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
+    factory = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "fp4_decode_operations"
+    )
+    callback = next(
+        n
+        for n in ast.walk(factory)
+        if isinstance(n, ast.FunctionDef) and n.name == "call"
+    )
+    received = []
+
+    def decode(*args, **kwargs):
+        received.append(args[5])
+        return "output", "lse"
+
+    namespace = {
+        name: object()
+        for name in (
+            "q",
+            "swa_view",
+            "swa_indices",
+            "swa_lengths",
+            "cache_view",
+            "physical",
+            "lengths",
+            "sink",
+        )
+    }
+    namespace.update(
+        packed=False,
+        mode="native",
+        upstream_flash_mla=SimpleNamespace(
+            get_mla_metadata=lambda: (object(), None), flash_mla_with_kvcache=decode
+        ),
+    )
+    exec(
+        compile(ast.Module(body=[callback], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    assert namespace["call"]() == namespace["call"]() == ("output", "lse")
+    assert len(received) == 2 and received[0] is not received[1]
+
+
 @pytest.mark.parametrize("global_page_size", [128, 256])
 def test_gpu_v41_upstream_native_comparison(global_page_size, benchmark):
     """Both production page sizes; original control, graphs and a nondefault stream."""
@@ -1384,6 +1434,7 @@ def test_v41_fp4_matrix_and_timing_gate():
                 "execution": "cuda_graph",
                 "repeats": 100,
                 "baseline": "upstream H100 auto FP8/BF16",
+                "native_scheduler": "first use per ratio; regenerated inside graph",
                 "native_control": {
                     "source_commit": cases.UPSTREAM_FLASHMLA_SHA,
                     "source_sha256": "b" * 64,
@@ -1430,6 +1481,7 @@ def test_v41_fp4_matrix_and_timing_gate():
         "custom-baseline",
         "fork-control",
         "missing-control",
+        "warmed-scheduler",
     ):
         broken = copy.deepcopy(payload)
         if fault == "missing-case":
@@ -1448,6 +1500,8 @@ def test_v41_fp4_matrix_and_timing_gate():
             broken["cases"][0]["native_control"]["source_commit"] = "3eb8594"
         elif fault == "missing-control":
             broken["cases"][0].pop("native_control")
+        elif fault == "warmed-scheduler":
+            broken["cases"][0]["native_scheduler"] = "cached before capture"
         elif fault == "wrong-geometry":
             broken["cases"][0]["case"]["swa_page_size"] = 64 + 128
         elif fault == "nonproduction-swa":
