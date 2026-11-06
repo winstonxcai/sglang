@@ -1433,7 +1433,8 @@ def test_glm_cli_rejects_adapter_and_deepseek_options():
     args = glm.parser().parse_args(
         ["--model-family", "glm53", "--suite", "glm-attention"]
     )
-    assert args.modes == "native,direct"
+    assert args.modes is None
+    assert glm.experiment(args.suite, args.phase)[1] == ("native", "direct")
 
 
 def test_glm_entrypoint_dispatches_before_deepseek_imports():
@@ -2146,3 +2147,179 @@ def test_shared_statistics_preserve_exact_summary_and_paired_rounds():
     ):
         with pytest.raises(ValueError):
             shared_timing.paired_ratio_summary(left, right)
+
+
+upstream = load_module(
+    "_glm_upstream_contract", ROOT / "python/sglang/benchmark/remnant/glm_upstream.py"
+)
+
+
+def test_glm_upstream_decode_matrix_and_labels():
+    protocol, modes, matrix = glm.experiment(glm.UPSTREAM_SUITE, "decode")
+    assert protocol == "remnant-glm-upstream-decode-v1"
+    assert modes == ("upstream", "direct")
+    assert len(matrix) == len({c.name for c in matrix}) == 24
+    assert {c.heads for c in matrix} == {16}
+    assert {c.queries for c in matrix} == {1, 8, 16, 24, 32, 64}
+    assert {c.tail for c in matrix} == {0, 3}
+    assert {c.policy for c in matrix} == {"warm", "rotating"}
+    assert matrix == [c for c in glm.cases("decode") if c.heads == 16]
+    for phase in ("all", "prefill", "prefill-small"):
+        with pytest.raises(ValueError, match="phase decode"):
+            glm.experiment(glm.UPSTREAM_SUITE, phase)
+    fixture = glm.Fixture.__new__(glm.Fixture)
+    assert fixture.modes == ("native", "direct")
+    fixture.upstream = True
+    assert fixture.modes == modes
+
+
+def test_glm_upstream_source_and_helper_provenance(tmp_path):
+    import hashlib
+    import json
+    import subprocess
+
+    directory = tmp_path / "upstream"
+    package = tmp_path / "package"
+    directory.mkdir()
+    for name in upstream.FILES:
+        path = (
+            directory / "tilelang_kernel.py"
+            if name == upstream.MODULE
+            else package / name
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name == upstream.MODULE:
+            prepared = os.environ.get(upstream.SOURCE_ENV)
+            data = (
+                (Path(prepared) / "tilelang_kernel.py").read_bytes()
+                if prepared
+                else subprocess.check_output(
+                    [
+                        "git",
+                        "-C",
+                        str(ROOT),
+                        "show",
+                        f"{upstream.COMMIT}:python/sglang/{name}",
+                    ],
+                    timeout=30,
+                )
+            )
+        else:
+            data = (ROOT / "python/sglang" / name).read_bytes()
+        path.write_bytes(data)
+        assert hashlib.sha256(data).hexdigest() == upstream.FILES[name]
+    (directory / "source.json").write_text(json.dumps(upstream.identity()))
+    assert upstream.verify_source(directory, package) == upstream.identity()
+    for name in upstream.FILES:
+        path = (
+            directory / "tilelang_kernel.py"
+            if name == upstream.MODULE
+            else package / name
+        )
+        original = path.read_bytes()
+        path.write_bytes(original + b"\n# changed\n")
+        with pytest.raises(RuntimeError, match="changed"):
+            upstream.verify_source(directory, package)
+        path.write_bytes(original)
+    (directory / "source.json").write_text(json.dumps({"commit": "wrong"}))
+    with pytest.raises(RuntimeError, match="receipt"):
+        upstream.verify_source(directory, package)
+
+
+def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
+    import copy
+    import hashlib
+
+    cubin = tmp_path / "kernel.cubin"
+    cubin.write_bytes(b"independent CPU fixture")
+    digest = hashlib.sha256(cubin.read_bytes()).hexdigest()
+    compiled = dict(
+        source=upstream.identity(),
+        cache_files={str(cubin): digest},
+        tilelang=[
+            dict(
+                heads=16,
+                inner=i,
+                packed=False,
+                cubin_path=str(cubin),
+                cubin_sha256=digest,
+            )
+            for i in (1, 2)
+        ],
+    )
+    upstream.verify_compilation(compiled)
+    for change in ("missing", "source", "binary", "missing_binding"):
+        candidate = copy.deepcopy(compiled)
+        if change == "missing":
+            candidate["tilelang"].pop()
+        elif change == "source":
+            candidate["source"]["commit"] = "wrong"
+        elif change == "missing_binding":
+            candidate["tilelang"][0].pop("cubin_path")
+            candidate["tilelang"][0].pop("cubin_sha256")
+        else:
+            candidate["tilelang"][0]["cubin_sha256"] = "wrong"
+        with pytest.raises(RuntimeError):
+            upstream.verify_compilation(candidate)
+    cubin.write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="changed"):
+        upstream.verify_compilation(compiled)
+
+
+def _glm_upstream_payload():
+    payload = _glm_complete_timing_payload()
+    payload.update(
+        suite=glm.UPSTREAM_SUITE,
+        protocol=glm.UPSTREAM_PROTOCOL,
+        phase="decode",
+        source={"upstream": upstream.identity(), "device": "NVIDIA H200"},
+        cases=[
+            c
+            for c in payload["cases"]
+            if c["case"]["phase"] == "decode" and c["case"]["heads"] == 16
+        ],
+    )
+    for case in payload["cases"]:
+        inner = 1 if case["case"]["queries"] == 1 else 2
+        case["fixture"].update(
+            changing_input_replay="passed",
+            path_geometry={
+                mode: dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner)
+                for mode in ("upstream", "direct")
+            },
+        )
+        case["paths"]["upstream"] = case["paths"].pop("native")
+        case["paired_ratios"]["direct_over_upstream"] = case["paired_ratios"].pop(
+            "direct_over_native"
+        )
+        case["round_orders"] = [["upstream", "direct"], ["direct", "upstream"]] * 15
+    payload["summary"] = glm.weighted_overhead(payload["cases"], baseline="upstream")
+    return payload
+
+
+def test_glm_upstream_result_identity_and_csv(tmp_path):
+    import copy
+
+    payload = _glm_upstream_payload()
+    glm.validate_timing(payload)
+    glm.write_results(payload, tmp_path / "timing")
+    csv = (tmp_path / "timing.csv").read_text()
+    assert "direct_over_upstream" in csv and "direct_over_native" not in csv
+    for change in ("scope", "source", "label", "rounds", "ratio"):
+        bad = copy.deepcopy(payload)
+        if change == "scope":
+            bad["cases"].pop()
+        elif change == "source":
+            bad["source"]["upstream"]["commit"] = "wrong"
+        elif change == "label":
+            bad["cases"][0]["paths"]["native"] = bad["cases"][0]["paths"].pop(
+                "upstream"
+            )
+        elif change == "rounds":
+            bad["cases"][0]["round_orders"][0] = ["direct", "upstream"]
+        else:
+            bad["cases"][0]["paired_ratios"]["direct_over_upstream"]["samples"][0] = 2
+        with pytest.raises(RuntimeError):
+            glm.validate_timing(bad)
+    with pytest.raises(RuntimeError, match="identity"):
+        glm.resume_prefix(payload, payload["source"], "decode")

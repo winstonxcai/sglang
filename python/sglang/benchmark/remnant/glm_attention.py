@@ -26,6 +26,8 @@ PROTOCOL = "remnant-glm-attention-v1"
 DECODE_PROTOCOL = "remnant-glm-decode-v1"
 PREFILL_PROTOCOL = "remnant-glm-prefill-v1"
 PREFILL_SMALL_PROTOCOL = "remnant-glm-prefill-small-v1"
+UPSTREAM_PROTOCOL = "remnant-glm-upstream-decode-v1"
+UPSTREAM_SUITE = "glm-upstream-decode"
 PROTOCOLS = {
     "all": PROTOCOL,
     "decode": DECODE_PROTOCOL,
@@ -88,6 +90,21 @@ def cases(phase_scope: str = "all") -> list[Case]:
         )
         for policy in ("warm", "rotating")
     ]
+
+
+def experiment(suite: str, phase: str) -> tuple[str, tuple[str, str], list[Case]]:
+    """Keep the pristine upstream experiment distinct from historical matrices."""
+    if suite == UPSTREAM_SUITE:
+        if phase != "decode":
+            raise ValueError("glm-upstream-decode requires --phase decode")
+        return (
+            UPSTREAM_PROTOCOL,
+            ("upstream", "direct"),
+            [case for case in cases("decode") if case.heads == 16],
+        )
+    if suite != "glm-attention":
+        raise ValueError(f"Unsupported GLM suite: {suite}")
+    return PROTOCOLS[phase], MODES, cases(phase)
 
 
 def case_seed(case: Case, bank: int = 0) -> int:
@@ -203,10 +220,14 @@ def cycles_per_sample(banks: int) -> int:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-family", choices=("glm53",), default="glm53")
-    p.add_argument("--suite", choices=("glm-attention",), default="glm-attention")
+    p.add_argument(
+        "--suite", choices=("glm-attention", UPSTREAM_SUITE), default="glm-attention"
+    )
     p.add_argument("--phase", choices=tuple(PROTOCOLS), default="all")
     p.add_argument("--packed-prefill-tile", type=int, choices=(32, 64, 128), default=32)
-    p.add_argument("--modes", choices=("native,direct",), default="native,direct")
+    p.add_argument(
+        "--modes", choices=("native,direct", "upstream,direct"), default=None
+    )
     p.add_argument(
         "--resume",
         help="Prior timing JSON from identical source/artifacts; requires REMNANT_BUILD_MANIFEST_PATH",
@@ -324,7 +345,9 @@ class Fixture:
         *,
         packed_prefill_tile: int = 32,
         gpu_family: str = "H100",
+        upstream: bool = False,
     ):
+        self.upstream = upstream
         self.packed_prefill_tile = packed_prefill_tile
         import torch
 
@@ -371,6 +394,10 @@ class Fixture:
             torch.cuda.get_device_properties(0).multi_processor_count,
             1,
         )
+        if upstream and inner not in (1, 2):
+            raise RuntimeError(
+                f"Unprepared H200 decode split: {inner}; refusing GPU compilation"
+            )
         output_budget //= min(inner, 33) if packed_prefill_tile != 32 else inner
         self.projected_bytes = cache_bytes + input_bytes + output_budget + 512 * 1024**2
         if self.projected_bytes >= self.memory_limit:
@@ -447,7 +474,7 @@ class Fixture:
             inner_iter=inner,
             partial_groups=66 // inner,
             path_geometry={
-                "native": dict(
+                self.baseline_name: dict(
                     tile_rows=32, inner_iter=inner, partial_groups=66 // inner
                 ),
                 "direct": dict(
@@ -462,6 +489,14 @@ class Fixture:
         self.outputs = {}
         self.validate()
 
+    @property
+    def baseline_name(self) -> str:
+        return "upstream" if getattr(self, "upstream", False) else "native"
+
+    @property
+    def modes(self) -> tuple[str, str]:
+        return self.baseline_name, "direct"
+
     def check(self) -> None:
         if time.monotonic() >= self.deadline - 5:
             raise TimeoutError(f"{self.case.name}: fixture/timing deadline reached")
@@ -472,7 +507,11 @@ class Fixture:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
         from sglang.srt.remnant.glm import attention
 
-        if mode == "native":
+        if mode == self.baseline_name:
+            if self.baseline_name == "upstream":
+                from sglang.benchmark.remnant.glm_upstream import load_baseline
+
+                tilelang_sparse_fwd = load_baseline().tilelang_sparse_fwd
             return tilelang_sparse_fwd(
                 self.q,
                 self.native[bank].view(torch.float8_e4m3fn).unsqueeze(1),
@@ -500,6 +539,10 @@ class Fixture:
 
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
+        if self.baseline_name == "upstream":
+            from sglang.benchmark.remnant.glm_upstream import load_baseline
+
+            tilelang_sparse_fwd = load_baseline().tilelang_sparse_fwd
         cpu = reference_device == "cpu"
         sample = torch.linspace(
             0,
@@ -529,7 +572,10 @@ class Fixture:
             direct_ref = attention_reference(
                 query, dense, local, device=reference_device
             )
-            for mode, reference in (("native", native_ref), ("direct", direct_ref)):
+            for mode, reference in (
+                (self.baseline_name, native_ref),
+                ("direct", direct_ref),
+            ):
                 output = self.call(mode, bank)
                 checked = output.cpu() if cpu else output
                 if not bool(torch.isfinite(checked).all()):
@@ -564,7 +610,7 @@ class Fixture:
 
         if warmup_calls < 1:
             raise ValueError("Capture requires positive warmup count")
-        for mode in MODES:
+        for mode in self.modes:
             self.check()
             for i in range(max(warmup_calls, self.banks)):
                 output = self.call(mode, i % self.banks)
@@ -608,13 +654,31 @@ class Fixture:
     def validate_replay(self, *, reference_device=None) -> None:
         import torch
 
-        for mode in ("direct", "native", "direct", "native"):
+        for mode in ("direct", self.baseline_name, "direct", self.baseline_name):
             self.graphs[mode].replay()
             expected = self.call(mode, self.banks - 1)
             actual = self.outputs[mode]
             if reference_device == "cpu":
                 actual, expected = actual.cpu(), expected.cpu()
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+        if self.baseline_name == "upstream":
+            # Q keeps its address but changes in place after capture. This
+            # tests replay inputs in both the pristine and production paths.
+            self.q.neg_()
+            try:
+                for mode in self.modes:
+                    self.graphs[mode].replay()
+                    expected = self.call(mode, self.banks - 1)
+                    torch.testing.assert_close(
+                        self.outputs[mode], expected, atol=0, rtol=0
+                    )
+            finally:
+                self.q.neg_()
+                for mode in self.modes:
+                    self.graphs[mode].replay()
+                torch.cuda.synchronize()
+            self.identity["changing_input_replay"] = "passed"
 
     def time(self) -> dict:
         from sglang.benchmark.remnant.cases import summary
@@ -623,7 +687,7 @@ class Fixture:
         self.capture()
         repeats = cycles_per_sample(self.banks)
         samples, orders = paired_samples(
-            {mode: self.graphs[mode].replay for mode in MODES},
+            {mode: self.graphs[mode].replay for mode in self.modes},
             ROUNDS,
             case_seed(self.case),
             repeats,
@@ -640,8 +704,8 @@ class Fixture:
             execution="cuda_graph",
             paths={m: summary(t) for m, t in samples.items()},
             paired_ratios={
-                "direct_over_native": paired_ratio_summary(
-                    samples["direct"], samples["native"]
+                f"direct_over_{self.baseline_name}": paired_ratio_summary(
+                    samples["direct"], samples[self.baseline_name]
                 )
             },
             round_orders=orders,
@@ -671,6 +735,7 @@ def benchmark_source_hashes(root: Path) -> dict[str, str]:
     """
     paths = (
         "benchmark/remnant/glm_attention.py",
+        "benchmark/remnant/glm_upstream.py",
         "benchmark/remnant/timing.py",
         "benchmark/remnant/cases.py",
         "srt/remnant/config.py",
@@ -748,6 +813,11 @@ def write_results(payload: dict, base: Path) -> None:
     tmp = base.with_suffix(".json.partial")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     tmp.replace(base.with_suffix(".json"))
+    ratio_name = (
+        "direct_over_upstream"
+        if payload.get("protocol") == UPSTREAM_PROTOCOL
+        else "direct_over_native"
+    )
     with base.with_suffix(".csv").open("w", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -758,7 +828,7 @@ def write_results(payload: dict, base: Path) -> None:
                 "median_ms",
                 "p95_round_average_ms",
                 "samples_ms",
-                "direct_over_native",
+                ratio_name,
                 "fixture",
             ),
             lineterminator="\n",
@@ -774,10 +844,26 @@ def write_results(payload: dict, base: Path) -> None:
                         median_ms=stats["median"],
                         p95_round_average_ms=stats["p95"],
                         samples_ms=json.dumps(stats["samples"]),
-                        direct_over_native=json.dumps(case["paired_ratios"]),
+                        **{ratio_name: json.dumps(case["paired_ratios"])},
                         fixture=json.dumps(case["fixture"]),
                     )
                 )
+
+
+@cache
+def _cpu_contract(owner: str):
+    """Import a pure sibling contract without initializing the serving package."""
+    import importlib.util
+    import sys
+
+    name = __name__ + "_" + owner
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).with_name(owner + ".py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 @cache
@@ -787,45 +873,55 @@ def _summary_function() -> Callable[[list[float]], dict]:
     Local preflights import this contract by file path on hosts with no serving
     dependencies. Keep the same summary implementation as GPU measurement.
     """
-    import importlib.util
-    import sys
-
-    name = __name__ + "_cases"
-    spec = importlib.util.spec_from_file_location(
-        name, Path(__file__).with_name("timing.py")
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module.summary
+    return _cpu_contract("timing").summary
 
 
 def validate_timing(payload: dict, *, prefix: bool = False) -> None:
     phase = payload.get("phase", "all")
-    protocol = PROTOCOLS[phase]
+    protocol, modes, expected = experiment(payload.get("suite", "glm-attention"), phase)
+    baseline = modes[0]
+    ratio_name = f"direct_over_{baseline}"
+    if protocol == UPSTREAM_PROTOCOL:
+        metadata = _cpu_contract("glm_upstream").identity()
+        if payload.get("source", {}).get("upstream") != metadata:
+            raise RuntimeError("Missing pristine upstream baseline identity")
     if payload.get("protocol") != protocol or (
         not prefix and payload.get("status") != "passed"
     ):
         raise RuntimeError("GLM timing protocol incomplete")
     if phase == "prefill" and payload.get("packed_prefill_tile") != 64:
         raise RuntimeError("Full GLM prefill requires the 64-row Packed tile")
-    expected = cases(phase)
+    expected_count = len(expected)
     if prefix:
         if len(payload["cases"]) > len(expected):
             raise RuntimeError("GLM checkpoint exceeds the required matrix")
         expected = expected[: len(payload["cases"])]
     if [c["name"] for c in payload["cases"]] != [c.name for c in expected]:
         raise RuntimeError(
-            f"GLM timing requires the ordered {len(cases(phase))}-case {phase} matrix"
+            f"GLM timing requires the ordered {expected_count}-case {phase} matrix"
         )
     for case, definition in zip(payload["cases"], expected):
         if (
             not case.get("valid")
-            or set(case.get("paths", {})) != set(MODES)
+            or set(case.get("paths", {})) != set(modes)
             or case.get("case") != asdict(definition)
         ):
             raise RuntimeError(f"Incomplete GLM case {case['name']}")
         fixture = case["fixture"]
+        if protocol == UPSTREAM_PROTOCOL:
+            inner = 1 if definition.queries == 1 else 2
+            geometry = {
+                mode: dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner)
+                for mode in modes
+            }
+            if (
+                fixture.get("changing_input_replay") != "passed"
+                or fixture.get("path_geometry") != geometry
+                or "H200" not in payload.get("source", {}).get("device", "")
+            ):
+                raise RuntimeError(
+                    f"Missing upstream decode graph/device geometry: {case['name']}"
+                )
         if phase == "prefill":
             native_inner = fixture.get("inner_iter")
             if native_inner not in (33, 66) or fixture.get("path_geometry") != {
@@ -861,8 +957,8 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
         orders = case["round_orders"]
         if (
             len(orders) != ROUNDS
-            or orders.count(["native", "direct"]) != ROUNDS // 2
-            or orders.count(["direct", "native"]) != ROUNDS // 2
+            or orders.count([baseline, "direct"]) != ROUNDS // 2
+            or orders.count(["direct", baseline]) != ROUNDS // 2
         ):
             raise RuntimeError(f"Unbalanced GLM timing {case['name']}")
         if (
@@ -880,27 +976,35 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
                 raise RuntimeError(
                     f"Invalid GLM derived statistics {case['name']}/{mode}"
                 )
-        ratios = case["paired_ratios"]["direct_over_native"]["samples"]
+        ratios = case["paired_ratios"][ratio_name]["samples"]
         if ratios != [
             d / n
             for d, n in zip(
-                case["paths"]["direct"]["samples"], case["paths"]["native"]["samples"]
+                case["paths"]["direct"]["samples"], case["paths"][baseline]["samples"]
             )
         ]:
             raise RuntimeError(f"Invalid GLM paired ratios {case['name']}")
-        if case["paired_ratios"]["direct_over_native"] != _summary_function()(ratios):
+        if case["paired_ratios"][ratio_name] != _summary_function()(ratios):
             raise RuntimeError(f"Invalid GLM derived paired statistics {case['name']}")
     if phase == "decode" and (not prefix or "summary" in payload):
-        if payload.get("summary") != weighted_overhead(payload["cases"]):
+        if payload.get("summary") != weighted_overhead(
+            payload["cases"], baseline=baseline
+        ):
             raise RuntimeError("Invalid GLM derived decode summary")
 
 
 def resume_prefix(
-    previous: dict, source: dict, phase: str = "all", *, packed_prefill_tile: int = 32
+    previous: dict,
+    source: dict,
+    phase: str = "all",
+    *,
+    packed_prefill_tile: int = 32,
+    suite: str = "glm-attention",
 ) -> list[dict]:
     """Reuse only validated cases from an identical fixture/toolchain snapshot."""
     if (
-        previous.get("phase", "all") != phase
+        previous.get("suite", "glm-attention") != suite
+        or previous.get("phase", "all") != phase
         or previous.get("source") != source
         or previous.get("seed") != SEED
         or previous.get("rounds") != ROUNDS
@@ -919,8 +1023,10 @@ def resume_prefix(
     return records
 
 
-def weighted_overhead(records: list[dict]) -> dict:
+def weighted_overhead(records: list[dict], *, baseline: str = "native") -> dict:
     """Batch-weighted mean of paired round overheads; other axes equal weight."""
+
+    ratio_name = f"direct_over_{baseline}"
 
     def score(rows):
         weight = sum(c["case"]["queries"] for c in rows)
@@ -929,11 +1035,7 @@ def weighted_overhead(records: list[dict]) -> dict:
                 100
                 * sum(
                     c["case"]["queries"]
-                    * (
-                        sum(c["paired_ratios"]["direct_over_native"]["samples"])
-                        / ROUNDS
-                        - 1
-                    )
+                    * (sum(c["paired_ratios"][ratio_name]["samples"]) / ROUNDS - 1)
                     for c in rows
                 )
                 / weight
@@ -952,14 +1054,20 @@ def weighted_overhead(records: list[dict]) -> dict:
         unacceptable_2x_cases=[
             c["name"]
             for c in rows
-            if sum(c["paired_ratios"]["direct_over_native"]["samples"]) / ROUNDS >= 2
+            if sum(c["paired_ratios"][ratio_name]["samples"]) / ROUNDS >= 2
         ],
     )
 
 
 def main() -> None:
     args = parser().parse_args()
-    protocol = PROTOCOLS[args.phase]
+    protocol, modes, matrix = experiment(args.suite, args.phase)
+    upstream = args.suite == UPSTREAM_SUITE
+    baseline = modes[0]
+    if args.modes is not None and args.modes != ",".join(modes):
+        raise ValueError(f"{args.suite} requires {modes}")
+    if upstream and args.packed_prefill_tile != 32:
+        raise ValueError("Upstream decode requires production Direct tile32")
     if args.phase == "prefill":
         if args.packed_prefill_tile != 64:
             raise ValueError("Full GLM prefill requires --packed-prefill-tile 64")
@@ -973,12 +1081,12 @@ def main() -> None:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
         from sglang.srt.remnant.glm import compile_kernels
 
+        if upstream:
+            from sglang.benchmark.remnant.glm_upstream import load_baseline
+
+            tilelang_sparse_fwd = load_baseline().tilelang_sparse_fwd
         assert callable(tilelang_sparse_fwd) and callable(compile_kernels)
-        print(
-            json.dumps(
-                dict(protocol=protocol, cases=len(cases(args.phase)), modes=MODES)
-            )
-        )
+        print(json.dumps(dict(protocol=protocol, cases=len(matrix), modes=modes)))
         return
     limit = 2400 if args.phase == "prefill" else 1200
     if not args.output or not 60 <= args.max_seconds <= limit:
@@ -995,6 +1103,7 @@ def main() -> None:
     payload = dict(
         protocol=protocol,
         phase=args.phase,
+        **({"suite": args.suite} if upstream else {}),
         packed_prefill_tile=args.packed_prefill_tile,
         status="running",
         seed=SEED,
@@ -1003,6 +1112,19 @@ def main() -> None:
         source=source_manifest(),
         cases=[],
     )
+    if upstream:
+        from sglang.benchmark.remnant.glm_upstream import (
+            identity,
+            load_baseline,
+            verify_compilation,
+        )
+
+        module = load_baseline()
+        verify_compilation(
+            payload["source"]["compiled_build"].get("upstream_compile", {})
+        )
+        payload["source"]["upstream"] = identity()
+        payload["source"]["upstream_module_path"] = module.__file__
     if args.resume:
         checkpoint = Path(args.resume)
         payload["cases"] = resume_prefix(
@@ -1010,6 +1132,7 @@ def main() -> None:
             payload["source"],
             args.phase,
             packed_prefill_tile=args.packed_prefill_tile,
+            suite=args.suite,
         )
         payload["resumed_from"] = dict(
             path=str(checkpoint),
@@ -1017,12 +1140,10 @@ def main() -> None:
             accepted_cases=len(payload["cases"]),
         )
         if args.phase == "decode":
-            payload["summary"] = weighted_overhead(payload["cases"])
+            payload["summary"] = weighted_overhead(payload["cases"], baseline=baseline)
     deadline = time.monotonic() + args.max_seconds
-    fixture = None
     try:
         with torch.inference_mode():
-            matrix = cases(args.phase)
             for case in matrix[len(payload["cases"]) :]:
                 record = dict(name=case.name, case=asdict(case), valid=False)
                 payload["cases"].append(record)
@@ -1032,21 +1153,23 @@ def main() -> None:
                     deadline,
                     packed_prefill_tile=args.packed_prefill_tile,
                     gpu_family="H200"
-                    if args.phase in ("prefill", "prefill-small")
+                    if upstream or args.phase in ("prefill", "prefill-small")
                     else "H100",
+                    upstream=upstream,
                 )
                 record["fixture"] = fixture.identity
                 record.update(fixture.time())
                 record["valid"] = True
                 if args.phase == "decode":
-                    payload["summary"] = weighted_overhead(payload["cases"])
+                    payload["summary"] = weighted_overhead(
+                        payload["cases"], baseline=baseline
+                    )
                 write_results(payload, base)
-                if args.phase == "prefill":
+                if upstream or args.phase == "prefill":
                     print(
                         f"{len(payload['cases'])}/{len(matrix)} {case.name}", flush=True
                     )
                 del fixture
-                fixture = None
                 gc.collect()
                 torch.cuda.empty_cache()
         payload["status"] = "passed"
