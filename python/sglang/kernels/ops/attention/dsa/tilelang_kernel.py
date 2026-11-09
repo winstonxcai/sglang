@@ -1082,7 +1082,13 @@ def sparse_mla_fwd_decode_combine(
     return main
 
 
-@tilelang.jit(out_idx=[-1], pass_configs=pass_configs)
+@tilelang.jit(
+    out_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
 def glm_packed_decode_combine(heads: int, dim: int, groups: int, columns: int):
     """Reduce split LSE in parallel and distribute output columns across CTAs."""
     assert dim % columns == 0
@@ -1114,8 +1120,10 @@ def glm_packed_decode_combine(heads: int, dim: int, groups: int, columns: int):
             for _, group in T.Parallel(1, padded_groups):
                 lse[0, group] = T.exp2(lse[0, group] - maximum[0])
             T.reduce_sum(lse, total, dim=1)
-            for group in T.Parallel(groups):
-                weights[group] = lse[0, group]
+            for _, group in T.Parallel(1, padded_groups):
+                if group < groups:
+                    weights[group] = lse[0, group]
+            T.sync_threads()
 
             T.fill(accum, 0)
             for group in T.serial(groups):
