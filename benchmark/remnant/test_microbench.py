@@ -2399,7 +2399,7 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
     )
     candidate = copy.deepcopy(compiled)
     candidate["decode_wgmma"] = {
-        str(batch): dict(partial=dict(wgmma), combine=dict(wgmma), hgmma_sites=32)
+        str(batch): dict(partial=dict(wgmma), combine=dict(wgmma), qgmma_sites=32)
         for batch in upstream.WGMMA_INNER
     }
     upstream.verify_compilation(candidate)
@@ -2409,7 +2409,7 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
         if change == "geometry":
             variants.pop("64")
         elif change == "instructions":
-            variants["64"]["hgmma_sites"] = 16
+            variants["64"]["qgmma_sites"] = 16
         else:
             variants["64"]["partial"]["library_sha256"] = "wrong"
         with pytest.raises(RuntimeError, match="WGMMA"):

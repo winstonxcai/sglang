@@ -181,13 +181,14 @@ def precompile() -> dict:
         sass = subprocess.check_output(
             ["cuobjdump", "--dump-sass", variant["cubin_path"]], text=True, timeout=30
         )
-        hgmm = len(re.findall(r"\bHGMMA\.", sass))
-        if hgmm < 32:
-            raise RuntimeError(f"WGMMA partial has only {hgmm} HGMMA sites: {batch=}")
+        # Hopper encodes FP8 warpgroup MMA as QGMMA.
+        qgmma = len(re.findall(r"\bQGMMA\.", sass))
+        if qgmma < 32:
+            raise RuntimeError(f"WGMMA partial has only {qgmma} QGMMA sites: {batch=}")
         compiled["decode_wgmma"][batch] = dict(
             partial=variant,
             combine=bind_decode_library(combine, artifacts),
-            hgmma_sites=hgmm,
+            qgmma_sites=qgmma,
             local_sites=len(re.findall(r"\b(?:LDL|STL)\b", sass)),
             loader_call=loader,
             resource_usage=subprocess.check_output(
@@ -235,7 +236,7 @@ def verify_compilation(compiled: dict) -> None:
                     for artifact in ("cubin", "library")
                 ):
                     raise RuntimeError(f"Unbound WGMMA decode {kind}: {batch=}")
-            if record["hgmma_sites"] < 32:
+            if record["qgmma_sites"] < 32:
                 raise RuntimeError(f"Missing CPU-verified WGMMA instructions: {batch=}")
     for name, expected in artifacts.items():
         path = Path(name)
