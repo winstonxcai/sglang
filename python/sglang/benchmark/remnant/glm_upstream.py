@@ -30,6 +30,15 @@ FILES = {
 SOURCE_ENV = "REMNANT_GLM_UPSTREAM_SOURCE"
 IMAGE_SOURCE = "/opt/remnant-glm-upstream-v0522"
 WGMMA_INNER = {8: 1, 16: 2, 24: 3, 32: 4, 64: 8}
+WGMMA_CANDIDATE = "wgmma-tile64-batches-8-64"
+WGMMA_TARGET_RATIO = 0.5
+
+
+def wgmma_geometry(batch: int) -> dict[str, int]:
+    inner = WGMMA_INNER[batch]
+    return dict(
+        tile_rows=64, inner_iter=inner, partial_groups=(33 + inner - 1) // inner
+    )
 
 
 def identity() -> dict:
@@ -100,7 +109,7 @@ def load_baseline():
 
 def wgmma_shared_ranges(source: str) -> dict[str, tuple[int, int]]:
     """Read the generated allocation offsets and reject asynchronous aliases."""
-    sizes = dict(q=16 * 512, kv=64 * 512, v_t=256 * 64, p=16 * 64, scratch=32 * 272)
+    sizes = dict(q=16 * 512, kv=64 * 512, v_t=512 * 64, p=16 * 64, scratch=32 * 272)
     offsets = dict(
         re.findall(
             r"void\* (q|kv|v_t|p|scratch) = .*buf_dyn_shmem \+ (\d+)\)\);",
@@ -125,6 +134,7 @@ def precompile() -> dict:
         bind_decode_library,
         bind_partial_launch_metadata,
         dynamic_shared_bytes,
+        partial_parameters,
     )
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         glm_packed_decode_combine,
@@ -171,7 +181,7 @@ def precompile() -> dict:
         )
     wgmma = {}
     for batch, inner in WGMMA_INNER.items():
-        groups = (33 + inner - 1) // inner
+        groups = wgmma_geometry(batch)["partial_groups"]
         partial = glm_packed_wgmma_partial(inner, 256**-0.5)
         combine = glm_packed_decode_combine(16, 512, groups, 512)
         wgmma[str(batch)] = partial, combine
@@ -215,31 +225,27 @@ def precompile() -> dict:
             raise RuntimeError(f"Unexpected WGMMA transpose instruction count: {batch=}")
         if not re.search(r"initialize_wgmma_descriptor<2, 1, 32>[^\n]*v_t", partial):
             raise RuntimeError(f"WGMMA transpose destination must use SW64: {batch=}")
-        halves = re.findall(
-            r"^\s*remnant_glm_transpose_wgmma_tile<256,\s*(\d+)>\(",
-            partial,
-            re.MULTILINE,
-        )
-        if halves != ["0", "256"]:
-            raise RuntimeError(f"WGMMA requires both feature halves in order: {batch=}")
+        if len(re.findall(r"^\s*remnant_glm_transpose_wgmma_tile\(", partial, re.M)) != 1:
+            raise RuntimeError(f"Missing single full-V transpose: {batch=}")
         host = Path(variant["library_path"]).with_name("host_kernel.cu").read_text()
         dynamic_shared = dynamic_shared_bytes(host)
+        symbol = "glm_packed_partial_wgmma_kernel"
         resources = subprocess.check_output(
             ["cuobjdump", "--dump-resource-usage", variant["cubin_path"]],
             text=True,
             timeout=30,
         ).strip()
-        static_shared = re.search(r"\bSHARED:(\d+)\b", resources)
-        # Hopper provides 228 KiB per SM and reserves 1 KiB per CTA.
-        if (
-            not static_shared
-            or dynamic_shared < max(end for _, end in shared_ranges.values())
-            or 3 * (dynamic_shared + int(static_shared[1]) + 1024) > 228 * 1024
-        ):
-            raise RuntimeError(f"WGMMA half tile exceeds three-CTA shared budget: {batch=}")
+        if dynamic_shared < max(end for _, end in shared_ranges.values()):
+            raise RuntimeError(f"WGMMA shared ranges exceed launch allocation: {batch=}")
         compiled["decode_wgmma"][batch] = dict(
-            partial=variant,
+            partial=dict(
+                **variant,
+                symbol=symbol,
+                parameters=partial_parameters(partial, symbol, packed=True),
+                dynamic_shared=dynamic_shared,
+            ),
             combine=bind_decode_library(combine, artifacts),
+            geometry=wgmma_geometry(int(batch)),
             qgmma_sites=qgmma,
             cta_barrier_sites=barriers,
             matrix_load_sites=matrix_loads,
@@ -253,7 +259,7 @@ def precompile() -> dict:
     return compiled
 
 
-def verify_compilation(compiled: dict) -> None:
+def verify_compilation(compiled: dict, *, require_wgmma: bool = False) -> None:
     """Fail before timing on absent, changed or incomplete cached artifacts."""
     if compiled.get("source") != identity():
         raise RuntimeError("Upstream compiled source identity changed")
@@ -277,10 +283,20 @@ def verify_compilation(compiled: dict) -> None:
             raise RuntimeError("Unbound upstream cubin")
     if not artifacts:
         raise RuntimeError("Missing upstream compiled artifacts")
-    if wgmma := compiled.get("decode_wgmma"):
+    wgmma = compiled.get("decode_wgmma")
+    if require_wgmma and not wgmma:
+        raise RuntimeError("Upstream decode requires CPU-prepared WGMMA variants")
+    if wgmma:
         if set(wgmma) != {str(batch) for batch in WGMMA_INNER}:
             raise RuntimeError("Missing WGMMA decode specializations")
         for batch, record in wgmma.items():
+            if require_wgmma and (
+                record.get("geometry") != wgmma_geometry(int(batch))
+                or record["partial"].get("symbol") != "glm_packed_partial_wgmma_kernel"
+                or not record["partial"].get("parameters")
+                or not record["partial"].get("dynamic_shared")
+            ):
+                raise RuntimeError(f"Unbound WGMMA decode launch geometry: {batch=}")
             for kind in ("partial", "combine"):
                 variant = record[kind]
                 if any(

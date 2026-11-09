@@ -493,7 +493,7 @@ class Fixture:
                 verify_decode_library,
                 verify_decode_partial_library,
             )
-            from sglang.benchmark.remnant.glm_upstream import WGMMA_INNER
+            from sglang.benchmark.remnant.glm_upstream import wgmma_geometry
             from sglang.srt.remnant.glm_config import H200_PACKED_DECODE_INNER
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 glm_packed_decode_combine,
@@ -504,9 +504,10 @@ class Fixture:
             columns = 128 if case.queries == 1 else 512
             if wgmma is not None and case.queries > 1:
                 variant = wgmma[str(case.queries)]
-                inner = WGMMA_INNER[case.queries]
-                tile_rows = 64
-                groups = (33 + inner - 1) // inner
+                geometry = wgmma_geometry(case.queries)
+                inner = geometry["inner_iter"]
+                tile_rows = geometry["tile_rows"]
+                groups = geometry["partial_groups"]
                 partial = glm_packed_wgmma_partial(inner, SCALE)
                 verify_decode_library(partial, variant["partial"])
                 combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
@@ -950,10 +951,23 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
     protocol, modes, expected = experiment(payload.get("suite", "glm-attention"), phase)
     baseline = modes[0]
     ratio_name = f"direct_over_{baseline}"
+    wgmma = {}
+    upstream_contract = None
     if protocol == UPSTREAM_PROTOCOL:
-        metadata = _cpu_contract("glm_upstream").identity()
-        if payload.get("source", {}).get("upstream") != metadata:
+        upstream_contract = _cpu_contract("glm_upstream")
+        source = payload.get("source", {})
+        if source.get("upstream") != upstream_contract.identity():
             raise RuntimeError("Missing pristine upstream baseline identity")
+        wgmma = (
+            source.get("compiled_build", {})
+            .get("upstream_compile", {})
+            .get("decode_wgmma", {})
+        )
+        expected_candidate = upstream_contract.WGMMA_CANDIDATE if wgmma else None
+        if payload.get("direct_candidate") != expected_candidate or (
+            wgmma and set(wgmma) != {str(b) for b in upstream_contract.WGMMA_INNER}
+        ):
+            raise RuntimeError("Missing or mismatched WGMMA candidate identity")
     if payload.get("protocol") != protocol or (
         not prefix and payload.get("status") != "passed"
     ):
@@ -1001,6 +1015,9 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
                 elif variants != {"66x128", "33x512"}:
                     raise RuntimeError("Unknown upstream decode combine geometry")
                 expected_columns = 128 if definition.queries == 1 else 512
+            if wgmma and definition.queries > 1:
+                geometry["direct"] = upstream_contract.wgmma_geometry(definition.queries)
+                expected_columns = 512
             if (
                 fixture.get("changing_input_replay") != "passed"
                 or fixture.get("direct_combine_columns") != expected_columns
@@ -1079,6 +1096,10 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             payload["cases"], baseline=baseline
         ):
             raise RuntimeError("Invalid GLM derived decode summary")
+    if wgmma and not prefix and payload.get("upstream_decode_score") != upstream_decode_score(
+        payload["cases"], target_ratio=upstream_contract.WGMMA_TARGET_RATIO
+    ):
+        raise RuntimeError("Invalid WGMMA upstream decode score")
 
 
 def resume_prefix(
@@ -1147,7 +1168,9 @@ def weighted_overhead(records: list[dict], *, baseline: str = "native") -> dict:
     )
 
 
-def upstream_decode_score(records: list[dict]) -> dict:
+def upstream_decode_score(
+    records: list[dict], *, target_ratio: float = 1 / 1.20
+) -> dict:
     """Equal-case geometric mean of the 30 paired Direct/Native ratios."""
     _, _, expected = experiment(UPSTREAM_SUITE, "decode")
     if [row["name"] for row in records] != [case.name for case in expected]:
@@ -1166,7 +1189,7 @@ def upstream_decode_score(records: list[dict]) -> dict:
     return {
         "geometric_mean_direct_over_upstream": ratio,
         "speedup": 1 / ratio,
-        "meets_target": ratio <= 1 / 1.20,
+        "meets_target": ratio <= target_ratio,
     }
 
 
@@ -1209,6 +1232,7 @@ def profile_upstream_decode(
 ):
     """Trace representative steady-state graph replays separately from timing."""
     import torch
+    from sglang.benchmark.remnant.glm_upstream import WGMMA_CANDIDATE
 
     selected = [
         case for case in matrix if case.queries in (1, 8, 32, 64) and case.tail == 0
@@ -1216,7 +1240,7 @@ def profile_upstream_decode(
     wgmma = source["compiled_build"]["upstream_compile"]["decode_wgmma"]
     payload = dict(
         protocol="remnant-glm-upstream-decode-profile-v1",
-        direct_candidate="wgmma-tile64-batches-8-64",
+        direct_candidate=WGMMA_CANDIDATE,
         source=source,
         status="running",
         cases=[],
@@ -1273,6 +1297,8 @@ def main() -> None:
     protocol, modes, matrix = experiment(args.suite, args.phase)
     upstream = args.suite == UPSTREAM_SUITE
     baseline = modes[0]
+    wgmma = None
+    target_ratio = 1 / 1.20
     if args.profile_decode and (not upstream or args.resume or args.check_imports):
         raise ValueError("Decode profiling requires a fresh upstream decode run")
     if args.modes is not None and args.modes != ",".join(modes):
@@ -1366,15 +1392,19 @@ def main() -> None:
         ):
             raise RuntimeError("Missing CPU-prepared Packed decode combine cubins")
         from sglang.benchmark.remnant.glm_upstream import (
+            WGMMA_CANDIDATE,
+            WGMMA_TARGET_RATIO,
             identity,
             load_baseline,
             verify_compilation,
         )
 
         module = load_baseline()
-        verify_compilation(
-            payload["source"]["compiled_build"].get("upstream_compile", {})
-        )
+        compiled_upstream = build.get("upstream_compile", {})
+        verify_compilation(compiled_upstream, require_wgmma=True)
+        wgmma = compiled_upstream["decode_wgmma"]
+        payload["direct_candidate"] = WGMMA_CANDIDATE
+        target_ratio = WGMMA_TARGET_RATIO
         payload["source"]["upstream"] = identity()
         payload["source"]["upstream_module_path"] = module.__file__
     if args.profile_decode:
@@ -1413,6 +1443,7 @@ def main() -> None:
                     if upstream or args.phase in ("prefill", "prefill-small")
                     else "H100",
                     upstream=upstream,
+                    wgmma=wgmma,
                 )
                 record["fixture"] = fixture.identity
                 record.update(fixture.time())
@@ -1430,9 +1461,11 @@ def main() -> None:
                 gc.collect()
                 torch.cuda.empty_cache()
         payload["status"] = "passed"
-        validate_timing(payload)
         if upstream:
-            payload["upstream_decode_score"] = upstream_decode_score(payload["cases"])
+            payload["upstream_decode_score"] = upstream_decode_score(
+                payload["cases"], target_ratio=target_ratio
+            )
+        validate_timing(payload)
     except BaseException as error:
         payload.update(status="incomplete", error=repr(error))
         raise

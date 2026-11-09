@@ -333,6 +333,37 @@ def dynamic_shared_bytes(host_source: str) -> int:
     return int(sizes[-1])
 
 
+def partial_parameters(
+    source: str, symbol: str, *, packed: bool
+) -> list[CudaParameter]:
+    """Bind the generated CUDA arguments used by the exact-CTA graph probe."""
+    match = re.search(r"\b" + re.escape(symbol) + r"\(([^)]*)\)\s*\{", source)
+    if not match:
+        raise RuntimeError(f"Missing production CUDA definition: {symbol}")
+    parameters = []
+    for declaration in match[1].split(","):
+        declaration = declaration.strip()
+        name = declaration.split()[-1]
+        pointer = "*" in declaration
+        if not pointer and declaration != f"int {name}":
+            raise RuntimeError(f"Unsupported GLM CUDA ABI: {declaration}")
+        parameters.append(
+            dict(name=name, pointer=pointer, type="pointer" if pointer else "int")
+        )
+    expected = (["bitmap"] if packed else []) + [
+        "indices",
+        "kv_fp8",
+        "partial_lse",
+        "partial_o",
+        "q_fp8",
+        "num_pages",
+        "seq_len",
+    ]
+    if [p["name"] for p in parameters] != expected:
+        raise RuntimeError(f"GLM partial ABI changed: {parameters}")
+    return parameters
+
+
 def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
     """Bind exact production cubins, generated ABI and dynamic shared bytes.
 
@@ -364,30 +395,6 @@ def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
             if not variant["libraries"]:
                 raise RuntimeError("Missing CPU-prepared GLM partial runtime library")
         symbol = "glm_packed_partial_kernel" if variant["packed"] else "main_kernel"
-        match = re.search(r"\b" + symbol + r"\(([^)]*)\)\s*\{", source)
-        if not match:
-            raise RuntimeError(f"Missing production CUDA definition: {symbol}")
-        parameters = []
-        for declaration in match[1].split(","):
-            declaration = declaration.strip()
-            name = declaration.split()[-1]
-            pointer = "*" in declaration
-            if not pointer and declaration != f"int {name}":
-                raise RuntimeError(f"Unsupported GLM CUDA ABI: {declaration}")
-            parameters.append(
-                dict(name=name, pointer=pointer, type="pointer" if pointer else "int")
-            )
-        expected = (["bitmap"] if variant["packed"] else []) + [
-            "indices",
-            "kv_fp8",
-            "partial_lse",
-            "partial_o",
-            "q_fp8",
-            "num_pages",
-            "seq_len",
-        ]
-        if [p["name"] for p in parameters] != expected:
-            raise RuntimeError(f"GLM partial ABI changed: {parameters}")
         host_path = matches[0].parent / "host_kernel.cu"
         host = host_path.read_text()
         if hashlib.sha256(host.encode()).hexdigest() != cache.get(str(host_path)):
@@ -396,7 +403,7 @@ def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
             cubin_path=str(cubin),
             cubin_sha256=cache[str(cubin)],
             symbol=symbol,
-            parameters=parameters,
+            parameters=partial_parameters(source, symbol, packed=variant["packed"]),
             dynamic_shared=dynamic_shared_bytes(host),
         )
 

@@ -2393,6 +2393,8 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
         ],
     )
     upstream.verify_compilation(compiled)
+    with pytest.raises(RuntimeError, match="requires CPU-prepared WGMMA"):
+        upstream.verify_compilation(compiled, require_wgmma=True)
     wgmma = dict(
         cubin_path=str(cubin), cubin_sha256=digest,
         library_path=str(cubin), library_sha256=digest,
@@ -2433,7 +2435,7 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
 
 
 def test_glm_wgmma_shared_ranges_reject_async_operand_aliases():
-    offsets = dict(q=0, kv=8192, v_t=40960, scratch=57344, p=66048)
+    offsets = dict(q=0, kv=8192, v_t=40960, scratch=73728, p=82432)
 
     def generated() -> str:
         return "\n".join(
@@ -2557,6 +2559,7 @@ def test_glm_upstream_goal_scores_all_cases_equally():
     assert score["geometric_mean_direct_over_upstream"] == pytest.approx(0.6 * 1.6**0.5)
     assert score["speedup"] == pytest.approx(1 / (0.6 * 1.6**0.5))
     assert score["meets_target"]
+    assert not glm.upstream_decode_score(records, target_ratio=0.5)["meets_target"]
     with pytest.raises(ValueError, match="all 24"):
         glm.upstream_decode_score(records[:-1])
     records[-1]["paired_ratios"]["direct_over_upstream"]["samples"][-1] = float("nan")
@@ -2615,3 +2618,40 @@ def test_glm_upstream_geometry_is_bound_to_combine_artifact_scope():
         payload["cases"][0]["fixture"].pop("direct_combine_columns")
         with pytest.raises(RuntimeError, match="geometry"):
             glm.validate_timing(payload)
+
+
+def test_glm_upstream_wgmma_timing_requires_candidate_geometry_and_score():
+    import copy
+
+    payload = _glm_upstream_payload()
+    payload["direct_candidate"] = upstream.WGMMA_CANDIDATE
+    payload["source"]["compiled_build"] = {
+        "glm_compile": {"decode_combine": {"66x128": {}, "33x512": {}}},
+        "upstream_compile": {"decode_wgmma": {str(b): {} for b in (8, 16, 24, 32, 64)}},
+    }
+    for row in payload["cases"]:
+        batch = row["case"]["queries"]
+        fixture = row["fixture"]
+        fixture["direct_combine_columns"] = 128 if batch == 1 else 512
+        if batch != 1:
+            inner, groups = {
+                8: (1, 33), 16: (2, 17), 24: (3, 11), 32: (4, 9), 64: (8, 5)
+            }[batch]
+            fixture["path_geometry"]["direct"] = dict(
+                tile_rows=64, inner_iter=inner, partial_groups=groups
+            )
+    payload["upstream_decode_score"] = glm.upstream_decode_score(
+        payload["cases"], target_ratio=0.5
+    )
+    glm.validate_timing(payload)
+    for field in ("identity", "geometry", "score"):
+        bad = copy.deepcopy(payload)
+        if field == "identity":
+            bad.pop("direct_candidate")
+        elif field == "geometry":
+            bad["cases"][4]["fixture"]["path_geometry"]["direct"]["tile_rows"] = 32
+        else:
+            score = bad["upstream_decode_score"]
+            score["meets_target"] = not score["meets_target"]
+        with pytest.raises(RuntimeError, match=field):
+            glm.validate_timing(bad)

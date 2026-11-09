@@ -1523,9 +1523,8 @@ def sparse_mla_fwd_decode_partial_fp8(
     },
 )
 def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
-    """Hopper decode with a shared PV buffer reused by two feature halves."""
+    """Hopper experiment with one warpgroup and 64 selected rows per tile."""
     heads, dim, topk, rows = 16, 512, 2112, 64
-    half = dim // 2
     tile_count = topk // rows
     groups = (tile_count + inner_iter - 1) // inner_iter
     log2_scale = sm_scale * 1.44269504
@@ -1550,12 +1549,11 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             T.import_source(source)
             q = T.alloc_shared([heads, dim], fp8)
             kv = T.alloc_shared([rows, dim], fp8)
-            v_t = T.alloc_shared([half, rows], fp8)
+            v_t = T.alloc_shared([dim, rows], fp8)
             p = T.alloc_shared([heads, rows], fp8)
             scratch = T.alloc_shared([32, 272], T.uint8)
             scores = T.alloc_fragment([rows, heads], T.float32)
-            numerator_left = T.alloc_fragment([half, heads], T.float32)
-            numerator_right = T.alloc_fragment([half, heads], T.float32)
+            numerator = T.alloc_fragment([dim, heads], T.float32)
             maximum = T.alloc_fragment([heads], T.float32)
             previous = T.alloc_fragment([heads], T.float32)
             alpha = T.alloc_fragment([heads], T.float32)
@@ -1565,8 +1563,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
 
             T.annotate_layout({kv: tilelang.layout.make_full_bank_swizzled_layout(kv)})
             T.copy(q_fp8[0, query, :, :], q)
-            T.fill(numerator_left, 0)
-            T.fill(numerator_right, 0)
+            T.fill(numerator, 0)
             T.fill(maximum, -(2**30))
             T.fill(denominator, 0)
 
@@ -1602,12 +1599,12 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.fence_proxy_async()
                 T.sync_threads()
                 # K @ Q^T puts 64 selected rows on the warpgroup M axis.
-                # Stage the left half of V while QK reads the same K tile.
+                # V's transpose reads the same tile while QK is in flight.
                 T.wgmma_gemm(kv, q, scores, transpose_B=True, clear_accum=True)
                 T.evaluate(
                     T.call_extern(
                         "int32",
-                        "remnant_glm_transpose_wgmma_tile<256, 0>",
+                        "remnant_glm_transpose_wgmma_tile",
                         T.access_ptr(kv, "r"),
                         T.access_ptr(v_t, "w"),
                     )
@@ -1633,38 +1630,17 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.reduce_sum(scores, tile_sum, dim=0, batch=4)
                 for head in T.Parallel(heads):
                     denominator[head] = denominator[head] * alpha[head] + tile_sum[head]
-                for column, head in T.Parallel(half, heads):
-                    numerator_left[column, head] *= alpha[head]
-                    numerator_right[column, head] *= alpha[head]
+                for column, head in T.Parallel(dim, heads):
+                    numerator[column, head] *= alpha[head]
 
                 # V^T @ P^T keeps both FP8 operands contiguous in K.
                 # Leave the constant probability scale in the FP32 numerator
                 # until the final normalization to avoid a second fragment.
                 T.fence_proxy_async()
                 T.sync_threads()
-                T.wgmma_gemm(v_t, p, numerator_left, transpose_B=True)
+                T.wgmma_gemm(v_t, p, numerator, transpose_B=True)
                 T.warpgroup_wait(0)
-                T.warpgroup_fence_operand(
-                    numerator_left, num_regs=half * heads // 128
-                )
-                # The completed PV releases V for the right half. Its
-                # probabilities and the expanded K remain live and unchanged.
-                T.sync_threads()
-                T.evaluate(
-                    T.call_extern(
-                        "int32",
-                        "remnant_glm_transpose_wgmma_tile<256, 256>",
-                        T.access_ptr(kv, "r"),
-                        T.access_ptr(v_t, "w"),
-                    )
-                )
-                T.fence_proxy_async()
-                T.sync_threads()
-                T.wgmma_gemm(v_t, p, numerator_right, transpose_B=True)
-                T.warpgroup_wait(0)
-                T.warpgroup_fence_operand(
-                    numerator_right, num_regs=half * heads // 128
-                )
+                T.warpgroup_fence_operand(numerator, num_regs=dim * heads // 128)
 
             for head in T.Parallel(heads):
                 alpha[head] = T.if_then_else(
@@ -1675,12 +1651,9 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                     T.log2(denominator[head]) + maximum[head] * log2_scale,
                     -(2**30),
                 )
-            for column, head in T.Parallel(half, heads):
+            for column, head in T.Parallel(dim, heads):
                 partial_o[0, query, group, head, column] = (
-                    numerator_left[column, head] * alpha[head]
-                )
-                partial_o[0, query, group, head, column + half] = (
-                    numerator_right[column, head] * alpha[head]
+                    numerator[column, head] * alpha[head]
                 )
 
     return main.with_attr("global_symbol", "glm_packed_partial_wgmma")
