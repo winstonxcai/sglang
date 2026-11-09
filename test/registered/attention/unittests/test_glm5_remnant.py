@@ -926,7 +926,6 @@ def test_decode_bank_graph(heads, inner, record_property):
 def test_packed_loader_bytes():
     import numpy as np
 
-    probe = packed_loader_probe()
     # 256 * index crosses signed 32-bit at index 8388608.
     slots = 8388610
     values = torch.empty(slots, 256, dtype=torch.uint8, device="cuda")
@@ -967,9 +966,31 @@ def test_packed_loader_bytes():
                 if rank < 256:
                     expected[row, j] = host_values[src, rank]
                 rank += 1
-    actual = probe(slots)(values, bitmap, torch.from_numpy(host_ids).cuda())
-    torch.cuda.synchronize()
-    assert np.array_equal(actual.cpu().numpy(), expected)
+    ids = torch.from_numpy(host_ids).cuda()
+    variants = (
+        (False, True) if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1" else (False,)
+    )
+    for use_rank_table in variants:
+        probe = packed_loader_probe(use_rank_table=use_rank_table)(slots)
+        if use_rank_table:
+            manifest = json.loads(
+                Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text()
+            )
+            library = Path(probe.adapter.libpath)
+            source = library.with_name("device_kernel.cu")
+            entry = manifest["scope_symbol_audit"]["probe_sources"][str(source)]
+            assert entry["symbol"] == "glm_packed_bytes_rank_table_kernel"
+            assert (
+                hashlib.sha256(probe.get_kernel_source().encode()).hexdigest()
+                == entry["sha256"]
+            )
+            assert (
+                hashlib.sha256(library.read_bytes()).hexdigest()
+                == manifest["cache_files"][str(library)]
+            )
+        actual = probe(values, bitmap, ids)
+        torch.cuda.synchronize()
+        assert np.array_equal(actual.cpu().numpy(), expected), use_rank_table
     # Do not carry the >2 GiB address probe's cached allocation into graph tools.
     del actual, values, bitmap
     torch.cuda.synchronize()

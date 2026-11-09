@@ -109,10 +109,10 @@ def load_baseline():
 
 def wgmma_shared_ranges(source: str) -> dict[str, tuple[int, int]]:
     """Read the generated allocation offsets and reject asynchronous aliases."""
-    sizes = dict(q=16 * 512, kv=64 * 512, p=16 * 64, scratch=32 * 272)
+    sizes = dict(q=16 * 512, kv=64 * 512, p=16 * 64, scratch=32 * 272, rank_table=64)
     offsets = dict(
         re.findall(
-            r"void\* (q|kv|v_t|p|scratch) = .*buf_dyn_shmem \+ (\d+)\)\);",
+            r"void\* (q|kv|v_t|p|scratch|rank_table) = .*buf_dyn_shmem \+ (\d+)\)\);",
             source,
         )
     )
@@ -204,7 +204,7 @@ def precompile() -> dict:
         shared_ranges = wgmma_shared_ranges(partial)
         loader = next(
             (line.strip() for line in partial.splitlines()
-             if "remnant_glm_expand_wide_tile<64, true>(" in line),
+             if "remnant_glm_expand_wide_tile<64, true, true>(" in line),
             None,
         )
         if loader is None:
@@ -253,6 +253,7 @@ def precompile() -> dict:
             matrix_store_sites=matrix_stores,
             local_sites=local_sites,
             pv_operand="register",
+            bitmap_selector="shared_nibble_table",
             loader_call=loader,
             shared_ranges=shared_ranges,
             dynamic_shared_bytes=dynamic_shared,

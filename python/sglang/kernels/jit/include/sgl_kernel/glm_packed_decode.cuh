@@ -24,8 +24,27 @@ __device__ __forceinline__ uint32_t glm_expand4(uint32_t a, uint32_t b, uint32_t
   asm("prmt.b32 %0, %1, %2, 0xba98;" : "=r"(bytes) : "r"(signs), "r"(0u));
   return __byte_perm(a, b, selectors) & bytes;
 }
-template <bool Prefill>
-__device__ __forceinline__ uint2 glm_expand8(const uint8_t* row, int rank, uint32_t mask) {
+// A PRMT selector of four reads from the second operand, which is zero.
+// Use one 32-bit shared word per mask so distinct nibbles use distinct banks.
+__device__ __forceinline__ int remnant_glm_init_rank_table(uint32_t* table) {
+  const unsigned int mask = threadIdx.x;
+  if (mask < 16) {
+    uint32_t selector = 0;
+    uint32_t rank = 0;
+#pragma unroll
+    for (int coordinate = 0; coordinate < 4; ++coordinate) {
+      const uint32_t keep = (mask >> (3 - coordinate)) & 1;
+      selector |= (keep ? rank : 4) << (4 * coordinate);
+      rank += keep;
+    }
+    table[mask] = selector;
+  }
+  return 0;
+}
+
+template <bool Prefill, bool UseRankTable = false>
+__device__ __forceinline__ uint2 glm_expand8(
+    const uint8_t* row, int rank, uint32_t mask, const uint32_t* rank_table) {
   // Sixteen zero padding bytes make the aligned window reads safe even for
   // empty/malformed bitmaps. Clamp also preserves zero for rank >= 256.
   rank = min(rank, 256);
@@ -48,6 +67,14 @@ __device__ __forceinline__ uint2 glm_expand8(const uint8_t* row, int rank, uint3
   uint32_t shift = (rank & 3) * 8;
   uint32_t lo = __funnelshift_r(w0, w1, shift);
   uint32_t hi = __funnelshift_r(w1, w2, shift);
+  if constexpr (UseRankTable) {
+    const uint32_t upper = mask >> 4;
+    // Clamp the shift at 32 so a full upper nibble selects hi verbatim.
+    const uint32_t second = __funnelshift_rc(lo, hi, __popc(upper) * 8);
+    return uint2{
+        __byte_perm(lo, 0, rank_table[upper]),
+        __byte_perm(second, 0, rank_table[mask & 15])};
+  }
   // The upper bitmap nibble describes the first four output coordinates.
   // The second four start after popcount(upper), added to each selector nibble.
   const uint32_t second_base = __popc(mask >> 4) * 0x1111u;
@@ -66,7 +93,7 @@ __device__ __forceinline__ uint2 glm_expand8(const uint8_t* row, int rank, uint3
   return uint2{glm_expand4<Prefill>(lo, hi, selectors >> 16, mask >> 4), glm_expand4<Prefill>(lo, hi, selectors & 0xffff, mask & 15)};
 }
 
-template <bool Prefill = false, bool GlobalIndices = false>
+template <bool Prefill = false, bool GlobalIndices = false, bool UseRankTable = false>
 __device__ __forceinline__ int remnant_glm_expand_tile(
     const void* values_raw,
     const uint64_t* bitmap,
@@ -77,7 +104,8 @@ __device__ __forceinline__ int remnant_glm_expand_tile(
     void* tile2,
     void* tile3,
     int64_t slots,
-    int64_t index_offset = 0) {
+    int64_t index_offset = 0,
+    const uint32_t* rank_table = nullptr) {
   const int row = threadIdx.x / 4, part = threadIdx.x % 4;
   const int32_t* row_index = indices + index_offset + row;
   // Aligned prefill reads immutable global indices. Other callers stage
@@ -152,9 +180,11 @@ __device__ __forceinline__ int remnant_glm_expand_tile(
       rank += __popcll(word >> (64 - offset));
     }
     const uint32_t bits = static_cast<uint32_t>(word >> (48 - offset)) & 0xffff;
-    const uint2 a = glm_expand8<Prefill>(scratch, rank, bits >> 8);
+    const uint2 a =
+        glm_expand8<Prefill, UseRankTable>(scratch, rank, bits >> 8, rank_table);
     const int second_rank = rank + __popc(bits >> 8);
-    const uint2 b = glm_expand8<Prefill>(scratch, second_rank, bits & 255);
+    const uint2 b = glm_expand8<Prefill, UseRankTable>(
+        scratch, second_rank, bits & 255, rank_table);
     const int j = fragment * 16;
     // Native's inferred 128-byte-row XOR layout; explicitly annotated in TIR.
     *reinterpret_cast<uint4*>(tile + row * 128 + (j ^ ((row & 7) << 4))) = uint4{a.x, a.y, b.x, b.y};
@@ -164,7 +194,7 @@ __device__ __forceinline__ int remnant_glm_expand_tile(
 
 
 // Rows are staged in 32-row waves. The swizzle repeats every eight rows.
-template <int Rows, bool GlobalIndices = false>
+template <int Rows, bool GlobalIndices = false, bool UseRankTable = false>
 __device__ __forceinline__ int remnant_glm_expand_wide_tile(
     const void* values,
     const uint64_t* bitmap,
@@ -175,17 +205,18 @@ __device__ __forceinline__ int remnant_glm_expand_wide_tile(
     void* tile2,
     void* tile3,
     int64_t slots,
-    int64_t index_offset = 0) {
+    int64_t index_offset = 0,
+    const uint32_t* rank_table = nullptr) {
 #pragma unroll
   for (int first = 0; first < Rows; first += 32) {
     if (first != 0) __syncwarp();
     const int offset = first * 128;
-    remnant_glm_expand_tile<true, GlobalIndices>(
+    remnant_glm_expand_tile<true, GlobalIndices, UseRankTable>(
         values, bitmap, indices + index_offset + first, scratch,
         static_cast<uint8_t*>(tile0) + offset,
         static_cast<uint8_t*>(tile1) + offset,
         static_cast<uint8_t*>(tile2) + offset,
-        static_cast<uint8_t*>(tile3) + offset, slots);
+        static_cast<uint8_t*>(tile3) + offset, slots, 0, rank_table);
   }
   return 0;
 }

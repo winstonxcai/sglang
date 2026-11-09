@@ -2435,7 +2435,7 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
 
 
 def test_glm_wgmma_shared_ranges_reject_async_operand_aliases():
-    offsets = dict(q=0, kv=8192, scratch=40960, p=49664)
+    offsets = dict(q=0, kv=8192, scratch=40960, p=49664, rank_table=50688)
 
     def generated() -> str:
         return "\n".join(
@@ -2444,7 +2444,7 @@ def test_glm_wgmma_shared_ranges_reject_async_operand_aliases():
         )
 
     assert upstream.wgmma_shared_ranges(generated())["kv"] == (8192, 40960)
-    offsets["v_t"] = 50688
+    offsets["v_t"] = 50752
     with pytest.raises(RuntimeError, match="Cannot verify WGMMA shared-memory offsets"):
         upstream.wgmma_shared_ranges(generated())
     del offsets["v_t"]
