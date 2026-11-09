@@ -1619,7 +1619,9 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                         valid[row], scores[row, head], -T.infinity(T.float32)
                     )
                 T.copy(maximum, previous)
-                T.reduce_max(scores, maximum, dim=0, clear=False)
+                # Each lane owns four heads in the m64n16 accumulator layout.
+                # Batch their reductions to share the CTA barriers.
+                T.reduce_max(scores, maximum, dim=0, clear=False, batch=4)
                 for head in T.Parallel(heads):
                     alpha[head] = T.exp2((previous[head] - maximum[head]) * log2_scale)
                 for row, head in T.Parallel(rows, heads):
@@ -1627,7 +1629,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                         scores[row, head] * log2_scale - maximum[head] * log2_scale
                     )
                     p[head, row] = scores[row, head] * 448.0
-                T.reduce_sum(scores, tile_sum, dim=0)
+                T.reduce_sum(scores, tile_sum, dim=0, batch=4)
                 for head in T.Parallel(heads):
                     denominator[head] = denominator[head] * alpha[head] + tile_sum[head]
                 for column, head in T.Parallel(dim, heads):
