@@ -1518,7 +1518,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     pass_configs={
         **pass_configs,
         # WGMMA still reads Q and KV after TileLang's synchronous liveness
-        # analysis sees their final access. Keep the transpose disjoint.
+        # analysis sees their final access. Keep the operands disjoint.
         tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
     },
 )
@@ -1531,10 +1531,11 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
     seq_len = T.symbolic("seq_len")
     num_pages = T.symbolic("num_pages")
     fp8 = "float8_e4m3fn"
-    source = (
-        Path(__file__).resolve().parents[3]
-        / "jit/include/sgl_kernel/glm_packed_decode.cuh"
-    ).read_text()
+    include = Path(__file__).resolve().parents[3] / "jit/include/sgl_kernel"
+    source = "\n".join(
+        (include / header).read_text()
+        for header in ("glm_packed_decode.cuh", "glm_wgmma_pv.cuh")
+    )
 
     @T.prim_func
     def main(
@@ -1549,7 +1550,6 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             T.import_source(source)
             q = T.alloc_shared([heads, dim], fp8)
             kv = T.alloc_shared([rows, dim], fp8)
-            v_t = T.alloc_shared([dim, rows], fp8)
             p = T.alloc_shared([heads, rows], fp8)
             scratch = T.alloc_shared([32, 272], T.uint8)
             scores = T.alloc_fragment([rows, heads], T.float32)
@@ -1561,7 +1561,28 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             denominator = T.alloc_fragment([heads], T.float32)
             valid = T.alloc_fragment([rows], T.bool)
 
-            T.annotate_layout({kv: tilelang.layout.make_full_bank_swizzled_layout(kv)})
+            T.annotate_layout(
+                {
+                    kv: tilelang.layout.make_full_bank_swizzled_layout(kv),
+                    p: tilelang.layout.make_half_bank_swizzled_layout(p),
+                    # The register source maps hardware rows r and r+8 to
+                    # adjacent logical features 2r and 2r+1 within each warp.
+                    numerator: T.Fragment(
+                        [dim, heads],
+                        forward_thread_fn=lambda column, head: (
+                            (column % 64 // 16) * 32
+                            + (column % 16 // 2) * 4
+                            + head % 8 // 2
+                        ),
+                        forward_index_fn=lambda column, head: (
+                            (column // 64) * 8
+                            + (head // 8) * 4
+                            + (column % 2) * 2
+                            + head % 2
+                        ),
+                    ),
+                }
+            )
             T.copy(q_fp8[0, query, :, :], q)
             T.fill(numerator, 0)
             T.fill(maximum, -(2**30))
@@ -1599,16 +1620,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.fence_proxy_async()
                 T.sync_threads()
                 # K @ Q^T puts 64 selected rows on the warpgroup M axis.
-                # V's transpose reads the same tile while QK is in flight.
                 T.wgmma_gemm(kv, q, scores, transpose_B=True, clear_accum=True)
-                T.evaluate(
-                    T.call_extern(
-                        "int32",
-                        "remnant_glm_transpose_wgmma_tile",
-                        T.access_ptr(kv, "r"),
-                        T.access_ptr(v_t, "w"),
-                    )
-                )
                 T.warpgroup_wait(0)
                 T.warpgroup_fence_operand(scores, num_regs=rows * heads // 128)
 
@@ -1633,14 +1645,19 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 for column, head in T.Parallel(dim, heads):
                     numerator[column, head] *= alpha[head]
 
-                # V^T @ P^T keeps both FP8 operands contiguous in K.
-                # Leave the constant probability scale in the FP32 numerator
-                # until the final normalization to avoid a second fragment.
+                # Consume KV directly from the same tile. The helper waits
+                # for its register-fed PV batches before returning.
                 T.fence_proxy_async()
                 T.sync_threads()
-                T.wgmma_gemm(v_t, p, numerator, transpose_B=True)
-                T.warpgroup_wait(0)
-                T.warpgroup_fence_operand(numerator, num_regs=dim * heads // 128)
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_wgmma_pv_registers",
+                        T.access_ptr(kv, "r"),
+                        T.access_ptr(p, "r"),
+                        T.access_ptr(numerator[0, 0], "rw", extent=dim * heads // 128),
+                    )
+                )
 
             for head in T.Parallel(heads):
                 alpha[head] = T.if_then_else(

@@ -109,7 +109,7 @@ def load_baseline():
 
 def wgmma_shared_ranges(source: str) -> dict[str, tuple[int, int]]:
     """Read the generated allocation offsets and reject asynchronous aliases."""
-    sizes = dict(q=16 * 512, kv=64 * 512, v_t=512 * 64, p=16 * 64, scratch=32 * 272)
+    sizes = dict(q=16 * 512, kv=64 * 512, p=16 * 64, scratch=32 * 272)
     offsets = dict(
         re.findall(
             r"void\* (q|kv|v_t|p|scratch) = .*buf_dyn_shmem \+ (\d+)\)\);",
@@ -221,12 +221,13 @@ def precompile() -> dict:
             raise RuntimeError(f"WGMMA partial emitted {barriers} CTA barriers: {batch=}")
         matrix_loads = len(re.findall(r"\bLDSM\.", sass))
         matrix_stores = len(re.findall(r"\bSTSM\.", sass))
-        if (matrix_loads, matrix_stores) != (16, 16):
-            raise RuntimeError(f"Unexpected WGMMA transpose instruction count: {batch=}")
-        if not re.search(r"initialize_wgmma_descriptor<2, 1, 32>[^\n]*v_t", partial):
-            raise RuntimeError(f"WGMMA transpose destination must use SW64: {batch=}")
-        if len(re.findall(r"^\s*remnant_glm_transpose_wgmma_tile\(", partial, re.M)) != 1:
-            raise RuntimeError(f"Missing single full-V transpose: {batch=}")
+        if (matrix_loads, matrix_stores) != (16, 0):
+            raise RuntimeError(f"Unexpected register PV matrix instructions: {batch=}")
+        if len(re.findall(r"^\s*remnant_glm_wgmma_pv_registers\(", partial, re.M)) != 1:
+            raise RuntimeError(f"Missing register PV call: {batch=}")
+        local_sites = len(re.findall(r"\b(?:LDL|STL)\b", sass))
+        if local_sites:
+            raise RuntimeError(f"Register PV generated local-memory traffic: {batch=}")
         host = Path(variant["library_path"]).with_name("host_kernel.cu").read_text()
         dynamic_shared = dynamic_shared_bytes(host)
         symbol = "glm_packed_partial_wgmma_kernel"
@@ -250,7 +251,8 @@ def precompile() -> dict:
             cta_barrier_sites=barriers,
             matrix_load_sites=matrix_loads,
             matrix_store_sites=matrix_stores,
-            local_sites=len(re.findall(r"\b(?:LDL|STL)\b", sass)),
+            local_sites=local_sites,
+            pv_operand="register",
             loader_call=loader,
             shared_ranges=shared_ranges,
             dynamic_shared_bytes=dynamic_shared,

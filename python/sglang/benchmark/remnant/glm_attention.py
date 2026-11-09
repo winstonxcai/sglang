@@ -785,6 +785,7 @@ def runtime_hashes(root: Path) -> dict[str, str]:
     paths = (
         "kernels/ops/attention/dsa/tilelang_kernel.py",
         "kernels/jit/include/sgl_kernel/glm_packed_decode.cuh",
+        "kernels/jit/include/sgl_kernel/glm_wgmma_pv.cuh",
         "srt/remnant/glm.py",
         "srt/remnant/glm_pool.py",
         "srt/remnant/reference.py",
