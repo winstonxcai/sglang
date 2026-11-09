@@ -793,6 +793,7 @@ def _benchmark_bank_graph(
     f = Fixture.__new__(Fixture)
     f.case = Case(phase, heads, queries, 3, "independent", "rotating")
     f.packed_prefill_tile = 32
+    f.wgmma_kernels = None
     f.deadline = time.monotonic() + 1200
     f.banks, f.memory_limit = (
         banks,
