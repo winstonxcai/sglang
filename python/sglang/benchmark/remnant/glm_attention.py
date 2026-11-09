@@ -487,7 +487,22 @@ class Fixture:
             first_query_sequence_length=HISTORY + (4 if case.tail == 0 else 3),
         )
         if upstream:
-            self.identity["direct_combine_columns"] = 128 if case.queries == 1 else 512
+            from sglang.benchmark.remnant.glm_artifacts import (
+                verify_decode_combine_library,
+            )
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                glm_packed_decode_combine,
+            )
+
+            columns = 128 if case.queries == 1 else 512
+            groups = 66 // inner
+            manifest = json.loads(
+                Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text()
+            )
+            variant = manifest["decode_combine"][f"{groups}x{columns}"]
+            combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
+            verify_decode_combine_library(combine, variant)
+            self.identity["direct_combine_columns"] = columns
         self.graphs = {}
         self.outputs = {}
         self.validate()
@@ -1245,6 +1260,10 @@ def main() -> None:
             or not variant.get("cubin_sha256")
             or compile_manifest["cache_files"].get(variant["cubin_path"])
             != variant["cubin_sha256"]
+            or not variant.get("library_path")
+            or not variant.get("library_sha256")
+            or compile_manifest["cache_files"].get(variant["library_path"])
+            != variant["library_sha256"]
             for variant in combines.values()
         ):
             raise RuntimeError("Missing CPU-prepared Packed decode combine cubins")
