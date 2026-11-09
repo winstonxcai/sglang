@@ -173,10 +173,7 @@ def precompile() -> dict:
         groups = (33 + inner - 1) // inner
         partial = glm_packed_wgmma_partial(inner, 256**-0.5)
         combine = glm_packed_decode_combine(16, 512, groups, 512)
-        wgmma[str(batch)] = (
-            partial.get_kernel_source(),
-            combine.get_kernel_source(),
-        )
+        wgmma[str(batch)] = partial, combine
     compiled = dict(
         source=identity(),
         tilelang=variants,
@@ -190,8 +187,9 @@ def precompile() -> dict:
     bind_partial_launch_metadata(compiled)
     artifacts = compiled["cache_files"]
     compiled["decode_wgmma"] = {}
-    for batch, (partial, combine) in wgmma.items():
-        variant = bind_decode_library(partial, artifacts)
+    for batch, (partial_kernel, combine) in wgmma.items():
+        partial = partial_kernel.get_kernel_source()
+        variant = bind_decode_library(partial_kernel, artifacts)
         shared_ranges = wgmma_shared_ranges(partial)
         loader = next(
             (line.strip() for line in partial.splitlines()

@@ -2447,6 +2447,39 @@ def test_glm_wgmma_shared_ranges_reject_async_operand_aliases():
         upstream.wgmma_shared_ranges(generated())
 
 
+def test_glm_decode_cache_binding_uses_exact_wrapper_entry(tmp_path, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+
+    artifacts = load_module(
+        "_glm_decode_artifact_contract",
+        ROOT / "python/sglang/benchmark/remnant/glm_artifacts.py",
+    )
+    device, host = "device program", "selected host wrapper"
+    entry, stale = tmp_path / "selected", tmp_path / "stale"
+    cubin = tmp_path / "device.cubin"
+    cache = {
+        str(entry / "device_kernel.cu"): hashlib.sha256(device.encode()).hexdigest(),
+        str(stale / "device_kernel.cu"): hashlib.sha256(device.encode()).hexdigest(),
+        str(entry / "host_kernel.cu"): hashlib.sha256(host.encode()).hexdigest(),
+        str(entry / "executable.so"): "selected binary",
+        str(stale / "executable.so"): "old binary",
+        str(cubin): "cubin",
+    }
+    monkeypatch.setattr(artifacts, "_verified_sm90_cubin", lambda *_: cubin)
+    kernel = SimpleNamespace(
+        _tilelang_cache_path=entry,
+        get_kernel_source=lambda: device,
+        adapter=SimpleNamespace(get_host_source=lambda: host),
+    )
+    assert artifacts.bind_decode_library(kernel, cache)["library_path"] == str(
+        entry / "executable.so"
+    )
+    kernel._tilelang_cache_path = stale
+    with pytest.raises(RuntimeError, match="does not match"):
+        artifacts.bind_decode_library(kernel, cache)
+
+
 def _glm_upstream_payload():
     payload = _glm_complete_timing_payload()
     payload.update(

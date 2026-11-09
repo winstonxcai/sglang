@@ -216,10 +216,8 @@ def precompile_sm90() -> None:
         glm_packed_decode_combine,
     )
 
-    combine_sources = {
-        f"{groups}x{columns}": glm_packed_decode_combine(
-            16, 512, groups, columns
-        ).get_kernel_source()
+    combines = {
+        f"{groups}x{columns}": glm_packed_decode_combine(16, 512, groups, columns)
         for groups, columns in H200_PACKED_DECODE_COMBINE
     }
     artifacts["cache_files"] = {
@@ -232,8 +230,8 @@ def precompile_sm90() -> None:
         if path.is_file()
     }
     artifacts["decode_combine"] = {
-        geometry: bind_decode_library(source, artifacts["cache_files"])
-        for geometry, source in combine_sources.items()
+        geometry: bind_decode_library(kernel, artifacts["cache_files"])
+        for geometry, kernel in combines.items()
     }
     bind_partial_launch_metadata(artifacts)
     Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).write_text(
@@ -241,19 +239,27 @@ def precompile_sm90() -> None:
     )
 
 
-def bind_decode_library(source: str, cache: dict[str, str]) -> dict[str, str]:
+def bind_decode_library(kernel, cache: dict[str, str]) -> dict[str, str]:
     """Record the CPU cubin and TVM FFI library for a generated decode kernel."""
+    source = kernel.get_kernel_source()
     digest = hashlib.sha256(source.encode()).hexdigest()
-    libraries = [
-        str(Path(path).with_name("executable.so"))
-        for path, value in cache.items()
-        if path.endswith("/device_kernel.cu") and value == digest
-    ]
-    libraries = [name for name in libraries if name in cache]
-    if len(libraries) != 1:
-        raise RuntimeError(f"Expected one cached GLM decode library: {digest}")
+    # TileLang v0.1.12 tags the persistent cache entry on a cold compile,
+    # when the adapter may only hold an in-memory runtime module.
+    # Distinct wrappers can legitimately share the same generated device code.
+    cache_path = getattr(kernel, "_tilelang_cache_path", None)
+    if not cache_path:
+        raise RuntimeError(f"Missing GLM decode cache entry: {digest}")
+    entry = Path(cache_path)
+    library = str(entry / "executable.so")
+    host = kernel.adapter.get_host_source()
+    if (
+        cache.get(str(entry / "device_kernel.cu")) != digest
+        or not host
+        or cache.get(str(entry / "host_kernel.cu")) != hashlib.sha256(host.encode()).hexdigest()
+        or library not in cache
+    ):
+        raise RuntimeError(f"GLM decode cache entry does not match the compilation: {entry}")
     cubin = str(_verified_sm90_cubin(source, cache))
-    library = libraries[0]
     return dict(
         source_sha256=digest,
         cubin_path=cubin,
