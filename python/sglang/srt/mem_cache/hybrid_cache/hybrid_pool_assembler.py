@@ -1,5 +1,4 @@
 from __future__ import annotations
-from sglang.srt.mem_cache.memory_pool_host import RemnantPackedHostPool
 
 import logging
 from dataclasses import dataclass, field
@@ -24,6 +23,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     LogicalHostPool,
+    RemnantPackedHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type

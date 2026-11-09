@@ -16,11 +16,13 @@ from sglang.srt.remnant.reference import (
     topmag_keep_mask,
     unpack_rows_ref,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestRemnantPack(CustomTestCase):
-
     def tearDown(self):
         remnant.configure_cache_format("native")
 
@@ -146,8 +148,9 @@ class TestRemnantPack(CustomTestCase):
         # Only effective C4 counts govern dispatch: every C4 layer is 256 here.
         ratios = (0, 128, 4, 128, 4)
         args = SimpleNamespace(
-            dsv4_c4_cache_format="remnant",
-            dsv4_c4_cache_keep_count=192,
+            kv_cache_format="direct",
+            _kv_cache_model_family="dsv4",
+            dsv4_c4_cache_keep_count=256,
             dsv4_c4_cache_layer_keep_counts='{"2":256,"4":256}',
             _dsv4_c4_cache_compression_ratios=ratios,
         )

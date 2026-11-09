@@ -243,13 +243,18 @@ class ServerArgs:
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
 
-    def _configure_dsv4_c4_cache_format(self) -> None:
+    def _configure_cache_format(self) -> None:
         from sglang.srt import remnant
         from sglang.srt.arg_groups.overrides import declare_resolution
+        from sglang.srt.remnant.config import resolve_model_family
 
+        hf_config = model_config_of(self).hf_config
+        self._kv_cache_model_family = resolve_model_family(hf_config)
         cfg = resolving_view(self)
+        if cfg.kv_cache_format == "direct" and self._kv_cache_model_family == "unknown":
+            raise ValueError("--kv-cache-format direct requires a supported model")
         remnant.configure_from_args(cfg, publish=False)
-        if getattr(cfg, "dsv41_main_kv_cache_format", "auto") != "auto":
+        if self._kv_cache_model_family == "dsv41":
             from sglang.srt.runtime_context import get_platform
 
             hf_config = model_config_of(self).hf_config
@@ -268,16 +273,14 @@ class ServerArgs:
                 raise ValueError("Explicit V4.1 FP4 does not support DSpark")
             if not get_platform().is_sm90:
                 raise ValueError("Explicit V4.1 FP4 currently requires H100/SM90")
-        if cfg.dsv4_c4_cache_format != "remnant":
+        if self._kv_cache_model_family != "dsv4" or cfg.kv_cache_format != "direct":
             return
 
         from sglang.srt.configs.model_config import is_deepseek_v4
 
         hf_config = model_config_of(self).hf_config
         if not is_deepseek_v4(hf_config):
-            raise ValueError(
-                "--dsv4-c4-cache-format remnant requires a DeepSeek V4 model"
-            )
+            raise ValueError("--kv-cache-format direct requires a DeepSeek V4 model")
         ratios = getattr(hf_config, "compress_ratios", None)
         if ratios is None and (
             getattr(self, "dsv4_c4_cache_keep_count", 256) != 256
@@ -309,14 +312,14 @@ class ServerArgs:
             )
             declare_resolution(
                 self,
-                "_configure_dsv4_c4_cache_format",
+                "_configure_cache_format",
                 hicache_mem_layout="layer_first",
             )
         if cfg.enable_prefill_cp:
             incompatible.append("--enable-prefill-cp")
         if incompatible:
             raise ValueError(
-                "--dsv4-c4-cache-format remnant is incompatible with "
+                "--kv-cache-format direct is incompatible with "
                 + ", ".join(incompatible)
             )
 
@@ -417,6 +420,7 @@ class ServerArgs:
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
         "DeepseekV4ForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",

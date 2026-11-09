@@ -12,8 +12,8 @@ completed real work.
 import asyncio
 import json
 import socket
-import threading
 import tempfile
+import threading
 import time
 import unittest
 from argparse import Namespace
@@ -22,7 +22,6 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
-
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,

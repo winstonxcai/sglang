@@ -1,3 +1,4 @@
+# Remnant GLM changes. Author: Winston Cai.
 from __future__ import annotations
 
 import gc
@@ -2344,6 +2345,14 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
+        # Author: Winston Cai. Only hybrid full-attention layers change layout.
+        from sglang.srt.remnant.glm_config import enabled as glm_packed_enabled
+
+        if glm_packed_enabled():
+            from sglang.srt.remnant.glm_pool import GLMPackedTokenToKVPool
+
+            full_pool_class = GLMPackedTokenToKVPool
+
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )

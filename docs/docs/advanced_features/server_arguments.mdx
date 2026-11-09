@@ -208,6 +208,50 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+
+    {/* Author: Winston Cai. Remnant fork cache controls. */}
+    <tr>
+      <td>`--glm5-mla-cache-format`</td>
+      <td>GLM MLA persistent cache format. Native keeps the stock FP8 rows; remnant selects Packed 320-byte rows. This fork supports Packed on H100/SM90 with the FP8 TileLang DSA backend.</td>
+      <td>`native`</td>
+      <td>native, remnant</td>
+    </tr>
+    <tr>
+      <td>`--glm5-mla-cache-implementation`</td>
+      <td>GLM Packed reader. Adapter reconstructs rows before stock attention; Direct expands inside TileLang. Used with the remnant cache format.</td>
+      <td>`direct`</td>
+      <td>adapter, direct</td>
+    </tr>
+    <tr>
+      <td>`--dsv4-c4-cache-format`</td>
+      <td>DeepSeek V4 compressed C4 cache format. Native keeps the stock SGLang layout; remnant uses persistent Packed C4 records (328 bytes at the default 256 survivors).</td>
+      <td>`native`</td>
+      <td>native, remnant</td>
+    </tr>
+    <tr>
+      <td>`--dsv4-c4-cache-keep-count`</td>
+      <td>Packed C4 survivors per layer, from 64 to 448 in steps of 64. Non-256 profiles require Triton storage and reconstruction.</td>
+      <td>`256`</td>
+      <td>64, 128, 192, 256, 320, 384, 448</td>
+    </tr>
+    <tr>
+      <td>`--dsv4-c4-cache-layer-keep-counts`</td>
+      <td>Packed C4 overrides as JSON keyed by zero-based model layer ID.</td>
+      <td>`None`</td>
+      <td>JSON object</td>
+    </tr>
+    <tr>
+      <td>`--dsv4-c4-cache-implementation`</td>
+      <td>Implementation for the remnant C4 cache format. Triton uses explicit selection and Native-page reconstruction; kernel uses fused packing and optimized decode dispatch. Ignored for Native.</td>
+      <td>`kernel`</td>
+      <td>triton, kernel</td>
+    </tr>
+    <tr>
+      <td>`--dsv4-c4-cache-store-implementation`</td>
+      <td>Override Packed C4 storage independently of decode. Triton uses explicit selection plus packing; kernel uses fused selection and packing. If unset, follows the C4 cache implementation. Ignored for Native.</td>
+      <td>`None`</td>
+      <td>triton, kernel</td>
+    </tr>
 </tbody>
 </table>
 

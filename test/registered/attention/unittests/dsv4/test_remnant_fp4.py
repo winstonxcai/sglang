@@ -38,6 +38,39 @@ register_cuda_ci(
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Modal H100")
 RATIOS = [0] * 2 + [2] * 18 + [1] * 20
 SOURCES = (2, 8, 14, 20)
+# Independent expected ABI: serving mode, row bytes, pool layout, report label.
+_FP4_POOL_CASES = (
+    ("native", 288, "sm90_fp4", "Native"),
+    ("direct", 224, "sm90_remnant", "Packed"),
+)
+
+
+def _fp4_pool_configurator():
+    """Production sizing with the same model geometry in CPU and GPU checks."""
+    from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    metadata = SimpleNamespace(
+        qk_nope_head_dim=448,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        context_len=131072,
+        compress_ratios=RATIOS,
+        window_size=128,
+        hf_config=SimpleNamespace(kv_source_layer_ids=SOURCES),
+    )
+    return DSV4PoolConfigurator(
+        SimpleNamespace(
+            kv_cache_dtype_str="fp8_e4m3",
+            model_config=metadata,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=40),
+            pp_size=1,
+            attn_dp_size=1,
+            page_size=256,
+            sliding_window_size=128,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+    )
 
 
 def _oracle(x: torch.Tensor, packed: bool) -> tuple[torch.Tensor, torch.Tensor]:
@@ -87,10 +120,16 @@ def test_fp4_startup_contract(monkeypatch):
         monkeypatch.delenv(field.name, raising=False)
     monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL", raising=False)
     validate_v41_cache_args(SimpleNamespace())
-    for mode in ("fp4", "remnant"):
-        validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format=mode))
+    for mode in ("native", "direct"):
         validate_v41_cache_args(
-            SimpleNamespace(dsv41_main_kv_cache_format=mode, dsv4_attn_backend="auto")
+            SimpleNamespace(_kv_cache_model_family="dsv41", kv_cache_format=mode)
+        )
+        validate_v41_cache_args(
+            SimpleNamespace(
+                _kv_cache_model_family="dsv41",
+                kv_cache_format=mode,
+                dsv4_attn_backend="auto",
+            )
         )
         for cli in ("auto", "flashmla_sparse", "flashmla_sparse_q8"):
             for override in ("1", "true", "yes", "on"):
@@ -99,7 +138,9 @@ def test_fp4_startup_contract(monkeypatch):
                 with pytest.raises(ValueError, match="SGLANG_DSV4_Q8KV8_PREFILL"):
                     validate_v41_cache_args(
                         SimpleNamespace(
-                            dsv41_main_kv_cache_format=mode, dsv4_prefill_backend=cli
+                            _kv_cache_model_family="dsv41",
+                            kv_cache_format=mode,
+                            dsv4_prefill_backend=cli,
                         )
                     )
             for override in ("0", "false", "no", "off"):
@@ -107,12 +148,14 @@ def test_fp4_startup_contract(monkeypatch):
                 assert resolve_dsv4_prefill_backend(cli) == "flashmla_sparse"
                 validate_v41_cache_args(
                     SimpleNamespace(
-                        dsv41_main_kv_cache_format=mode, dsv4_prefill_backend=cli
+                        _kv_cache_model_family="dsv41",
+                            kv_cache_format=mode,
+                            dsv4_prefill_backend=cli,
                     )
                 )
             monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL")
             args = SimpleNamespace(
-                dsv41_main_kv_cache_format=mode, dsv4_prefill_backend=cli
+                _kv_cache_model_family="dsv41", kv_cache_format=mode, dsv4_prefill_backend=cli
             )
             if cli == "flashmla_sparse_q8":
                 with pytest.raises(ValueError, match="SGLANG_DSV4_Q8KV8_PREFILL"):
@@ -125,46 +168,75 @@ def test_fp4_startup_contract(monkeypatch):
         ):
             with field.override("auto"):
                 validate_v41_cache_args(
-                    SimpleNamespace(dsv41_main_kv_cache_format=mode)
+                    SimpleNamespace(
+                        _kv_cache_model_family="dsv41", kv_cache_format=mode
+                    )
                 )
             with field.override("v4"):
                 with pytest.raises(ValueError, match="legacy SGLANG_DSV4"):
                     validate_v41_cache_args(
-                        SimpleNamespace(dsv41_main_kv_cache_format=mode)
+                        SimpleNamespace(
+                            _kv_cache_model_family="dsv41", kv_cache_format=mode
+                        )
                     )
         for key, value in [
             ("enable_hierarchical_cache", True),
             ("speculative_algorithm", "DSpark"),
-            ("dsv4_c4_cache_format", "remnant"),
             ("dsv4_c4_cache_keep_count", 192),
             ("disaggregation_mode", "decode"),
             ("enable_encoder_swa_bounded_replay", True),
         ]:
             with pytest.raises(ValueError, match=key):
                 validate_v41_cache_args(
-                    SimpleNamespace(dsv41_main_kv_cache_format=mode, **{key: value})
+                    SimpleNamespace(
+                        _kv_cache_model_family="dsv41",
+                        kv_cache_format=mode,
+                        **{key: value},
+                    )
                 )
     with pytest.raises(ValueError):
-        validate_v41_cache_args(SimpleNamespace(dsv41_main_kv_cache_format="fp8"))
+        validate_v41_cache_args(
+            SimpleNamespace(_kv_cache_model_family="dsv41", kv_cache_format="fp8")
+        )
     import argparse
 
-    from sglang.srt.runtime_context import get_context, get_model
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import select_dsv4_kv_layout
+    from sglang.srt.runtime_context import get_context, get_model, override_platform
     from sglang.srt.server_args import ServerArgs
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     args = ServerArgs.from_cli_args(
-        parser.parse_args(
-            ["--model", "dummy", "--dsv41-main-kv-cache-format", "remnant"]
-        )
+        parser.parse_args(["--model", "dummy", "--kv-cache-format", "direct"])
     )
-    assert args.dsv41_main_kv_cache_format == "remnant"
-    with get_context().override_server_args(dsv41_main_kv_cache_format="remnant"):
-        assert get_model().dsv41_main_kv_cache_format == "remnant"
+    assert args.kv_cache_format == "direct"
+    with get_context().override_server_args(
+        _kv_cache_model_family="dsv41", kv_cache_format="direct"
+    ):
+        assert get_model().kv_cache_format == "direct"
     assert KVLayout.V41_FP4.bytes_per_token == 288
     assert KVLayout.V41_FP4_REMNANT.bytes_per_token == 224
     for p in (128, 256):
         assert KVLayout.V41_FP4_REMNANT.page_bytes(p) == p * 224
+    # Exercise the actual selector and sizing before reserving a GPU. Only the
+    # platform fact is overridden; expected ABI widths remain independent.
+    for mode, row_bytes, layout, _ in _FP4_POOL_CASES:
+        with (
+            override_platform(is_sm90=True),
+            get_context().override_server_args(
+                device="cpu",
+                dsv4_attn_backend="flashmla",
+                page_size=256,
+                max_running_requests=8,
+                chunked_prefill_size=512,
+                _kv_cache_model_family="dsv41",
+                kv_cache_format=mode,
+            ),
+        ):
+            assert select_dsv4_kv_layout() == (KVLayout.V4, layout)
+            sizing = _fp4_pool_configurator()
+            assert sizing._compressed_bytes_per_full_token(1) == row_bytes + 68
+            assert sizing._compressed_bytes_per_full_token(2) == (row_bytes + 68) / 2
 
 
 @GPU
@@ -504,9 +576,7 @@ def test_fp4_pool_allocations(tmp_path):
         DeepSeekV4SingleKVPool,
         DeepSeekV4TokenToKVPool,
     )
-    from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
     from sglang.srt.runtime_context import get_context
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     direct_peaks = []
     for packed in (False, True):
@@ -582,37 +652,17 @@ def test_fp4_pool_allocations(tmp_path):
                         )
                     )
                     del pool
-    for mode in ("fp4", "remnant"):
+    for mode, record_bytes, layout, report_mode in _FP4_POOL_CASES:
         with get_context().override_server_args(
             device="cuda",
             dsv4_attn_backend="flashmla",
             page_size=256,
             max_running_requests=8,
             chunked_prefill_size=512,
-            dsv41_main_kv_cache_format=mode,
+            _kv_cache_model_family="dsv41",
+            kv_cache_format=mode,
         ):
-            metadata = SimpleNamespace(
-                qk_nope_head_dim=448,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                context_len=131072,
-                compress_ratios=RATIOS,
-                window_size=128,
-                hf_config=SimpleNamespace(kv_source_layer_ids=SOURCES),
-            )
-            sizing = DSV4PoolConfigurator(
-                SimpleNamespace(
-                    kv_cache_dtype_str="fp8_e4m3",
-                    model_config=metadata,
-                    layer_info=SimpleNamespace(start_layer=0, end_layer=40),
-                    pp_size=1,
-                    attn_dp_size=1,
-                    page_size=256,
-                    sliding_window_size=128,
-                    spec_algorithm=SpeculativeAlgorithm.NONE,
-                )
-            )
-            record_bytes = 288 if mode == "fp4" else 224
+            sizing = _fp4_pool_configurator()
             assert sizing._compressed_bytes_per_full_token(1) == record_bytes + 68
             assert sizing._compressed_bytes_per_full_token(2) == (record_bytes + 68) / 2
             workspace_bytes = 1024 * 512 * 2 + direct_workspace_bytes
@@ -642,7 +692,7 @@ def test_fp4_pool_allocations(tmp_path):
                 kv_source_layers=SOURCES,
                 full_size=full,
                 kv_layout=KVLayout.V4,
-                compressed_kv_layout="sm90_fp4" if mode == "fp4" else "sm90_remnant",
+                compressed_kv_layout=layout,
             )
             assert pool.kv_pools[2].layer_num == 3 and pool.kv_pools[1].layer_num == 1
             assert (
@@ -757,7 +807,7 @@ def test_fp4_pool_allocations(tmp_path):
             assert total_bytes + 256 * sizing.bytes_per_full_token > byte_budget
             report["modes"].append(
                 dict(
-                    mode="Native" if mode == "fp4" else "Packed",
+                    mode=report_mode,
                     groups=groups,
                     prefill_workspace_bytes=workspace.nbytes,
                     direct_workspace_bytes=direct_workspace.nbytes,
@@ -1146,7 +1196,7 @@ def test_fp4_backend_dispatch():
             )
             assert direct.call_args.args[3].shape[-1] == layout.bytes_per_token
 
-    for mode in ("auto", "fp4", "remnant"):
+    for family, mode in (("dsv4", "native"), ("dsv41", "native"), ("dsv41", "direct")):
         for ratio in (0, 1, 2):
             q = torch.ones((1, 1, 64, 512), dtype=torch.bfloat16)
             workspace = torch.zeros((2, 1, 512), dtype=torch.bfloat16)
@@ -1180,7 +1230,10 @@ def test_fp4_backend_dispatch():
                 mock.patch.object(
                     module,
                     "get_model",
-                    return_value=SimpleNamespace(dsv41_main_kv_cache_format=mode),
+                    return_value=SimpleNamespace(
+                        cache_model_family=family,
+                        kv_cache_format=mode,
+                    ),
                 ),
                 mock.patch.object(module, "dequantize_k_cache_paged"),
                 mock.patch.dict(
@@ -1202,8 +1255,8 @@ def test_fp4_backend_dispatch():
                     SimpleNamespace(),
                     torch.zeros(64),
                 )
-            (stock if mode == "auto" else fp4).assert_called_once()
-            (fp4 if mode == "auto" else stock).assert_not_called()
+            (stock if family == "dsv4" else fp4).assert_called_once()
+            (fp4 if family == "dsv4" else stock).assert_not_called()
 
 
 @GPU

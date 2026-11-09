@@ -1,3 +1,4 @@
+# Remnant GLM changes. Author: Winston Cai.
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -4297,6 +4298,22 @@ class HybridLinearKVPool(KVCache):
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
         self.full_kv_pool._finalize_backing_tokens(config.max_total_num_tokens)
         self.size = int(config.max_total_num_tokens)
+
+    # Author: Winston Cai. Explicit Packed access preserves global layer mapping.
+    @property
+    def glm_packed(self) -> bool:
+        return getattr(self.full_kv_pool, "glm_packed", False)
+
+    def get_glm_packed_buffer(self, layer_id):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_glm_packed_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def normalize_and_store_glm(self, layer_id, raw, norm, loc):
+        return self.full_kv_pool.normalize_and_store_glm(
+            self._transfer_full_attention_id(layer_id), raw, norm, loc
+        )
 
     @property
     def dsa_kv_cache_store_fp8(self) -> bool:

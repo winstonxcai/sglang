@@ -15,6 +15,9 @@ from sglang.kernels.ops.attention.dsv4.compress import (
 )
 from sglang.srt import remnant
 from sglang.srt.layers.attention.dsv4 import compressor_v2 as module
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
@@ -108,3 +111,7 @@ def test_compressor_routes_store(phase, mode, implementation, keep_count):
             torch.testing.assert_close(latent, original_latent, atol=0, rtol=0)
     finally:
         remnant.configure_cache_format("native")
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

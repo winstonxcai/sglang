@@ -333,3 +333,137 @@ selection, reconstruction and combine; duration, DRAM traffic/bandwidth, L2,
 occupancy, registers, local spill traffic and warp stalls are required. Reports,
 commands, versions and exported summaries are separate from timing records.
 Profiling does not refresh or replace unprofiled timing.
+
+## GLM Native FP8 versus Packed Direct
+
+`--model-family glm53 --suite glm-attention` selects protocol
+`remnant-glm-attention-v1`, independent of the DeepSeek defaults above. Only
+`native,direct` is accepted. Native retains all 512 FP8 coordinates; Direct reads
+256 FP8 values plus eight bitmap words. Both calls include query conversion,
+partial attention and combine. No store, indexer, metadata preparation, Adapter,
+weights, KDA state, or TP communication is timed.
+
+The full matrix has 128 cases: heads16 then8; decode B1/8/16/24/32/64 then
+prefill Q128/512/1536/4096/8192; tail phases0/3; warm/rotating buffers; independent
+or shared prefill history. Decode histories are request-disjoint. Four-token
+KPool groups and 256-token page offsets are preserved; 2,048 history entries
+plus causal live tails are padded to2,112. The completed prefix is128K; phase0
+starts at sequence length131076 and phase3 at131075, then prefill advances
+contiguously. These lengths include the current query token.
+
+One fixed seed20261024, 30 balanced paired rounds and >=100 calls/sample use
+CUDA graphs for both phases. Rotation banks use the smallest distinct selected
+Packed footprint exceeding twice measured device L2, with identical bank counts
+in both modes. Fixture backing/inputs/graph liveness must remain under70% VRAM.
+Warm is a buffer-reuse policy, not a promise that all data resides in L2.
+Results are conditional synthetic measurements, not a model workload distribution.
+
+CPU contracts live in the existing `test_microbench.py`; small GPU graph-owner
+regressions live in the existing GLM integration tests. The dedicated GLM module
+owns numerical fixtures/references, and `timing.py` is shared with DeepSeek.
+The parent `benchmarks/microbench/glm53-packed/README.md` owns authorization,
+aggregate cost, gate identities and the canonical experiment ledger.
+
+```bash
+python benchmark/remnant/microbench.py --model-family glm53 --suite glm-attention \
+  --output /path/to/unique-run/timing --max-seconds 850
+```
+
+Direct CLI timing is diagnostic unless paired with the parent's sanitizer
+qualification evidence. The maintained Modal entry point requires explicit
+`--qualification-runs` covering all three sanitizer tools with matching runtime,
+compiled kernels and dependencies. A per-tool validation run never represents
+all-tool qualification. No output is overwritten and each completed case is
+checkpointed. Missing coverage is incomplete; there is no required speedup.
+
+
+GLM fixture initialization `selected-physical-union-v1` keeps full-size zeroed
+backing banks and populates every distinct valid selected physical row once.
+Native and Packed share those raw latents; all written Packed bytes are checked.
+This changes setup cost and fixture hashes, not rotation footprints or timed calls.
+`--resume <prior-timing.json>` accepts only a valid ordered prefix with identical
+source/artifact identity, seed, rounds and per-case coverage. It discards only an
+unfinished final case. A completed aggregate still requires every case in the
+selected scope (128 for `all`, 48 for `decode`). Resume requires
+`REMNANT_BUILD_MANIFEST_PATH` to the complete build manifest emitted by the
+maintained parent CPU workflow. It verifies source/toolchain identity and recorded
+binary/cache hashes on disk. Fresh standalone diagnostic runs may omit it;
+they cannot resume without the verified build identity. Local source hashes also
+cover the independent reference, RMSNorm, configuration, bitmap and statistics
+modules. Derived case/aggregate statistics are recomputed from the raw samples.
+
+
+Focused sanitizer bank probes use Q2/Q8, banks2/4, heads8/16 and explicitly
+force inner33/66. These are the same compiled partial/combine specializations
+with representative launch grids. JUnit records exact geometry and actual 2/4
+warmup calls per mode. They retain every bank, independent references, alternating
+and changing-input replay. Full Q128/Q512 numerical/ownership smoke stays intact;
+the probes do not establish sanitizer coverage for those full allocation/grid
+sizes. Measured captures keep the default ten warmups and the full128 matrix.
+
+
+The maintained focused sanitizer probes now use Q2 for both head geometries,
+with inner33/66 and banks2/4 unchanged. Their independent oracle executes the
+same FP8-rounded/FP32 attention formula on CPU and returns BF16 to CUDA. Every
+production CUDA path remains instrumented; no kernel filters apply. Unprofiled
+full-size smoke verifies CPU/GPU oracle parity on actual inputs at unchanged
+0.02 tolerances before these probes, while full-size/timing validation retains
+its GPU oracle. JUnit records reference device and exact representative geometry.
+
+
+### GLM implementation and artifact ownership
+
+The serving startup contract requires resolved DSA prefill/decode dispatch with
+TileLang implementations and BF16 model activations after dtype resolution
+(including `auto`). Explicit dense attention overrides and resolved non-BF16
+Packed activations are rejected before pool allocation; Native is unchanged.
+Adapter reconstruction widens physical indices to int64 before byte offsets;
+its large-address regression covers the 2 GiB boundary, duplicates and invalids.
+Direct's loader and attention arithmetic are unchanged by these review fixes.
+
+`python/sglang/benchmark/remnant/glm_artifacts.py` owns the SM90 factory, byte
+probe and complete compile manifest, including verified generated source/host
+hashes, cubin identity, launch ABI and shared-memory requirements. The parent
+build runner and focused GPU tests consume that interface; GPU test fixtures no
+longer own compilation. Inside the maintained Linux CUDA build environment:
+
+```bash
+export TRITON_CACHE_DIR=/cache/glm/triton
+export TILELANG_CACHE_DIR=/cache/glm/tilelang
+export REMNANT_GLM_COMPILE_MANIFEST=/cache/glm/manifest.json
+python -m sglang.benchmark.remnant.glm_artifacts
+```
+
+The command requires explicit cache/output paths and defaults TileLang to SM90a.
+The maintained CPU build additionally supplies its verified import-driver stubs
+and pinned toolchain. Importing the artifact module itself needs no CUDA stack.
+Focused partial-graph tests read the resulting manifest directly; no parent-side
+metadata enrichment or imports from the parent repository are required.
+
+CPU regression command (no weights or GPU):
+
+```bash
+PYTHONPATH=python python -m pytest -q test/registered/unit/test_glm5_mla_cache_format.py benchmark/remnant/test_microbench.py
+```
+
+The Adapter boundary regression passed at the source recorded in the parent
+ledger. The expanded production integration test exercises the actual model
+producer, hybrid pool, and public prefill/decode methods for both readers; that
+expanded test still requires H100 validation. Historical Native/Direct results
+retain their recorded source identities and do not qualify subsequent commits.
+
+
+### Serving selector after the GLM/V4.1 integration
+
+The v0.5.22 serving interface is `--kv-cache-format native|direct` (default
+`native`). Direct selects Packed C4/FlashMLA for V4, Packed FP4/FlashMLA for
+V4.1, or 320-byte Packed MLA/TileLang for GLM. V4.1 Native always uses its FP4
+global-cache path; SWA and indexer are unchanged. The former model-specific
+format and reader options have been removed and are unknown CLI options.
+For example, replace `--glm5-mla-cache-format remnant
+--glm5-mla-cache-implementation direct` with `--kv-cache-format direct`.
+
+Adapter and reconstruction are explicit internal benchmark/test choices. Their
+benchmark mode names and historical protocol identities remain unchanged.
+Non-256 C4 profiles remain available to internal Triton reconstruction tests;
+serving Direct rejects profiles without a supported Direct implementation.

@@ -252,6 +252,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
         self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        # Author: Winston Cai. Adapter scratch is shared by all MLA layers,
+        # so charge it once before token sizing rather than per cache row.
+        from sglang.srt.remnant.glm_config import enabled as glm_packed_enabled
+
+        if (
+            glm_packed_enabled()
+            and num_layers
+            and getattr(kvc, "glm_cache_implementation", "direct") == "adapter"
+        ):
+            from sglang.srt.remnant.glm_config import (
+                LATENT_DIM,
+                MAX_QUERY_CHUNK,
+                SELECTION_COLUMNS,
+            )
+
+            self._fixed_overhead_bytes += (
+                MAX_QUERY_CHUNK * SELECTION_COLUMNS * LATENT_DIM
+            )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -381,6 +399,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
+            # Author: Winston Cai. Indexer accounting below remains unchanged.
+            from sglang.srt.remnant.glm_config import ROW_BYTES
+            from sglang.srt.remnant.glm_config import enabled as glm_packed_enabled
+
+            if glm_packed_enabled():
+                cell_size = ROW_BYTES * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -645,9 +669,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
         self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -1452,7 +1476,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         full-page prefix plus their own physical page. SWA reserves its own
         logical page. Workspaces/activations are budgeted by the caller.
         """
-        if get_model().dsv41_main_kv_cache_format == "auto":
+        if get_model().cache_model_family != "dsv41":
             return 0
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
 
@@ -1603,9 +1627,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         max_running_requests_per_worker = self._resolve_max_running_requests_per_worker(
             available_bytes
@@ -1662,9 +1686,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         # Token count, not a byte budget: the fixed pools are not re-subtracted, so
         # the input must not exceed what calculate_pool_sizes derived for it.
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

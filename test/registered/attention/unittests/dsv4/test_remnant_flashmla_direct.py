@@ -12,6 +12,14 @@ from sglang.srt import remnant
 from sglang.srt.remnant import NativeWorkspace
 from sglang.srt.remnant.packed import pack_rows, pack_rows_fused, unpack_gather_native
 from sglang.srt.remnant.reference import topmag_keep_mask
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=0,
+    stage="base-a",
+    runner_config="1-gpu-small",
+    disabled="Requires the independently pinned SGLang/FlashMLA build; qualified by scripts/modal/kernels.py",
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or importlib.util.find_spec("triton") is None,
@@ -75,9 +83,9 @@ def _bitmap_edge_keep_mask(rows: int, device: torch.device) -> torch.Tensor:
             (coordinate < 255) | (coordinate == 511),
         )
     )
-    assert torch.all(
-        patterns.sum(dim=-1) == 256
-    ), "Each bitmap pattern must retain 256 values"
+    assert torch.all(patterns.sum(dim=-1) == 256), (
+        "Each bitmap pattern must retain 256 values"
+    )
     row_pattern = torch.arange(rows, device=device) % patterns.shape[0]
     return patterns.index_select(0, row_pattern)
 
@@ -256,9 +264,9 @@ class TestRemnantFlashMLADirect:
         )
 
         packed_codes = buffers[0]
-        assert not torch.any(
-            (packed_codes & 0x7F) == 0x7F
-        ), "Packed cache contains FP8 NaN codes"
+        assert not torch.any((packed_codes & 0x7F) == 0x7F), (
+            "Packed cache contains FP8 NaN codes"
+        )
         assert torch.isfinite(native_out).all(), "Native adapter output is non-finite"
         assert torch.isfinite(native_lse).all(), "Native adapter LSE is non-finite"
         assert torch.isfinite(direct_out).all(), "Direct output is non-finite"
@@ -388,4 +396,4 @@ class TestRemnantFlashMLADirect:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -7,6 +7,7 @@ from unittest import mock
 
 import pytest
 import torch
+
 from sglang.benchmark.remnant.cases import store_cases
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
@@ -15,6 +16,14 @@ from sglang.kernels.ops.attention.dsv4.compress import (
 from sglang.srt import remnant
 from sglang.srt.remnant.packed import PackedBuffers, pack_rows, pack_rows_fused
 from sglang.srt.remnant.reference import topmag_keep_mask
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=0,
+    stage="base-a",
+    runner_config="1-gpu-small",
+    disabled="Requires the independently pinned SGLang/FlashMLA build; qualified by scripts/modal/kernels.py",
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -220,7 +229,7 @@ def test_empty_does_not_select_or_launch():
 def test_nonuniform_fp32_weights_preserve_production_pair_rounding(
     heads, batch, length
 ):
-    from sglang.benchmark.remnant.cases import DecodeCase, SEED, case_seed
+    from sglang.benchmark.remnant.cases import SEED, DecodeCase, case_seed
 
     generator = torch.Generator(device="cuda").manual_seed(
         case_seed(DecodeCase(heads, batch, length), SEED)
@@ -237,3 +246,7 @@ def test_nonuniform_fp32_weights_preserve_production_pair_rounding(
     pack_rows(x, topmag_keep_mask(x, 0.5), weight, 1e-6, plan, locations, expected)
     for a, b in zip(actual, expected):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

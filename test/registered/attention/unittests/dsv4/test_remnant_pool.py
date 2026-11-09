@@ -8,7 +8,6 @@ import hashlib
 import json
 import math
 import os
-import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +21,11 @@ from sglang.srt.mem_cache import deepseek_v4_memory_pool as pool_module
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import RemnantPackedKVPool
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 from sglang.srt.remnant import config
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
 
 MODEL_CONFIG_SHA256 = "6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023"
 
@@ -82,9 +85,9 @@ def test_real_gpu_allocations(tmp_path):
     REMNANT_ALLOCATION_REPORT optionally retains incremental measurements outside
     pytest's temporary directory. Allocator reservation is diagnostic, not storage.
     """
+    from sglang.srt.remnant import NativeWorkspace
     from sglang.srt.runtime_context import get_context
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-    from sglang.srt.remnant import NativeWorkspace
 
     source = Path(
         os.environ.get("REMNANT_MODEL_CONFIG", "/opt/remnant-0731-config.json")
@@ -157,7 +160,7 @@ def test_real_gpu_allocations(tmp_path):
                     False,
                     global_page_size=256,
                     kv_layout=pool_module.KVLayout.V4,
-                    **options
+                    **options,
                 )
                 pages = math.ceil((rows + 256) / 64)
                 expected = (
@@ -205,10 +208,15 @@ def test_real_gpu_allocations(tmp_path):
             max_running_requests=32,
             chunked_prefill_size=8192,
             page_size=256,
-            dsv4_c4_cache_format="native" if mode == "native" else "remnant",
-            dsv4_c4_cache_implementation="triton" if mode == "triton" else "kernel",
+            kv_cache_format="native" if mode == "native" else "direct",
+            _kv_cache_model_family="dsv4",
             _dsv4_c4_cache_compression_ratios=ratios,
         ):
+            remnant.configure_cache_format(
+                "native" if mode == "native" else "remnant",
+                "triton" if mode == "triton" else "kernel",
+                compression_ratios=ratios,
+            )
             hf = SimpleNamespace(**model, kv_source_layer_ids=())
             metadata = SimpleNamespace(
                 qk_nope_head_dim=448,
@@ -323,11 +331,13 @@ def test_real_gpu_allocations(tmp_path):
             clean()
             for batch in (8, 24, 32):
                 with get_context().override_server_args(
-                    dsv4_c4_cache_format="native" if mode == "native" else "remnant",
-                    dsv4_c4_cache_implementation=(
-                        "triton" if mode == "triton" else "kernel"
-                    ),
+                    kv_cache_format="native" if mode == "native" else "direct",
+                    _kv_cache_model_family="dsv4",
                 ):
+                    remnant.configure_cache_format(
+                        "native" if mode == "native" else "remnant",
+                        "triton" if mode == "triton" else "kernel",
+                    )
                     workspace = (
                         None
                         if mode == "native"
@@ -368,7 +378,6 @@ def test_real_gpu_allocations(tmp_path):
 
 
 class TestRemnantPool(CustomTestCase):
-
     def setUp(self):
         super().setUp()
         patcher = mock.patch(
@@ -521,4 +530,4 @@ class TestRemnantPool(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -1,0 +1,192 @@
+"""Pinned, unedited upstream GLM attention baseline and CPU artifacts.
+
+Author: Winston Cai.
+Consumers: glm_attention fixtures and the maintained Modal CPU preparation.
+This module changes no production dispatch and imports CUDA only when loading
+or compiling the baseline inside the verified image.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import inspect
+import json
+import os
+import subprocess
+import sys
+from functools import cache
+from pathlib import Path
+
+COMMIT = "baa9befa381511cd4d56f83980951e5a45fffc6d"
+MODULE = "kernels/ops/attention/dsa/tilelang_kernel.py"
+FILES = {
+    MODULE: "3d288dc04676b304e1a4d1a44703a8281762ebe789ca7cdd745b0c80fcac591e",
+    "kernels/ops/quantization/fp8_kernel.py": "f5b428f2cb51b7707b19dd7b55e9ef61818a5f99b1cb382cd5e811429dd46806",
+    "srt/utils/__init__.py": "d4c887ce6d68fb14d2f870c50dabc621da1c67a85823e8c8cf704392865963c8",
+    "srt/utils/common.py": "5423d1bb153e72852306934ab56ee0b3eccab8b3ec6395dc9da0fea79f7e74da",
+}
+SOURCE_ENV = "REMNANT_GLM_UPSTREAM_SOURCE"
+IMAGE_SOURCE = "/opt/remnant-glm-upstream-v0522"
+
+
+def identity() -> dict:
+    return {"commit": COMMIT, "files": dict(FILES), "scope": "attention-module"}
+
+
+def prepare_source(checkout: Path, destination: Path) -> dict:
+    """Export exact Git blobs locally; the image needs neither Git nor network."""
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, expected in FILES.items():
+        data = subprocess.check_output(
+            ["git", "-C", str(checkout), "show", f"{COMMIT}:python/sglang/{name}"],
+            timeout=30,
+        )
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise RuntimeError(f"Pinned upstream source mismatch: {COMMIT}/{name}")
+        if name == MODULE:
+            (destination / "tilelang_kernel.py").write_bytes(data)
+    (destination / "source.json").write_text(json.dumps(identity(), indent=2) + "\n")
+    verify_source(destination, checkout / "python/sglang")
+    return identity()
+
+
+def verify_source(directory: Path, package: Path) -> dict:
+    """Check source and shared helper bytes without importing Torch or CUDA."""
+    if json.loads((directory / "source.json").read_text()) != identity():
+        raise RuntimeError("Upstream baseline receipt changed")
+    for name, expected in FILES.items():
+        path = directory / "tilelang_kernel.py" if name == MODULE else package / name
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise RuntimeError(f"Upstream baseline/helper changed: {path}")
+    return identity()
+
+
+@cache
+def load_baseline():
+    """Load an independently named upstream module, never the fork Native arm."""
+    package = Path(__file__).resolve().parents[2]
+    directory = Path(os.environ[SOURCE_ENV])
+    verify_source(directory, package)
+    path = directory / "tilelang_kernel.py"
+    name = "_remnant_pristine_glm_tilelang_v0522"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+        for helper, relative in (
+            (module.is_fp8_fnuz, "kernels/ops/quantization/fp8_kernel.py"),
+            (module.is_hip, "srt/utils/common.py"),
+            (module.is_gfx95_supported, "srt/utils/common.py"),
+        ):
+            if (
+                Path(inspect.getsourcefile(inspect.unwrap(helper))).resolve()
+                != (package / relative).resolve()
+            ):
+                raise RuntimeError(f"Upstream helper import was redirected: {relative}")
+        if (
+            Path(inspect.getsourcefile(module.tilelang_sparse_fwd)).resolve()
+            != path.resolve()
+        ):
+            raise RuntimeError("Upstream attention import was redirected")
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def precompile() -> dict:
+    """Compile only heads16 decode partial/combine variants on CPU/SM90a."""
+    from sglang.benchmark.remnant.glm_artifacts import bind_partial_launch_metadata
+
+    required = ("TRITON_CACHE_DIR", "TILELANG_CACHE_DIR", SOURCE_ENV)
+    if any(not os.environ.get(name) for name in required):
+        raise RuntimeError(f"Upstream CPU preparation requires {required}")
+    os.environ.setdefault(
+        "TILELANG_DEFAULT_TARGET", json.dumps({"kind": "cuda", "arch": "sm_90a"})
+    )
+    module = load_baseline()
+    variants = []
+    for inner in (1, 2):
+        partial = module.sparse_mla_fwd_decode_partial_fp8(
+            16,
+            512,
+            0,
+            2112,
+            sm_scale=256**-0.5,
+            block_I=32,
+            inner_iter=inner,
+            threads=128,
+        )
+        variants.append(
+            dict(
+                heads=16,
+                inner=inner,
+                packed=False,
+                block_i=32,
+                source_sha256=hashlib.sha256(
+                    partial.get_kernel_source().encode()
+                ).hexdigest(),
+            )
+        )
+        module.sparse_mla_fwd_decode_combine(
+            16,
+            512,
+            (66 // inner) * 32,
+            head_per_block=4,
+            block_I=32,
+            threads=128,
+        )
+    compiled = dict(
+        source=identity(),
+        tilelang=variants,
+        cache_files={
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for root in (Path(os.environ[name]) for name in required[:2])
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        },
+    )
+    bind_partial_launch_metadata(compiled)
+    return compiled
+
+
+def verify_compilation(compiled: dict) -> None:
+    """Fail before timing on absent, changed or incomplete cached artifacts."""
+    if compiled.get("source") != identity():
+        raise RuntimeError("Upstream compiled source identity changed")
+    variants = compiled.get("tilelang", [])
+    if {(v["heads"], v["inner"], v["packed"]) for v in variants} != {
+        (16, 1, False),
+        (16, 2, False),
+    } or len(variants) != 2:
+        raise RuntimeError("Missing upstream heads16 SM90 variants")
+    artifacts = compiled.get("cache_files", {})
+    for variant in variants:
+        path, digest = variant.get("cubin_path"), variant.get("cubin_sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(c not in "0123456789abcdef" for c in digest)
+            or artifacts.get(path) != digest
+        ):
+            raise RuntimeError("Unbound upstream cubin")
+    if not artifacts:
+        raise RuntimeError("Missing upstream compiled artifacts")
+    for name, expected in artifacts.items():
+        path = Path(name)
+        if (
+            not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+        ):
+            raise RuntimeError(f"Upstream compiled artifact changed: {path}")
+
+
+if __name__ == "__main__":
+    record = precompile()
+    Path("/opt/remnant-glm-upstream-compile.json").write_text(
+        json.dumps(record, indent=2) + "\n"
+    )
