@@ -1092,6 +1092,40 @@ def upstream_decode_score(records: list[dict]) -> dict:
     }
 
 
+def decode_trace_stages(events: list[dict], banks: int) -> dict:
+    """Attribute one complete replay by launch order, even for identical symbols."""
+    kernels = sorted(
+        (
+            event
+            for event in events
+            if event.get("cat") == "kernel" and event.get("ph") == "X"
+        ),
+        key=lambda event: event["ts"],
+    )
+    if (
+        banks < 1
+        or len(kernels) != 3 * banks
+        or len({(event["pid"], event["tid"]) for event in kernels}) != 1
+        or any(
+            not math.isfinite(event["dur"]) or event["dur"] <= 0 for event in kernels
+        )
+    ):
+        raise RuntimeError("Expected three CUDA kernels per bank on one graph stream")
+    stages = {}
+    for position, name in enumerate(
+        ("query_conversion", "partial_attention", "combine")
+    ):
+        launches = kernels[position::3]
+        symbols = {event["name"] for event in launches}
+        if len(symbols) != 1:
+            raise RuntimeError(f"Inconsistent {name} kernel across graph banks")
+        stages[name] = {
+            "symbol": symbols.pop(),
+            "us_per_call": math.fsum(event["dur"] for event in launches) / banks,
+        }
+    return stages
+
+
 def profile_upstream_decode(
     matrix: list[Case], base: Path, deadline: float, source: dict
 ):
@@ -1129,19 +1163,12 @@ def profile_upstream_decode(
                         torch.cuda.synchronize()
                     trace = trace_dir / f"{case.name}-{mode}.json"
                     profiler.export_chrome_trace(str(trace))
-                    kernels = {}
-                    for event in json.loads(trace.read_text())["traceEvents"]:
-                        if event.get("cat") == "kernel" and event.get("ph") == "X":
-                            durations = kernels.setdefault(event["name"], [])
-                            durations.append(event["dur"])
-                    if sum(map(len, kernels.values())) < 3 * fixture.banks:
-                        raise RuntimeError(f"Incomplete CUDA graph trace: {trace}")
+                    stages = decode_trace_stages(
+                        json.loads(trace.read_text())["traceEvents"], fixture.banks
+                    )
                     record["paths"][mode] = {
                         "trace": str(trace.relative_to(base.parent)),
-                        "kernel_us_per_call": {
-                            name: math.fsum(times) / fixture.banks
-                            for name, times in kernels.items()
-                        },
+                        "stages": stages,
                     }
                 del graph, fixture
                 gc.collect()

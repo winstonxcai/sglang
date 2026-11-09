@@ -2493,3 +2493,17 @@ def test_glm_upstream_goal_scores_all_cases_equally():
     records[-1]["paired_ratios"]["direct_over_upstream"]["samples"][-1] = float("nan")
     with pytest.raises(ValueError, match="Invalid"):
         glm.upstream_decode_score(records)
+
+
+def test_glm_decode_trace_distinguishes_identical_native_symbols():
+    events = [
+        dict(cat="kernel", ph="X", pid=0, tid=1, ts=i * 100, name=symbol, dur=duration)
+        for i, (symbol, duration) in enumerate(
+            [("copy", 2), ("main_kernel", 8), ("main_kernel", 5)] * 2
+        )
+    ]
+    stages = glm.decode_trace_stages(events[::-1], 2)
+    assert [stage["us_per_call"] for stage in stages.values()] == [2, 8, 5]
+    assert stages["partial_attention"]["symbol"] == stages["combine"]["symbol"]
+    with pytest.raises(RuntimeError, match="three CUDA kernels"):
+        glm.decode_trace_stages(events[:-1], 2)
