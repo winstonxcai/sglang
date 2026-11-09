@@ -45,6 +45,7 @@ class CompileManifest(TypedDict):
     precompile_workers: int
     triton: list[str]
     tilelang: list[PartialVariant]
+    decode_combine: NotRequired[dict[str, dict[str, str]]]
     cache_files: dict[str, str]
 
 
@@ -124,7 +125,7 @@ def compile_sm90_variant(case: tuple[int, int, int]) -> list[PartialVariant]:
 
     heads, inner, block_i = case
     variants = []
-    for packed in ((False, True) if block_i == 32 else (True,)):
+    for packed in (False, True) if block_i == 32 else (True,):
         kernel = sparse_mla_fwd_decode_partial_fp8(
             heads,
             512,
@@ -148,8 +149,12 @@ def compile_sm90_variant(case: tuple[int, int, int]) -> list[PartialVariant]:
             )
         )
     sparse_mla_fwd_decode_combine(
-        heads, 512, ((2112 + block_i * inner - 1) // (block_i * inner)) * block_i,
-        head_per_block=4, block_I=block_i, threads=128,
+        heads,
+        512,
+        ((2112 + block_i * inner - 1) // (block_i * inner)) * block_i,
+        head_per_block=4,
+        block_I=block_i,
+        threads=128,
     )
     return variants
 
@@ -181,7 +186,9 @@ def precompile_sm90() -> None:
         "triton": [store.hash, unpack.hash],
         "tilelang": [],
     }
-    cases = [(heads, inner, 32) for heads in (8, 16, 32, 64) for inner in (1, 2, 33, 66)]
+    cases = [
+        (heads, inner, 32) for heads in (8, 16, 32, 64) for inner in (1, 2, 33, 66)
+    ]
     cases.extend([(8, 17, 64), (16, 17, 64), (16, 9, 128)])
     # Separate processes isolate TVM compiler state; each pair owns its combine
     # variant. The maintained runner supplies the overall bounded subprocess.
@@ -196,6 +203,16 @@ def precompile_sm90() -> None:
                 flush=True,
             )
     packed_loader_probe()(8388610)
+    from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+        glm_packed_decode_combine,
+    )
+
+    combine_sources = {
+        f"{groups}x{columns}": glm_packed_decode_combine(
+            16, 512, groups, columns
+        ).get_kernel_source()
+        for groups, columns in ((66, 128), (33, 512))
+    }
     artifacts["cache_files"] = {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()
         for root in (
@@ -205,18 +222,29 @@ def precompile_sm90() -> None:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+    artifacts["decode_combine"] = {}
+    for geometry, source in combine_sources.items():
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        cache = artifacts["cache_files"]
+        if not any(
+            path.endswith("/device_kernel.cu") and h == digest
+            for path, h in cache.items()
+        ):
+            raise RuntimeError(f"Missing generated GLM combine source: {geometry}")
+        cubin = _verified_sm90_cubin(source, cache)
+        artifacts["decode_combine"][geometry] = {
+            "source_sha256": digest,
+            "cubin_path": str(cubin),
+            "cubin_sha256": cache[str(cubin)],
+        }
     bind_partial_launch_metadata(artifacts)
     Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).write_text(
         json.dumps(artifacts, indent=2) + "\n"
     )
 
 
-def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
-    """Bind exact production cubins, generated ABI and dynamic shared bytes.
-
-    The qualified TileLang version uses this public CUDA cache key API. Resolve
-    it on CPU, require a manifest hash, and fail before H100 on any mismatch.
-    """
+def _verified_sm90_cubin(source: str, cache: dict[str, str]) -> Path:
+    """Resolve a generated SM90 cubin against its CPU preparation cache hashes."""
     import tilelang
     from tilelang.cache.cuda_binary_cache import CUDABinaryCache
 
@@ -226,6 +254,29 @@ def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
         f"-I{package}/3rdparty/../src",
         f"-I{package}/3rdparty/cutlass/include",
     ]
+    key = CUDABinaryCache.make_key(
+        code=source,
+        target_kind="cuda",
+        target_arch="90a",
+        target_code=[],
+        compile_format="cubin",
+        options=options,
+    )
+    cubin = Path(CUDABinaryCache.get_path(key, "cubin"))
+    if (
+        str(cubin) not in cache
+        or hashlib.sha256(cubin.read_bytes()).hexdigest() != cache[str(cubin)]
+    ):
+        raise RuntimeError(f"Unverified production GLM cubin: {cubin}")
+    return cubin
+
+
+def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
+    """Bind exact production cubins, generated ABI and dynamic shared bytes.
+
+    The qualified TileLang version uses this public CUDA cache key API. Resolve
+    it on CPU, require a manifest hash, and fail before H100 on any mismatch.
+    """
     cache = compiled["cache_files"]
     for variant in compiled["tilelang"]:
         matches = [
@@ -238,20 +289,7 @@ def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
         source = matches[0].read_text()
         if hashlib.sha256(source.encode()).hexdigest() != variant["source_sha256"]:
             raise RuntimeError(f"GLM generated source changed: {matches[0]}")
-        key = CUDABinaryCache.make_key(
-            code=source,
-            target_kind="cuda",
-            target_arch="90a",
-            target_code=[],
-            compile_format="cubin",
-            options=options,
-        )
-        cubin = Path(CUDABinaryCache.get_path(key, "cubin"))
-        if (
-            str(cubin) not in cache
-            or hashlib.sha256(cubin.read_bytes()).hexdigest() != cache[str(cubin)]
-        ):
-            raise RuntimeError(f"Unverified production GLM cubin: {cubin}")
+        cubin = _verified_sm90_cubin(source, cache)
         symbol = "glm_packed_partial_kernel" if variant["packed"] else "main_kernel"
         match = re.search(r"\b" + symbol + r"\(([^)]*)\)\s*\{", source)
         if not match:

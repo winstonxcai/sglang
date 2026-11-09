@@ -395,7 +395,7 @@ class Fixture:
             torch.cuda.get_device_properties(0).multi_processor_count,
             1,
         )
-        if upstream and inner not in (1, 2):
+        if upstream and inner != (1 if case.queries == 1 else 2):
             raise RuntimeError(
                 f"Unprepared H200 decode split: {inner}; refusing GPU compilation"
             )
@@ -486,6 +486,8 @@ class Fixture:
             },
             first_query_sequence_length=HISTORY + (4 if case.tail == 0 else 3),
         )
+        if upstream:
+            self.identity["direct_combine_columns"] = 128 if case.queries == 1 else 512
         self.graphs = {}
         self.outputs = {}
         self.validate()
@@ -523,7 +525,7 @@ class Fixture:
         if mode != "direct":
             raise ValueError(f"Unsupported GLM path {mode}")
         cache = self.packed[bank]
-        if self.packed_prefill_tile == 32:
+        if self.packed_prefill_tile == 32 and self.baseline_name != "upstream":
             return attention(self.q, cache, self.ids[bank], SCALE)
         return tilelang_sparse_fwd(
             self.q,
@@ -533,6 +535,9 @@ class Fixture:
             DIM,
             packed_bitmap=cache.bitmaps,
             packed_prefill_tile=self.packed_prefill_tile,
+            packed_decode_combine_columns=(128 if self.case.queries == 1 else 512)
+            if self.baseline_name == "upstream"
+            else 0,
         )
 
     def validate(self, *, reference_device=None) -> None:
@@ -917,6 +922,10 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             }
             if (
                 fixture.get("changing_input_replay") != "passed"
+                or fixture.get(
+                    "direct_combine_columns", 128 if definition.queries == 1 else 512
+                )
+                != (128 if definition.queries == 1 else 512)
                 or fixture.get("path_geometry") != geometry
                 or "H200" not in payload.get("source", {}).get("device", "")
             ):
@@ -1201,6 +1210,17 @@ def main() -> None:
         cases=[],
     )
     if upstream:
+        build = payload["source"]["compiled_build"]
+        compile_manifest = build.get("glm_compile", {})
+        combines = compile_manifest.get("decode_combine", {})
+        if set(combines) != {"66x128", "33x512"} or any(
+            not variant.get("cubin_path")
+            or not variant.get("cubin_sha256")
+            or compile_manifest["cache_files"].get(variant["cubin_path"])
+            != variant["cubin_sha256"]
+            for variant in combines.values()
+        ):
+            raise RuntimeError("Missing CPU-prepared Packed decode combine cubins")
         from sglang.benchmark.remnant.glm_upstream import (
             identity,
             load_baseline,

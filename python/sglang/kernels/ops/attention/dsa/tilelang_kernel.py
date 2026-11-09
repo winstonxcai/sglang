@@ -1522,6 +1522,7 @@ def tilelang_sparse_fwd(
     *,
     packed_bitmap: torch.Tensor | None = None,
     packed_prefill_tile: int = 32,
+    packed_decode_combine_columns: int = 0,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1531,6 +1532,18 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if packed_decode_combine_columns and (
+        packed_decode_combine_columns not in (128, 512)
+        or packed_bitmap is None
+        or not is_fp8_kv
+        or _is_hip
+        or num_heads != 16
+        or d_v != 512
+        or tail_dim != 0
+        or topk != 2112
+        or packed_prefill_tile != 32
+    ):
+        raise ValueError("Packed decode combine requires Hopper FP8 heads16 tile32")
     if packed_prefill_tile != 32 and (
         packed_prefill_tile not in (64, 128)
         or packed_bitmap is None
@@ -1560,6 +1573,11 @@ def tilelang_sparse_fwd(
                 (ni + 1) // 2 if packed_prefill_tile != 32
                 else _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             )
+            if packed_decode_combine_columns and (
+                (ni + inner_iter - 1) // inner_iter,
+                packed_decode_combine_columns,
+            ) not in ((66, 128), (33, 512)):
+                raise ValueError("Unprepared Packed decode combine geometry")
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1603,14 +1621,19 @@ def tilelang_sparse_fwd(
                 q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
             )
         n_groups = (ni + inner_iter - 1) // inner_iter
-        kernel_combine = sparse_mla_fwd_decode_combine(
-            num_heads,
-            d_v,
-            n_groups * block_I,
-            head_per_block=4,
-            block_I=block_I,
-            threads=threads,
-        )
+        if packed_decode_combine_columns:
+            kernel_combine = glm_packed_decode_combine(
+                num_heads, d_v, n_groups, packed_decode_combine_columns
+            )
+        else:
+            kernel_combine = sparse_mla_fwd_decode_combine(
+                num_heads,
+                d_v,
+                n_groups * block_I,
+                head_per_block=4,
+                block_I=block_I,
+                threads=threads,
+            )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
         kernel_factory = (

@@ -1267,3 +1267,34 @@ def test_adapter_reconstruction_above_2gib():
         torch.cuda.synchronize()
         del values, bitmap
         torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(("groups", "columns"), [(66, 128), (33, 512)])
+def test_packed_decode_combine_graph(groups, columns):
+    """Exercise the two candidate cubins with a fully masked head and new inputs."""
+    from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+        glm_packed_decode_combine,
+    )
+
+    generator = torch.Generator().manual_seed(20261024 + groups)
+    sentinel = -(2**30)
+    split_output = torch.randn((1, 1, groups, 16, 512), generator=generator)
+    split_output = split_output.to(device="cuda", dtype=torch.bfloat16)
+    split_lse = torch.randn((1, 1, groups, 16), generator=generator).cuda()
+    split_output[..., 0, :] = 0
+    split_lse[..., 0] = sentinel
+    combine = glm_packed_decode_combine(16, 512, groups, columns)
+    warm = combine(split_output, split_lse)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = combine(split_output, split_lse)
+    for _ in range(2):
+        graph.replay()
+        weights = torch.softmax(split_lse * 0.6931471805599453, dim=2)
+        expected = (split_output.float() * weights[..., None]).sum(dim=2)
+        torch.testing.assert_close(result.float(), expected, atol=0.02, rtol=0.02)
+        assert torch.count_nonzero(result[..., 0, :]).item() == 0
+        split_lse[..., 1:].neg_()
+        split_output.neg_()
+    del warm
