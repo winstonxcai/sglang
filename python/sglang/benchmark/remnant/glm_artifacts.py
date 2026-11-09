@@ -50,7 +50,7 @@ class CompileManifest(TypedDict):
     cache_files: dict[str, str]
 
 
-def packed_loader_probe(*, use_rank_table: bool = False):
+def packed_loader_probe():
     """Invoke the production helper and compare every raw code independently.
 
     Synthetic masks include >256 survivors, empty words, all fragment/word
@@ -65,12 +65,6 @@ def packed_loader_probe(*, use_rank_table: bool = False):
         Path(__file__).resolve().parents[2]
         / "kernels/jit/include/sgl_kernel/glm_packed_decode.cuh"
     ).read_text()
-    loader = (
-        "remnant_glm_expand_tile<true, true, true>"
-        if use_rank_table
-        else "remnant_glm_expand_tile"
-    )
-    symbol = "glm_packed_bytes_rank_table" if use_rank_table else "glm_packed_bytes"
 
     @tilelang.jit(out_idx=[-1])
     def probe(slots: int):
@@ -84,7 +78,6 @@ def packed_loader_probe(*, use_rank_table: bool = False):
             with T.Kernel(1, threads=128):
                 T.import_source(source)
                 scratch = T.alloc_shared([32, 272], T.uint8)
-                rank_table = T.alloc_shared([16], T.uint32)
                 a = T.alloc_shared([32, 128], T.uint8)
                 b = T.alloc_shared([32, 128], T.uint8)
                 c = T.alloc_shared([32, 128], T.uint8)
@@ -100,15 +93,7 @@ def packed_loader_probe(*, use_rank_table: bool = False):
                 T.evaluate(
                     T.call_extern(
                         "int32",
-                        "remnant_glm_init_rank_table",
-                        T.access_ptr(rank_table, "w"),
-                    )
-                )
-                T.sync_threads()
-                T.evaluate(
-                    T.call_extern(
-                        "int32",
-                        loader,
+                        "remnant_glm_expand_tile",
                         T.access_ptr(values, "r", extent=T.int64(slots) * 256),
                         T.access_ptr(bitmap, "r", extent=T.int64(slots) * 8),
                         T.access_ptr(ids, "r"),
@@ -118,8 +103,6 @@ def packed_loader_probe(*, use_rank_table: bool = False):
                         T.access_ptr(c, "w"),
                         T.access_ptr(d, "w"),
                         T.int64(slots),
-                        T.int64(0),
-                        T.access_ptr(rank_table, "r"),
                     )
                 )
                 T.sync_threads()
@@ -129,7 +112,7 @@ def packed_loader_probe(*, use_rank_table: bool = False):
                     out[i, j + 256] = c[i, j]
                     out[i, j + 384] = d[i, j]
 
-        return main.with_attr("global_symbol", symbol)
+        return main.with_attr("global_symbol", "glm_packed_bytes")
 
     return probe
 
@@ -229,8 +212,6 @@ def precompile_sm90() -> None:
                 flush=True,
             )
     packed_loader_probe()(8388610)
-    if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
-        packed_loader_probe(use_rank_table=True)(8388610)
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         glm_packed_decode_combine,
     )

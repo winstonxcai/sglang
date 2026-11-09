@@ -1552,7 +1552,6 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             kv = T.alloc_shared([rows, dim], fp8)
             p = T.alloc_shared([heads, rows], fp8)
             scratch = T.alloc_shared([32, 272], T.uint8)
-            rank_table = T.alloc_shared([16], T.uint32)
             scores = T.alloc_fragment([rows, heads], T.float32)
             numerator = T.alloc_fragment([dim, heads], T.float32)
             maximum = T.alloc_fragment([heads], T.float32)
@@ -1585,13 +1584,6 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 }
             )
             T.copy(q_fp8[0, query, :, :], q)
-            T.evaluate(
-                T.call_extern(
-                    "int32",
-                    "remnant_glm_init_rank_table",
-                    T.access_ptr(rank_table, "w"),
-                )
-            )
             T.fill(numerator, 0)
             T.fill(maximum, -(2**30))
             T.fill(denominator, 0)
@@ -1608,7 +1600,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.evaluate(
                     T.call_extern(
                         "int32",
-                        "remnant_glm_expand_wide_tile<64, true, true>",
+                        "remnant_glm_expand_wide_tile<64, true>",
                         T.access_ptr(
                             kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256
                         ),
@@ -1623,7 +1615,6 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                         T.access_ptr(kv[0, 384], "w", extent=rows * 128),
                         T.Cast("int64", num_pages),
                         T.Cast("int64", query) * topk + start,
-                        T.access_ptr(rank_table, "r"),
                     )
                 )
                 T.fence_proxy_async()
