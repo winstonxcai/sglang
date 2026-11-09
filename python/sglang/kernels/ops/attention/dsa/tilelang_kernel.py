@@ -1551,8 +1551,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             kv = T.alloc_shared([rows, dim], fp8)
             v_t = T.alloc_shared([dim, rows], fp8)
             p = T.alloc_shared([heads, rows], fp8)
-            scratch = T.alloc_shared([rows, 272], T.uint8)
-            transpose_tile = T.alloc_local([16, 16], fp8)
+            scratch = T.alloc_shared([32, 272], T.uint8)
             scores = T.alloc_fragment([rows, heads], T.float32)
             numerator = T.alloc_fragment([dim, heads], T.float32)
             maximum = T.alloc_fragment([heads], T.float32)
@@ -1570,11 +1569,6 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
 
             # The last split can be short. All lanes take the same loop bound.
             for step in T.serial(T.min(inner_iter, tile_count - group * inner_iter)):
-                # PV consumes the previous tile's transposed V and P. Its
-                # operands stay live while this iteration fills the separate
-                # K tile and scratch, hiding part of the next gather.
-                if step > 0:
-                    T.wgmma_gemm(v_t, p, numerator, transpose_B=True)
                 start = (group * inner_iter + step) * rows
                 for row in T.Parallel(rows):
                     index = indices[0, query, 0, start + row]
@@ -1585,7 +1579,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.evaluate(
                     T.call_extern(
                         "int32",
-                        "remnant_glm_expand_wgmma_tile",
+                        "remnant_glm_expand_wide_tile<64, true>",
                         T.access_ptr(
                             kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256
                         ),
@@ -1604,22 +1598,17 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 )
                 T.fence_proxy_async()
                 T.sync_threads()
-                if step > 0:
-                    # Finish reading V and P before overwriting either.
-                    T.warpgroup_wait(0)
-                    T.warpgroup_fence_operand(numerator, num_regs=dim * heads // 128)
                 # K @ Q^T puts 64 selected rows on the warpgroup M axis.
                 # V's transpose reads the same tile while QK is in flight.
                 T.wgmma_gemm(kv, q, scores, transpose_B=True, clear_accum=True)
-                # One 16×16 tile per lane. Vectorize both shared-memory axes
-                # through registers to avoid a barrier per scalar transpose.
-                for row_tile, col_tile in T.Parallel(rows // 16, dim // 16):
-                    for i in T.unroll(16):
-                        for j in T.vectorized(16):
-                            transpose_tile[i, j] = kv[row_tile * 16 + i, col_tile * 16 + j]
-                    for j in T.unroll(16):
-                        for i in T.vectorized(16):
-                            v_t[col_tile * 16 + j, row_tile * 16 + i] = transpose_tile[i, j]
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_transpose_wgmma_tile",
+                        T.access_ptr(kv, "r"),
+                        T.access_ptr(v_t, "w"),
+                    )
+                )
                 T.warpgroup_wait(0)
                 T.warpgroup_fence_operand(scores, num_regs=rows * heads // 128)
 
@@ -1644,17 +1633,15 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 for column, head in T.Parallel(dim, heads):
                     numerator[column, head] *= alpha[head]
 
-                # Publish this tile's V and P before the next PV issue.
+                # V^T @ P^T keeps both FP8 operands contiguous in K.
+                # Leave the constant probability scale in the FP32 numerator
+                # until the final normalization to avoid a second fragment.
                 T.fence_proxy_async()
                 T.sync_threads()
+                T.wgmma_gemm(v_t, p, numerator, transpose_B=True)
+                T.warpgroup_wait(0)
+                T.warpgroup_fence_operand(numerator, num_regs=dim * heads // 128)
 
-            # Each split owns at least one tile. Drain its last PV without
-            # prefetching another tile. Both FP8 operands are contiguous in K.
-            T.wgmma_gemm(v_t, p, numerator, transpose_B=True)
-            T.warpgroup_wait(0)
-            T.warpgroup_fence_operand(numerator, num_regs=dim * heads // 128)
-
-            # The FP32 numerator still includes the constant FP8 P scale.
             for head in T.Parallel(heads):
                 alpha[head] = T.if_then_else(
                     denominator[head] > 0, 1.0 / (denominator[head] * 448.0), 0.0
