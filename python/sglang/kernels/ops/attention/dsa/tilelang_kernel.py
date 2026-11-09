@@ -1551,7 +1551,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             kv = T.alloc_shared([rows, dim], fp8)
             v_t = T.alloc_shared([dim, rows], fp8)
             p = T.alloc_shared([heads, rows], fp8)
-            scratch = T.alloc_shared([32, 272], T.uint8)
+            scratch = T.alloc_shared([rows, 272], T.uint8)
             transpose_tile = T.alloc_local([16, 16], fp8)
             scores = T.alloc_fragment([rows, heads], T.float32)
             numerator = T.alloc_fragment([dim, heads], T.float32)
@@ -1585,7 +1585,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.evaluate(
                     T.call_extern(
                         "int32",
-                        "remnant_glm_expand_wide_tile<64, true>",
+                        "remnant_glm_expand_wgmma_tile",
                         T.access_ptr(
                             kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256
                         ),

@@ -100,7 +100,7 @@ def load_baseline():
 
 def wgmma_shared_ranges(source: str) -> dict[str, tuple[int, int]]:
     """Read the generated allocation offsets and reject asynchronous aliases."""
-    sizes = dict(q=16 * 512, kv=64 * 512, v_t=512 * 64, p=16 * 64, scratch=32 * 272)
+    sizes = dict(q=16 * 512, kv=64 * 512, v_t=512 * 64, p=16 * 64, scratch=64 * 272)
     offsets = dict(
         re.findall(
             r"void\* (q|kv|v_t|p|scratch) = .*buf_dyn_shmem \+ (\d+)\)\);",
@@ -193,7 +193,7 @@ def precompile() -> dict:
         shared_ranges = wgmma_shared_ranges(partial)
         loader = next(
             (line.strip() for line in partial.splitlines()
-             if "remnant_glm_expand_wide_tile<64, true>(" in line),
+             if "remnant_glm_expand_wgmma_tile(" in line),
             None,
         )
         if loader is None:
@@ -208,11 +208,15 @@ def precompile() -> dict:
         barriers = len(re.findall(r"\bBAR\.SYNC\b", sass))
         if barriers > 24:
             raise RuntimeError(f"WGMMA partial emitted {barriers} CTA barriers: {batch=}")
+        async_copies = len(re.findall(r"\bLDGSTS\.", sass))
+        if async_copies < 8:
+            raise RuntimeError(f"WGMMA partial is missing async payload copies: {batch=}")
         compiled["decode_wgmma"][batch] = dict(
             partial=variant,
             combine=bind_decode_library(combine, artifacts),
             qgmma_sites=qgmma,
             cta_barrier_sites=barriers,
+            async_copy_sites=async_copies,
             local_sites=len(re.findall(r"\b(?:LDL|STL)\b", sass)),
             loader_call=loader,
             shared_ranges=shared_ranges,

@@ -66,63 +66,21 @@ __device__ __forceinline__ uint2 glm_expand8(const uint8_t* row, int rank, uint3
   return uint2{glm_expand4<Prefill>(lo, hi, selectors >> 16, mask >> 4), glm_expand4<Prefill>(lo, hi, selectors & 0xffff, mask & 15)};
 }
 
-template <bool Prefill = false, bool GlobalIndices = false>
-__device__ __forceinline__ int remnant_glm_expand_tile(
-    const void* values_raw,
-    const uint64_t* bitmap,
-    const int32_t* indices,
-    void* scratch_raw,
-    void* tile0,
-    void* tile1,
-    void* tile2,
-    void* tile3,
-    int64_t slots,
-    int64_t index_offset = 0) {
+template <bool Prefill>
+__device__ __forceinline__ void glm_expand_staged_row(
+    const uint8_t* scratch, ulonglong2 words, bool valid,
+    void* tile0, void* tile1, void* tile2, void* tile3) {
   const int row = threadIdx.x / 4, part = threadIdx.x % 4;
-  const int32_t* row_index = indices + index_offset + row;
-  // Aligned prefill reads immutable global indices. Other callers stage
-  // their indices in shared memory and use the ordinary load.
-  const int32_t index = GlobalIndices ? __ldg(row_index) : *row_index;
-  // Sign-extend before converting to unsigned so negative indices exceed
-  // any positive int64 slot count, even for caches above 2 GiB.
-  const bool valid = Prefill
-      ? static_cast<uint64_t>(static_cast<int64_t>(index)) < static_cast<uint64_t>(slots)
-      : index >= 0 && static_cast<int64_t>(index) < slots;
-  uint8_t* scratch = static_cast<uint8_t*>(scratch_raw) + row * 272;
-  uint64_t word0 = 0, word1 = 0;
-  // Address multiplication must be 64-bit: B64 histories exceed 2 GiB.
-  if (valid) {
-    const uint8_t* src = static_cast<const uint8_t*>(values_raw) + static_cast<int64_t>(index) * 256;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      // Adjacent lanes stage adjacent vectors. Expansion still reads the
-      // same ascending-coordinate payload from the same scratch addresses.
-      const int vector = Prefill ? 4 * i + part : 4 * part + i;
-      reinterpret_cast<uint4*>(scratch)[vector] =
-          __ldg(reinterpret_cast<const uint4*>(src) + vector);
-    }
-    const ulonglong2 words =
-        __ldg(reinterpret_cast<const ulonglong2*>(bitmap + static_cast<int64_t>(index) * 8 + part * 2));
-    word0 = words.x;
-    word1 = words.y;
-  } else {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int vector = Prefill ? 4 * i + part : 4 * part + i;
-      reinterpret_cast<uint4*>(scratch)[vector] = uint4{0, 0, 0, 0};
-    }
-  }
-  if (part == 0) *reinterpret_cast<uint4*>(scratch + 256) = uint4{0, 0, 0, 0};
-  const int count0 = __popcll(word0);
-  int count = count0 + __popcll(word1);
+  const int count0 = __popcll(words.x);
+  const int count1 = __popcll(words.y);
+  int count = count0 + count1;
   // All lanes participate, including invalid rows. Four-lane groups never
   // cross a warp, and no subgroup depends on another subgroup's scratch.
   int previous = __shfl_up_sync(0xffffffffu, count, 1, 4);
   if (part >= 1) count += previous;
   previous = __shfl_up_sync(0xffffffffu, count, 2, 4);
   if (part >= 2) count += previous;
-  const int prefix0 = count - count0 - __popcll(word1);
-  __syncwarp();
+  const int prefix0 = count - count0 - count1;
   uint8_t* tile = static_cast<uint8_t*>(part == 0 ? tile0 : part == 1 ? tile1 : part == 2 ? tile2 : tile3);
   if constexpr (Prefill) {
     // Invalid rows have no payload. Initialize the full swizzled output
@@ -132,12 +90,12 @@ __device__ __forceinline__ int remnant_glm_expand_tile(
       for (int vector = 0; vector < 8; ++vector) {
         reinterpret_cast<uint4*>(tile + row * 128)[vector] = uint4{0, 0, 0, 0};
       }
-      return 0;
+      return;
     }
   }
 #pragma unroll
   for (int fragment = 0; fragment < 8; ++fragment) {
-    const uint64_t word = fragment < 4 ? word0 : word1;
+    const uint64_t word = fragment < 4 ? words.x : words.y;
     const int offset = (fragment & 3) * 16;
     const int prefix = prefix0 + (fragment < 4 ? 0 : count0);
     int rank = prefix;
@@ -159,6 +117,58 @@ __device__ __forceinline__ int remnant_glm_expand_tile(
     // Native's inferred 128-byte-row XOR layout; explicitly annotated in TIR.
     *reinterpret_cast<uint4*>(tile + row * 128 + (j ^ ((row & 7) << 4))) = uint4{a.x, a.y, b.x, b.y};
   }
+}
+
+__device__ __forceinline__ bool glm_packed_valid_index(int32_t index, int64_t slots) {
+  // Sign-extend before converting to unsigned so negative indices exceed
+  // any positive int64 slot count, even for caches above 2 GiB.
+  return static_cast<uint64_t>(static_cast<int64_t>(index)) < static_cast<uint64_t>(slots);
+}
+
+__device__ __forceinline__ ulonglong2 glm_packed_load_words(
+    const uint64_t* bitmap, int32_t index, bool valid, int part) {
+  if (!valid) return ulonglong2{0, 0};
+  return __ldg(reinterpret_cast<const ulonglong2*>(
+      bitmap + static_cast<int64_t>(index) * 8 + part * 2));
+}
+
+template <bool Prefill = false, bool GlobalIndices = false>
+__device__ __forceinline__ int remnant_glm_expand_tile(
+    const void* values_raw,
+    const uint64_t* bitmap,
+    const int32_t* indices,
+    void* scratch_raw,
+    void* tile0,
+    void* tile1,
+    void* tile2,
+    void* tile3,
+    int64_t slots,
+    int64_t index_offset = 0) {
+  const int row = threadIdx.x / 4, part = threadIdx.x % 4;
+  const int32_t* row_index = indices + index_offset + row;
+  const int32_t index = GlobalIndices ? __ldg(row_index) : *row_index;
+  const bool valid = glm_packed_valid_index(index, slots);
+  uint8_t* scratch = static_cast<uint8_t*>(scratch_raw) + row * 272;
+  if (valid) {
+    // Address multiplication must be 64-bit: B64 histories exceed 2 GiB.
+    const uint8_t* src = static_cast<const uint8_t*>(values_raw) + static_cast<int64_t>(index) * 256;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int vector = Prefill ? 4 * i + part : 4 * part + i;
+      reinterpret_cast<uint4*>(scratch)[vector] =
+          __ldg(reinterpret_cast<const uint4*>(src) + vector);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int vector = Prefill ? 4 * i + part : 4 * part + i;
+      reinterpret_cast<uint4*>(scratch)[vector] = uint4{0, 0, 0, 0};
+    }
+  }
+  if (part == 0) *reinterpret_cast<uint4*>(scratch + 256) = uint4{0, 0, 0, 0};
+  const ulonglong2 words = glm_packed_load_words(bitmap, index, valid, part);
+  __syncwarp();
+  glm_expand_staged_row<Prefill>(scratch, words, valid, tile0, tile1, tile2, tile3);
   return 0;
 }
 
@@ -187,5 +197,64 @@ __device__ __forceinline__ int remnant_glm_expand_wide_tile(
         static_cast<uint8_t*>(tile2) + offset,
         static_cast<uint8_t*>(tile3) + offset, slots);
   }
+  return 0;
+}
+
+// Issue four 16-byte copies per lane. A four-lane row reads adjacent
+// vectors at each instruction. An invalid index zero-fills without reading
+// the source; using slot zero also keeps the operand address in range.
+__device__ __forceinline__ void glm_packed_stage_async(
+    const void* values, uint8_t* scratch, int32_t index, bool valid, int part) {
+  const int64_t slot = valid ? index : 0;
+  const auto* src = static_cast<const uint8_t*>(values) + slot * 256;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int offset = (4 * i + part) * 16;
+    const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(scratch + offset));
+    asm volatile(
+        "{ .reg .pred ignore; setp.ne.u32 ignore, %2, 0;"
+        " cp.async.cg.shared.global [%0], [%1], 16, ignore; }"
+        :: "r"(dst), "l"(src + offset), "r"(static_cast<uint32_t>(!valid)) : "memory");
+  }
+  if (part == 0) *reinterpret_cast<uint4*>(scratch + 256) = uint4{0, 0, 0, 0};
+}
+
+__device__ __forceinline__ int remnant_glm_expand_wgmma_tile(
+    const void* values,
+    const uint64_t* bitmap,
+    const int32_t* indices,
+    void* scratch_raw,
+    void* tile0,
+    void* tile1,
+    void* tile2,
+    void* tile3,
+    int64_t slots,
+    int64_t index_offset) {
+  const int row = threadIdx.x / 4, part = threadIdx.x % 4;
+  auto* scratch = static_cast<uint8_t*>(scratch_raw) + row * 272;
+  auto* next = scratch + 32 * 272;
+  const int32_t first_index = __ldg(indices + index_offset + row);
+  const int32_t next_index = __ldg(indices + index_offset + row + 32);
+  const bool first_valid = glm_packed_valid_index(first_index, slots);
+  const bool next_valid = glm_packed_valid_index(next_index, slots);
+  glm_packed_stage_async(values, scratch, first_index, first_valid, part);
+  glm_packed_stage_async(values, next, next_index, next_valid, part);
+  asm volatile("cp.async.commit_group;" ::: "memory");
+
+  const ulonglong2 first_words = glm_packed_load_words(bitmap, first_index, first_valid, part);
+  // Every lane must finish its copies before any lane reads another lane's
+  // portion of the row. Each row belongs to exactly one warp.
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+  __syncwarp();
+  glm_expand_staged_row<true>(
+      scratch, first_words, first_valid, tile0, tile1, tile2, tile3);
+  const ulonglong2 next_words = glm_packed_load_words(bitmap, next_index, next_valid, part);
+  constexpr int second_panel_offset = 32 * 128;
+  glm_expand_staged_row<true>(
+      next, next_words, next_valid,
+      static_cast<uint8_t*>(tile0) + second_panel_offset,
+      static_cast<uint8_t*>(tile1) + second_panel_offset,
+      static_cast<uint8_t*>(tile2) + second_panel_offset,
+      static_cast<uint8_t*>(tile3) + second_panel_offset);
   return 0;
 }
