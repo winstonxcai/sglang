@@ -325,6 +325,14 @@ def _verified_sm90_cubin(source: str, cache: dict[str, str]) -> Path:
     return cubin
 
 
+def dynamic_shared_bytes(host_source: str) -> int:
+    """Read TileLang's generated launch argument for dynamic shared memory."""
+    sizes = re.findall(r"v_int64\) = \(\(int64_t\)(\d+)\);", host_source)
+    if not sizes:
+        raise RuntimeError("Missing generated dynamic shared-memory size")
+    return int(sizes[-1])
+
+
 def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
     """Bind exact production cubins, generated ABI and dynamic shared bytes.
 
@@ -384,15 +392,12 @@ def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
         host = host_path.read_text()
         if hashlib.sha256(host.encode()).hexdigest() != cache.get(str(host_path)):
             raise RuntimeError(f"GLM generated host changed: {host_path}")
-        sizes = re.findall(r"v_int64\) = \(\(int64_t\)(\d+)\);", host)
-        if not sizes:
-            raise RuntimeError("Missing generated dynamic shared-memory size")
         variant.update(
             cubin_path=str(cubin),
             cubin_sha256=cache[str(cubin)],
             symbol=symbol,
             parameters=parameters,
-            dynamic_shared=int(sizes[-1]),
+            dynamic_shared=dynamic_shared_bytes(host),
         )
 
 

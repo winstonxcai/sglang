@@ -1517,13 +1517,15 @@ def sparse_mla_fwd_decode_partial_fp8(
     out_idx=[-2, -1],
     pass_configs={
         **pass_configs,
-        # QK reads Q and KV asynchronously. Keep the handoff to PV explicit.
+        # WGMMA still reads Q and KV after TileLang's synchronous liveness
+        # analysis sees their final access. Keep the transpose disjoint.
         tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
     },
 )
 def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
-    """Hopper decode with warpgroup QK and warp-level PV on one FP8 tile."""
+    """Hopper decode with a shared PV buffer reused by two feature halves."""
     heads, dim, topk, rows = 16, 512, 2112, 64
+    half = dim // 2
     tile_count = topk // rows
     groups = (tile_count + inner_iter - 1) // inner_iter
     log2_scale = sm_scale * 1.44269504
@@ -1548,11 +1550,12 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             T.import_source(source)
             q = T.alloc_shared([heads, dim], fp8)
             kv = T.alloc_shared([rows, dim], fp8)
+            v_t = T.alloc_shared([half, rows], fp8)
             p = T.alloc_shared([heads, rows], fp8)
-            pv_scale = T.alloc_shared([heads], T.float32)
             scratch = T.alloc_shared([32, 272], T.uint8)
             scores = T.alloc_fragment([rows, heads], T.float32)
-            numerator = T.alloc_fragment([heads, dim], T.float32)
+            numerator_left = T.alloc_fragment([half, heads], T.float32)
+            numerator_right = T.alloc_fragment([half, heads], T.float32)
             maximum = T.alloc_fragment([heads], T.float32)
             previous = T.alloc_fragment([heads], T.float32)
             alpha = T.alloc_fragment([heads], T.float32)
@@ -1562,7 +1565,8 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
 
             T.annotate_layout({kv: tilelang.layout.make_full_bank_swizzled_layout(kv)})
             T.copy(q_fp8[0, query, :, :], q)
-            T.fill(numerator, 0)
+            T.fill(numerator_left, 0)
+            T.fill(numerator_right, 0)
             T.fill(maximum, -(2**30))
             T.fill(denominator, 0)
 
@@ -1598,7 +1602,16 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.fence_proxy_async()
                 T.sync_threads()
                 # K @ Q^T puts 64 selected rows on the warpgroup M axis.
+                # Stage the left half of V while QK reads the same K tile.
                 T.wgmma_gemm(kv, q, scores, transpose_B=True, clear_accum=True)
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_transpose_wgmma_tile<256, 0>",
+                        T.access_ptr(kv, "r"),
+                        T.access_ptr(v_t, "w"),
+                    )
+                )
                 T.warpgroup_wait(0)
                 T.warpgroup_fence_operand(scores, num_regs=rows * heads // 128)
 
@@ -1620,16 +1633,38 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 T.reduce_sum(scores, tile_sum, dim=0, batch=4)
                 for head in T.Parallel(heads):
                     denominator[head] = denominator[head] * alpha[head] + tile_sum[head]
-                # QK and PV distribute heads across different lanes.
-                T.copy(alpha, pv_scale)
-                T.sync_threads()
-                for head, column in T.Parallel(heads, dim):
-                    numerator[head, column] *= pv_scale[head]
+                for column, head in T.Parallel(half, heads):
+                    numerator_left[column, head] *= alpha[head]
+                    numerator_right[column, head] *= alpha[head]
 
-                # Warp MMA reads the same SW128 tile with features as its
-                # output columns. Keep the FP8 probability scale in the
-                # numerator until normalization.
-                T.gemm(p, kv, numerator, policy=T.GemmWarpPolicy.FullCol)
+                # V^T @ P^T keeps both FP8 operands contiguous in K.
+                # Leave the constant probability scale in the FP32 numerator
+                # until the final normalization to avoid a second fragment.
+                T.fence_proxy_async()
+                T.sync_threads()
+                T.wgmma_gemm(v_t, p, numerator_left, transpose_B=True)
+                T.warpgroup_wait(0)
+                T.warpgroup_fence_operand(
+                    numerator_left, num_regs=half * heads // 128
+                )
+                # The completed PV releases V for the right half. Its
+                # probabilities and the expanded K remain live and unchanged.
+                T.sync_threads()
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_transpose_wgmma_tile<256, 256>",
+                        T.access_ptr(kv, "r"),
+                        T.access_ptr(v_t, "w"),
+                    )
+                )
+                T.fence_proxy_async()
+                T.sync_threads()
+                T.wgmma_gemm(v_t, p, numerator_right, transpose_B=True)
+                T.warpgroup_wait(0)
+                T.warpgroup_fence_operand(
+                    numerator_right, num_regs=half * heads // 128
+                )
 
             for head in T.Parallel(heads):
                 alpha[head] = T.if_then_else(
@@ -1640,12 +1675,12 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                     T.log2(denominator[head]) + maximum[head] * log2_scale,
                     -(2**30),
                 )
-            T.sync_threads()
-            T.copy(alpha, pv_scale)
-            T.sync_threads()
-            for head, column in T.Parallel(heads, dim):
+            for column, head in T.Parallel(half, heads):
                 partial_o[0, query, group, head, column] = (
-                    numerator[head, column] * pv_scale[head]
+                    numerator_left[column, head] * alpha[head]
+                )
+                partial_o[0, query, group, head, column + half] = (
+                    numerator_right[column, head] * alpha[head]
                 )
 
     return main.with_attr("global_symbol", "glm_packed_partial_wgmma")

@@ -2399,24 +2399,20 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
     )
     candidate = copy.deepcopy(compiled)
     candidate["decode_wgmma"] = {
-        str(batch): dict(
-            partial=dict(wgmma), combine=dict(wgmma), qgmma_sites=16, warp_mma_sites=32
-        )
+        str(batch): dict(partial=dict(wgmma), combine=dict(wgmma), qgmma_sites=32)
         for batch in upstream.WGMMA_INNER
     }
     upstream.verify_compilation(candidate)
-    for change in ("geometry", "qgmma", "warp_mma", "library"):
+    for change in ("geometry", "instructions", "library"):
         broken = copy.deepcopy(candidate)
         variants = broken["decode_wgmma"]
         if change == "geometry":
             variants.pop("64")
-        elif change == "qgmma":
-            variants["64"]["qgmma_sites"] = 32
-        elif change == "warp_mma":
-            variants["64"].pop("warp_mma_sites")
+        elif change == "instructions":
+            variants["64"]["qgmma_sites"] = 16
         else:
             variants["64"]["partial"]["library_sha256"] = "wrong"
-        with pytest.raises(RuntimeError, match="WGMMA|QK/PV"):
+        with pytest.raises(RuntimeError, match="WGMMA"):
             upstream.verify_compilation(broken)
     for change in ("missing", "source", "binary", "missing_binding"):
         candidate = copy.deepcopy(compiled)
@@ -2437,7 +2433,7 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
 
 
 def test_glm_wgmma_shared_ranges_reject_async_operand_aliases():
-    offsets = dict(q=0, kv=8192, scratch=40960, p=49664, pv_scale=50688)
+    offsets = dict(q=0, kv=8192, v_t=40960, scratch=57344, p=66048)
 
     def generated() -> str:
         return "\n".join(
@@ -2446,7 +2442,7 @@ def test_glm_wgmma_shared_ranges_reject_async_operand_aliases():
         )
 
     assert upstream.wgmma_shared_ranges(generated())["kv"] == (8192, 40960)
-    offsets["p"] = 0
+    offsets["v_t"] = 0
     with pytest.raises(RuntimeError, match="Aliased WGMMA"):
         upstream.wgmma_shared_ranges(generated())
 

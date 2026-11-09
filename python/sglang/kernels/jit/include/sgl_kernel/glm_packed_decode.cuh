@@ -189,3 +189,52 @@ __device__ __forceinline__ int remnant_glm_expand_wide_tile(
   }
   return 0;
 }
+
+// Transpose one aligned feature range of the 64x512 FP8 SW128 K tile
+// into a dense SW64 PV operand.
+// A warp owns 16 history rows and processes two 16x16 byte tiles per step.
+// Hopper's matrix instructions move 16-bit pairs, so permute the raw bytes
+// between the transposed load and the store. FP8 bit patterns stay intact.
+template <int Columns, int FeatureStart>
+__device__ __forceinline__ int remnant_glm_transpose_wgmma_tile(
+    const void* kv_raw, void* v_raw) {
+  static_assert(Columns > 0 && Columns % 32 == 0);
+  static_assert(
+      FeatureStart >= 0 && FeatureStart % 32 == 0 && FeatureStart + Columns <= 512);
+  const auto* kv = static_cast<const uint8_t*>(kv_raw);
+  auto* v = static_cast<uint8_t*>(v_raw);
+  const int lane = threadIdx.x & 31;
+  const int row_base = (threadIdx.x >> 5) * 16;
+  // Eight lanes supply eight row addresses per b16 matrix. Within each
+  // 16-row tile, load rows [0,1,4,5,...] in one matrix and [2,3,6,7,...]
+  // in the other. A register pair then holds four consecutive history rows.
+  const int matrix_row = lane & 7;
+  const int matrix_parity = (lane >> 3) & 1;
+  const int src_row = row_base + 4 * (matrix_row / 2) + matrix_row % 2 + 2 * matrix_parity;
+#pragma unroll
+  for (int base = 0; base < Columns; base += 32) {
+    const int tile_col = base + (lane >> 4) * 16;
+    const int src_col = FeatureStart + tile_col;
+    const int kv_offset =
+        (src_col / 128) * (64 * 128) + src_row * 128 + ((src_col % 128) ^ ((src_row & 7) << 4));
+    const uint32_t kv_addr = static_cast<uint32_t>(__cvta_generic_to_shared(kv + kv_offset));
+    uint32_t a0, b0, a1, b1;
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(a0), "=r"(b0), "=r"(a1), "=r"(b1) : "r"(kv_addr) : "memory");
+
+    // Even and odd bytes become separate matrices whose rows are features
+    // and whose columns are the consecutive history bytes.
+    const uint32_t even0 = __byte_perm(a0, b0, 0x6420);
+    const uint32_t odd0 = __byte_perm(a0, b0, 0x7531);
+    const uint32_t even1 = __byte_perm(a1, b1, 0x6420);
+    const uint32_t odd1 = __byte_perm(a1, b1, 0x7531);
+    const int dst_col = tile_col + 2 * matrix_row + matrix_parity;
+    const int v_offset = dst_col * 64 + (row_base ^ ((dst_col & 6) << 3));
+    const uint32_t v_addr = static_cast<uint32_t>(__cvta_generic_to_shared(v + v_offset));
+    asm volatile(
+        "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};"
+        :: "r"(v_addr), "r"(even0), "r"(odd0), "r"(even1), "r"(odd1) : "memory");
+  }
+  return 0;
+}

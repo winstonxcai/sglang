@@ -100,10 +100,10 @@ def load_baseline():
 
 def wgmma_shared_ranges(source: str) -> dict[str, tuple[int, int]]:
     """Read the generated allocation offsets and reject asynchronous aliases."""
-    sizes = dict(q=16 * 512, kv=64 * 512, p=16 * 64, pv_scale=16 * 4, scratch=32 * 272)
+    sizes = dict(q=16 * 512, kv=64 * 512, v_t=256 * 64, p=16 * 64, scratch=32 * 272)
     offsets = dict(
         re.findall(
-            r"void\* (q|kv|p|pv_scale|scratch) = .*buf_dyn_shmem \+ (\d+)\)\);",
+            r"void\* (q|kv|v_t|p|scratch) = .*buf_dyn_shmem \+ (\d+)\)\);",
             source,
         )
     )
@@ -124,6 +124,7 @@ def precompile() -> dict:
     from sglang.benchmark.remnant.glm_artifacts import (
         bind_decode_library,
         bind_partial_launch_metadata,
+        dynamic_shared_bytes,
     )
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         glm_packed_decode_combine,
@@ -203,27 +204,51 @@ def precompile() -> dict:
         )
         # Hopper encodes FP8 warpgroup MMA as QGMMA.
         qgmma = len(re.findall(r"\bQGMMA\.", sass))
-        warp_mma = len(re.findall(r"\b(?:HMMA|QMMA)\.", sass))
-        if qgmma != 16 or warp_mma == 0:
-            raise RuntimeError(
-                f"Expected FP8 warpgroup QK and warp PV: {batch=} {qgmma=} {warp_mma=}"
-            )
+        if qgmma != 32:
+            raise RuntimeError(f"WGMMA partial has {qgmma} QGMMA sites: {batch=}")
         barriers = len(re.findall(r"\bBAR\.SYNC\b", sass))
         if barriers > 24:
             raise RuntimeError(f"WGMMA partial emitted {barriers} CTA barriers: {batch=}")
+        matrix_loads = len(re.findall(r"\bLDSM\.", sass))
+        matrix_stores = len(re.findall(r"\bSTSM\.", sass))
+        if (matrix_loads, matrix_stores) != (16, 16):
+            raise RuntimeError(f"Unexpected WGMMA transpose instruction count: {batch=}")
+        if not re.search(r"initialize_wgmma_descriptor<2, 1, 32>[^\n]*v_t", partial):
+            raise RuntimeError(f"WGMMA transpose destination must use SW64: {batch=}")
+        halves = re.findall(
+            r"^\s*remnant_glm_transpose_wgmma_tile<256,\s*(\d+)>\(",
+            partial,
+            re.MULTILINE,
+        )
+        if halves != ["0", "256"]:
+            raise RuntimeError(f"WGMMA requires both feature halves in order: {batch=}")
+        host = Path(variant["library_path"]).with_name("host_kernel.cu").read_text()
+        dynamic_shared = dynamic_shared_bytes(host)
+        resources = subprocess.check_output(
+            ["cuobjdump", "--dump-resource-usage", variant["cubin_path"]],
+            text=True,
+            timeout=30,
+        ).strip()
+        static_shared = re.search(r"\bSHARED:(\d+)\b", resources)
+        # Hopper provides 228 KiB per SM and reserves 1 KiB per CTA.
+        if (
+            not static_shared
+            or dynamic_shared < max(end for _, end in shared_ranges.values())
+            or 3 * (dynamic_shared + int(static_shared[1]) + 1024) > 228 * 1024
+        ):
+            raise RuntimeError(f"WGMMA half tile exceeds three-CTA shared budget: {batch=}")
         compiled["decode_wgmma"][batch] = dict(
             partial=variant,
             combine=bind_decode_library(combine, artifacts),
             qgmma_sites=qgmma,
             cta_barrier_sites=barriers,
-            warp_mma_sites=warp_mma,
+            matrix_load_sites=matrix_loads,
+            matrix_store_sites=matrix_stores,
             local_sites=len(re.findall(r"\b(?:LDL|STL)\b", sass)),
             loader_call=loader,
             shared_ranges=shared_ranges,
-            resource_usage=subprocess.check_output(
-                ["cuobjdump", "--dump-resource-usage", variant["cubin_path"]],
-                text=True, timeout=30,
-            ).strip(),
+            dynamic_shared_bytes=dynamic_shared,
+            resource_usage=resources,
         )
     return compiled
 
@@ -265,8 +290,8 @@ def verify_compilation(compiled: dict) -> None:
                     for artifact in ("cubin", "library")
                 ):
                     raise RuntimeError(f"Unbound WGMMA decode {kind}: {batch=}")
-            if record["qgmma_sites"] != 16 or record.get("warp_mma_sites", 0) <= 0:
-                raise RuntimeError(f"Missing CPU-verified QK/PV instructions: {batch=}")
+            if record["qgmma_sites"] != 32:
+                raise RuntimeError(f"Missing CPU-verified WGMMA instructions: {batch=}")
     for name, expected in artifacts.items():
         path = Path(name)
         if (
