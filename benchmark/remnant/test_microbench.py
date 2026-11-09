@@ -2524,3 +2524,25 @@ def test_glm_upstream_direct_split_policy_bounds_partial_traffic():
         (11, 512),
         (6, 512),
     }
+
+
+def test_glm_upstream_geometry_is_bound_to_combine_artifact_scope():
+    cfg = glm._cpu_contract("glm_config")
+    for tuned in (False, True):
+        payload = _glm_upstream_payload()
+        variants = cfg.H200_PACKED_DECODE_COMBINE if tuned else ((66, 128), (33, 512))
+        compiled = {"decode_combine": {f"{g}x{c}": {} for g, c in variants}}
+        payload["source"]["compiled_build"] = {"glm_compile": compiled}
+        for row in payload["cases"]:
+            queries = row["case"]["queries"]
+            fixture = row["fixture"]
+            fixture["direct_combine_columns"] = 128 if queries == 1 else 512
+            if tuned:
+                inner = cfg.H200_PACKED_DECODE_INNER[queries]
+                fixture["path_geometry"]["direct"] = dict(
+                    tile_rows=32, inner_iter=inner, partial_groups=66 // inner
+                )
+        glm.validate_timing(payload)
+        payload["cases"][0]["fixture"].pop("direct_combine_columns")
+        with pytest.raises(RuntimeError, match="geometry"):
+            glm.validate_timing(payload)

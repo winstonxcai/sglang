@@ -949,18 +949,22 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
                 .get("compiled_build", {})
                 .get("glm_compile", {})
             )
-            if "decode_combine" in compiled:
-                policy = _cpu_contract("glm_config").H200_PACKED_DECODE_INNER
-                direct_inner = policy[definition.queries]
-                geometry["direct"].update(
-                    inner_iter=direct_inner, partial_groups=66 // direct_inner
-                )
+            variants = set(compiled.get("decode_combine", {}))
+            expected_columns = None
+            if variants:
+                config = _cpu_contract("glm_config")
+                tuned = {f"{g}x{c}" for g, c in config.H200_PACKED_DECODE_COMBINE}
+                if variants == tuned:
+                    direct_inner = config.H200_PACKED_DECODE_INNER[definition.queries]
+                    geometry["direct"].update(
+                        inner_iter=direct_inner, partial_groups=66 // direct_inner
+                    )
+                elif variants != {"66x128", "33x512"}:
+                    raise RuntimeError("Unknown upstream decode combine geometry")
+                expected_columns = 128 if definition.queries == 1 else 512
             if (
                 fixture.get("changing_input_replay") != "passed"
-                or fixture.get(
-                    "direct_combine_columns", 128 if definition.queries == 1 else 512
-                )
-                != (128 if definition.queries == 1 else 512)
+                or fixture.get("direct_combine_columns") != expected_columns
                 or fixture.get("path_geometry") != geometry
                 or "H200" not in payload.get("source", {}).get("device", "")
             ):
