@@ -1513,6 +1513,135 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main.with_attr("global_symbol", "glm_packed_partial") if packed else main
 
 
+@tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
+def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
+    """Hopper experiment with one warpgroup and 64 selected rows per tile."""
+    heads, dim, topk, rows = 16, 512, 2112, 64
+    tile_count = topk // rows
+    groups = (tile_count + inner_iter - 1) // inner_iter
+    log2_scale = sm_scale * 1.44269504
+    seq_len = T.symbolic("seq_len")
+    num_pages = T.symbolic("num_pages")
+    fp8 = "float8_e4m3fn"
+    source = (
+        Path(__file__).resolve().parents[3]
+        / "jit/include/sgl_kernel/glm_packed_decode.cuh"
+    ).read_text()
+
+    @T.prim_func
+    def main(
+        q_fp8: T.Tensor([1, seq_len, heads, dim], fp8),
+        kv_fp8: T.Tensor([1, num_pages, 1, 256], fp8),
+        bitmap: T.Tensor([num_pages, 8], T.uint64),
+        indices: T.Tensor([1, seq_len, 1, topk], T.int32),
+        partial_o: T.Tensor([1, seq_len, groups, heads, dim], T.bfloat16),
+        partial_lse: T.Tensor([1, seq_len, groups, heads], T.float32),
+    ):
+        with T.Kernel(seq_len, groups, threads=128) as (query, group):
+            T.import_source(source)
+            q = T.alloc_shared([heads, dim], fp8)
+            kv = T.alloc_shared([rows, dim], fp8)
+            v_t = T.alloc_shared([dim, rows], fp8)
+            p = T.alloc_shared([heads, rows], fp8)
+            scratch = T.alloc_shared([32, 272], T.uint8)
+            scores = T.alloc_fragment([rows, heads], T.float32)
+            numerator = T.alloc_fragment([dim, heads], T.float32)
+            maximum = T.alloc_fragment([heads], T.float32)
+            previous = T.alloc_fragment([heads], T.float32)
+            alpha = T.alloc_fragment([heads], T.float32)
+            tile_sum = T.alloc_fragment([heads], T.float32)
+            denominator = T.alloc_fragment([heads], T.float32)
+            valid = T.alloc_fragment([rows], T.bool)
+
+            T.annotate_layout({kv: tilelang.layout.make_full_bank_swizzled_layout(kv)})
+            T.copy(q_fp8[0, query, :, :], q)
+            T.fill(numerator, 0)
+            T.fill(maximum, -(2**30))
+            T.fill(denominator, 0)
+
+            # The last split can be short. All lanes take the same loop bound.
+            for step in T.serial(T.min(inner_iter, tile_count - group * inner_iter)):
+                start = (group * inner_iter + step) * rows
+                for row in T.Parallel(rows):
+                    index = indices[0, query, 0, start + row]
+                    valid[row] = (index >= 0) & (index < num_pages)
+                # TileLang's SW128 layout stores four consecutive K panels.
+                # Each panel has the 128-byte row swizzle used by the loader.
+                T.sync_threads()
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_expand_wide_tile<64, true>",
+                        T.access_ptr(
+                            kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256
+                        ),
+                        T.access_ptr(
+                            bitmap, "r", extent=T.Cast("int64", num_pages) * 8
+                        ),
+                        T.access_ptr(indices, "r"),
+                        T.access_ptr(scratch, "rw"),
+                        T.access_ptr(kv[0, 0], "w", extent=rows * 128),
+                        T.access_ptr(kv[0, 128], "w", extent=rows * 128),
+                        T.access_ptr(kv[0, 256], "w", extent=rows * 128),
+                        T.access_ptr(kv[0, 384], "w", extent=rows * 128),
+                        T.Cast("int64", num_pages),
+                        T.Cast("int64", query) * topk + start,
+                    )
+                )
+                T.fence_proxy_async()
+                T.sync_threads()
+                # K @ Q^T puts 64 selected rows on the warpgroup M axis.
+                # V's transpose reads the same tile while QK is in flight.
+                T.wgmma_gemm(kv, q, scores, transpose_B=True, clear_accum=True)
+                T.transpose(kv, v_t)
+                T.warpgroup_wait(0)
+                T.warpgroup_fence_operand(scores, num_regs=rows * heads // 128)
+
+                for row, head in T.Parallel(rows, heads):
+                    scores[row, head] = T.if_then_else(
+                        valid[row], scores[row, head], -T.infinity(T.float32)
+                    )
+                T.copy(maximum, previous)
+                T.reduce_max(scores, maximum, dim=0, clear=False)
+                for head in T.Parallel(heads):
+                    alpha[head] = T.exp2((previous[head] - maximum[head]) * log2_scale)
+                for row, head in T.Parallel(rows, heads):
+                    scores[row, head] = T.exp2(
+                        scores[row, head] * log2_scale - maximum[head] * log2_scale
+                    )
+                    p[head, row] = scores[row, head] * 448.0
+                T.reduce_sum(scores, tile_sum, dim=0)
+                for head in T.Parallel(heads):
+                    denominator[head] = denominator[head] * alpha[head] + tile_sum[head]
+                for column, head in T.Parallel(dim, heads):
+                    numerator[column, head] *= alpha[head]
+
+                # V^T @ P^T keeps both FP8 operands contiguous in K.
+                # Leave the constant probability scale in the FP32 numerator
+                # until the final normalization to avoid a second fragment.
+                T.fence_proxy_async()
+                T.sync_threads()
+                T.wgmma_gemm(v_t, p, numerator, transpose_B=True)
+                T.warpgroup_wait(0)
+                T.warpgroup_fence_operand(numerator, num_regs=dim * heads // 128)
+
+            for head in T.Parallel(heads):
+                alpha[head] = T.if_then_else(
+                    denominator[head] > 0, 1.0 / (denominator[head] * 448.0), 0.0
+                )
+                partial_lse[0, query, group, head] = T.if_then_else(
+                    denominator[head] > 0,
+                    T.log2(denominator[head]) + maximum[head] * log2_scale,
+                    -(2**30),
+                )
+            for column, head in T.Parallel(dim, heads):
+                partial_o[0, query, group, head, column] = (
+                    numerator[column, head] * alpha[head]
+                )
+
+    return main.with_attr("global_symbol", "glm_packed_partial_wgmma")
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,

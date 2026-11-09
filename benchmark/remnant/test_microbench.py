@@ -2393,6 +2393,27 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
         ],
     )
     upstream.verify_compilation(compiled)
+    wgmma = dict(
+        cubin_path=str(cubin), cubin_sha256=digest,
+        library_path=str(cubin), library_sha256=digest,
+    )
+    candidate = copy.deepcopy(compiled)
+    candidate["decode_wgmma"] = {
+        str(batch): dict(partial=dict(wgmma), combine=dict(wgmma), hgmma_sites=32)
+        for batch in upstream.WGMMA_INNER
+    }
+    upstream.verify_compilation(candidate)
+    for change in ("geometry", "instructions", "library"):
+        broken = copy.deepcopy(candidate)
+        variants = broken["decode_wgmma"]
+        if change == "geometry":
+            variants.pop("64")
+        elif change == "instructions":
+            variants["64"]["hgmma_sites"] = 16
+        else:
+            variants["64"]["partial"]["library_sha256"] = "wrong"
+        with pytest.raises(RuntimeError, match="WGMMA"):
+            upstream.verify_compilation(broken)
     for change in ("missing", "source", "binary", "missing_binding"):
         candidate = copy.deepcopy(compiled)
         if change == "missing":

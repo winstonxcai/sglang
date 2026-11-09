@@ -13,6 +13,7 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 from functools import cache
@@ -28,6 +29,7 @@ FILES = {
 }
 SOURCE_ENV = "REMNANT_GLM_UPSTREAM_SOURCE"
 IMAGE_SOURCE = "/opt/remnant-glm-upstream-v0522"
+WGMMA_INNER = {8: 1, 16: 2, 24: 3, 32: 4, 64: 8}
 
 
 def identity() -> dict:
@@ -98,7 +100,14 @@ def load_baseline():
 
 def precompile() -> dict:
     """Compile only heads16 decode partial/combine variants on CPU/SM90a."""
-    from sglang.benchmark.remnant.glm_artifacts import bind_partial_launch_metadata
+    from sglang.benchmark.remnant.glm_artifacts import (
+        bind_decode_library,
+        bind_partial_launch_metadata,
+    )
+    from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+        glm_packed_decode_combine,
+        glm_packed_wgmma_partial,
+    )
 
     required = ("TRITON_CACHE_DIR", "TILELANG_CACHE_DIR", SOURCE_ENV)
     if any(not os.environ.get(name) for name in required):
@@ -138,6 +147,15 @@ def precompile() -> dict:
             block_I=32,
             threads=128,
         )
+    wgmma = {}
+    for batch, inner in WGMMA_INNER.items():
+        groups = (33 + inner - 1) // inner
+        partial = glm_packed_wgmma_partial(inner, 256**-0.5)
+        combine = glm_packed_decode_combine(16, 512, groups, 512)
+        wgmma[str(batch)] = (
+            partial.get_kernel_source(),
+            combine.get_kernel_source(),
+        )
     compiled = dict(
         source=identity(),
         tilelang=variants,
@@ -149,6 +167,34 @@ def precompile() -> dict:
         },
     )
     bind_partial_launch_metadata(compiled)
+    artifacts = compiled["cache_files"]
+    compiled["decode_wgmma"] = {}
+    for batch, (partial, combine) in wgmma.items():
+        variant = bind_decode_library(partial, artifacts)
+        loader = next(
+            (line.strip() for line in partial.splitlines()
+             if "remnant_glm_expand_wide_tile<64, true>(" in line),
+            None,
+        )
+        if loader is None:
+            raise RuntimeError(f"Missing Packed vector expansion: {batch=}")
+        sass = subprocess.check_output(
+            ["cuobjdump", "--dump-sass", variant["cubin_path"]], text=True, timeout=30
+        )
+        hgmm = len(re.findall(r"\bHGMMA\.", sass))
+        if hgmm < 32:
+            raise RuntimeError(f"WGMMA partial has only {hgmm} HGMMA sites: {batch=}")
+        compiled["decode_wgmma"][batch] = dict(
+            partial=variant,
+            combine=bind_decode_library(combine, artifacts),
+            hgmma_sites=hgmm,
+            local_sites=len(re.findall(r"\b(?:LDL|STL)\b", sass)),
+            loader_call=loader,
+            resource_usage=subprocess.check_output(
+                ["cuobjdump", "--dump-resource-usage", variant["cubin_path"]],
+                text=True, timeout=30,
+            ).strip(),
+        )
     return compiled
 
 
@@ -176,6 +222,21 @@ def verify_compilation(compiled: dict) -> None:
             raise RuntimeError("Unbound upstream cubin")
     if not artifacts:
         raise RuntimeError("Missing upstream compiled artifacts")
+    if wgmma := compiled.get("decode_wgmma"):
+        if set(wgmma) != {str(batch) for batch in WGMMA_INNER}:
+            raise RuntimeError("Missing WGMMA decode specializations")
+        for batch, record in wgmma.items():
+            for kind in ("partial", "combine"):
+                variant = record[kind]
+                if any(
+                    not variant.get(f"{artifact}_sha256")
+                    or artifacts.get(variant.get(f"{artifact}_path"))
+                    != variant[f"{artifact}_sha256"]
+                    for artifact in ("cubin", "library")
+                ):
+                    raise RuntimeError(f"Unbound WGMMA decode {kind}: {batch=}")
+            if record["hgmma_sites"] < 32:
+                raise RuntimeError(f"Missing CPU-verified WGMMA instructions: {batch=}")
     for name, expected in artifacts.items():
         path = Path(name)
         if (

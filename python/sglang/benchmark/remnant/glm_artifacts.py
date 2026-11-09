@@ -231,45 +231,50 @@ def precompile_sm90() -> None:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
-    artifacts["decode_combine"] = {}
-    for geometry, source in combine_sources.items():
-        digest = hashlib.sha256(source.encode()).hexdigest()
-        cache = artifacts["cache_files"]
-        libraries = [
-            str(Path(path).with_name("executable.so"))
-            for path, h in cache.items()
-            if path.endswith("/device_kernel.cu") and h == digest
-        ]
-        libraries = [name for name in libraries if name in cache]
-        if len(libraries) != 1:
-            raise RuntimeError(f"Expected one cached GLM combine library: {geometry}")
-        cubin = _verified_sm90_cubin(source, cache)
-        library = libraries[0]
-        artifacts["decode_combine"][geometry] = {
-            "source_sha256": digest,
-            "cubin_path": str(cubin),
-            "cubin_sha256": cache[str(cubin)],
-            "library_path": library,
-            "library_sha256": cache[library],
-        }
+    artifacts["decode_combine"] = {
+        geometry: bind_decode_library(source, artifacts["cache_files"])
+        for geometry, source in combine_sources.items()
+    }
     bind_partial_launch_metadata(artifacts)
     Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).write_text(
         json.dumps(artifacts, indent=2) + "\n"
     )
 
 
-def verify_decode_combine_library(kernel, variant: dict[str, str]) -> None:
+def bind_decode_library(source: str, cache: dict[str, str]) -> dict[str, str]:
+    """Record the CPU cubin and TVM FFI library for a generated decode kernel."""
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    libraries = [
+        str(Path(path).with_name("executable.so"))
+        for path, value in cache.items()
+        if path.endswith("/device_kernel.cu") and value == digest
+    ]
+    libraries = [name for name in libraries if name in cache]
+    if len(libraries) != 1:
+        raise RuntimeError(f"Expected one cached GLM decode library: {digest}")
+    cubin = str(_verified_sm90_cubin(source, cache))
+    library = libraries[0]
+    return dict(
+        source_sha256=digest,
+        cubin_path=cubin,
+        cubin_sha256=cache[cubin],
+        library_path=library,
+        library_sha256=cache[library],
+    )
+
+
+def verify_decode_library(kernel, variant: dict[str, str]) -> None:
     """Require the TVM FFI adapter to load the library prepared on CPU."""
     library = getattr(kernel.adapter, "libpath", None)
     if library is None or Path(library) != Path(variant["library_path"]):
-        raise RuntimeError(f"GLM combine did not load the prepared library: {library}")
+        raise RuntimeError(f"GLM decode did not load the prepared library: {library}")
     if (
         hashlib.sha256(Path(library).read_bytes()).hexdigest()
         != variant["library_sha256"]
         or hashlib.sha256(kernel.get_kernel_source().encode()).hexdigest()
         != variant["source_sha256"]
     ):
-        raise RuntimeError("Prepared GLM combine library or device source changed")
+        raise RuntimeError("Prepared GLM decode library or device source changed")
 
 
 def verify_decode_partial_library(kernel, variant: PartialVariant) -> None:

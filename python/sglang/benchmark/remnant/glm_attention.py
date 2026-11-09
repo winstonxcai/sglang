@@ -347,9 +347,11 @@ class Fixture:
         packed_prefill_tile: int = 32,
         gpu_family: str = "H100",
         upstream: bool = False,
+        wgmma: dict | None = None,
     ):
         self.upstream = upstream
         self.packed_prefill_tile = packed_prefill_tile
+        self.wgmma_kernels = None
         import torch
 
         from sglang.srt.layers.layernorm import RMSNorm
@@ -488,47 +490,54 @@ class Fixture:
         )
         if upstream:
             from sglang.benchmark.remnant.glm_artifacts import (
-                verify_decode_combine_library,
+                verify_decode_library,
                 verify_decode_partial_library,
             )
+            from sglang.benchmark.remnant.glm_upstream import WGMMA_INNER
             from sglang.srt.remnant.glm_config import H200_PACKED_DECODE_INNER
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 glm_packed_decode_combine,
+                glm_packed_wgmma_partial,
                 sparse_mla_fwd_decode_partial_fp8,
             )
 
             columns = 128 if case.queries == 1 else 512
-            self.packed_decode_inner = H200_PACKED_DECODE_INNER[case.queries]
-            groups = 66 // self.packed_decode_inner
+            if wgmma is not None and case.queries > 1:
+                variant = wgmma[str(case.queries)]
+                inner = WGMMA_INNER[case.queries]
+                tile_rows = 64
+                groups = (33 + inner - 1) // inner
+                partial = glm_packed_wgmma_partial(inner, SCALE)
+                verify_decode_library(partial, variant["partial"])
+                combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
+                verify_decode_library(combine, variant["combine"])
+                self.wgmma_kernels = partial, combine
+            else:
+                tile_rows = 32
+                inner = self.packed_decode_inner = H200_PACKED_DECODE_INNER[case.queries]
+                groups = 66 // inner
+                manifest = json.loads(
+                    Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text()
+                )
+                (partial_variant,) = (
+                    item
+                    for item in manifest["tilelang"]
+                    if item["packed"]
+                    and item["heads"] == case.heads
+                    and item.get("block_i", 32) == tile_rows
+                    and item["inner"] == inner
+                )
+                partial = sparse_mla_fwd_decode_partial_fp8(
+                    case.heads, DIM, 0, COLUMNS, packed=True, sm_scale=SCALE,
+                    block_I=tile_rows, inner_iter=inner, threads=128,
+                )
+                verify_decode_partial_library(partial, partial_variant)
+                variant = manifest["decode_combine"][f"{groups}x{columns}"]
+                combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
+                verify_decode_library(combine, variant)
             self.identity["path_geometry"]["direct"].update(
-                inner_iter=self.packed_decode_inner, partial_groups=groups
+                tile_rows=tile_rows, inner_iter=inner, partial_groups=groups
             )
-            manifest = json.loads(
-                Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text()
-            )
-            (partial_variant,) = (
-                item
-                for item in manifest["tilelang"]
-                if item["packed"]
-                and item["heads"] == case.heads
-                and item.get("block_i", 32) == 32
-                and item["inner"] == self.packed_decode_inner
-            )
-            partial = sparse_mla_fwd_decode_partial_fp8(
-                case.heads,
-                DIM,
-                0,
-                COLUMNS,
-                packed=True,
-                sm_scale=SCALE,
-                block_I=32,
-                inner_iter=self.packed_decode_inner,
-                threads=128,
-            )
-            verify_decode_partial_library(partial, partial_variant)
-            variant = manifest["decode_combine"][f"{groups}x{columns}"]
-            combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
-            verify_decode_combine_library(combine, variant)
             self.identity["direct_combine_columns"] = columns
         self.graphs = {}
         self.outputs = {}
@@ -567,6 +576,14 @@ class Fixture:
         if mode != "direct":
             raise ValueError(f"Unsupported GLM path {mode}")
         cache = self.packed[bank]
+        if self.wgmma_kernels is not None:
+            partial, combine = self.wgmma_kernels
+            return combine(*partial(
+                self.q.to(torch.float8_e4m3fn).unsqueeze(0),
+                cache.values.view(torch.float8_e4m3fn)[None, :, None, :],
+                cache.bitmaps,
+                self.ids[bank].unsqueeze(0),
+            ))
         if self.packed_prefill_tile == 32 and self.baseline_name != "upstream":
             return attention(self.q, cache, self.ids[bank], SCALE)
         return tilelang_sparse_fwd(
@@ -1196,8 +1213,10 @@ def profile_upstream_decode(
     selected = [
         case for case in matrix if case.queries in (1, 8, 32, 64) and case.tail == 0
     ]
+    wgmma = source["compiled_build"]["upstream_compile"]["decode_wgmma"]
     payload = dict(
         protocol="remnant-glm-upstream-decode-profile-v1",
+        direct_candidate="wgmma-tile64-batches-8-64",
         source=source,
         status="running",
         cases=[],
@@ -1208,7 +1227,9 @@ def profile_upstream_decode(
     try:
         with torch.inference_mode():
             for case in selected:
-                fixture = Fixture(case, deadline, gpu_family="H200", upstream=True)
+                fixture = Fixture(
+                    case, deadline, gpu_family="H200", upstream=True, wgmma=wgmma
+                )
                 fixture.capture()
                 record = dict(name=case.name, fixture=fixture.identity, paths={})
                 payload["cases"].append(record)
