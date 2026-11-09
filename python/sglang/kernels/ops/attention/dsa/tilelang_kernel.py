@@ -1533,8 +1533,9 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    if packed_decode_combine_columns and (
-        packed_decode_combine_columns not in (128, 512)
+    if (packed_decode_inner or packed_decode_combine_columns) and (
+        not packed_decode_inner
+        or packed_decode_combine_columns not in (128, 512)
         or packed_bitmap is None
         or not is_fp8_kv
         or _is_hip
@@ -1581,9 +1582,7 @@ def tilelang_sparse_fwd(
                 )
 
                 if (
-                    not packed_decode_combine_columns
-                    or not packed_decode_inner
-                    or packed_decode_inner != H200_PACKED_DECODE_INNER.get(q.shape[0])
+                    packed_decode_inner != H200_PACKED_DECODE_INNER.get(q.shape[0])
                     or (ni // packed_decode_inner, packed_decode_combine_columns)
                     not in H200_PACKED_DECODE_COMBINE
                 ):
