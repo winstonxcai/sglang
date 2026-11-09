@@ -28,6 +28,10 @@ from sglang.srt.remnant.glm import (
     normalize_and_store,
     reconstruct,
 )
+from sglang.srt.remnant.glm_config import (
+    H200_PACKED_DECODE_COMBINE,
+    H200_PACKED_DECODE_INNER,
+)
 from sglang.srt.remnant.reference import topmag_keep_mask
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -1046,15 +1050,17 @@ class _CachedPartial:
             self.module.value = None
 
 
-@pytest.mark.parametrize("inner", [1, 2])
-@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize(
+    ("heads", "inner"),
+    [(8, 1), (8, 2)] + [(16, inner) for inner in sorted(set(H200_PACKED_DECODE_INNER.values()))],
+)
 def test_decode_partial_graph(heads, inner, record_property):
     """Essential sanitizer: one exact production CTA, two banks, tails 0..3.
 
     Fixture creation, reconstruction, finiteness and comparisons run on CPU.
     The instrumented GPU work is only the changed partial kernel, with stock
     Native on independently reconstructed Packed rows as its control. The full
-    66/33-partition attention and combine path has a separate uninstrumented gate.
+    attention and combine path has a separate uninstrumented gate.
     """
     _check_cached_partial_graph(heads, inner, record_property, packed_tile=32)
 
@@ -1269,9 +1275,9 @@ def test_adapter_reconstruction_above_2gib():
         torch.cuda.empty_cache()
 
 
-@pytest.mark.parametrize(("groups", "columns"), [(66, 128), (33, 512)])
+@pytest.mark.parametrize(("groups", "columns"), H200_PACKED_DECODE_COMBINE)
 def test_packed_decode_combine_graph(groups, columns, record_property):
-    """Exercise the two candidate cubins with a fully masked head and new inputs."""
+    """Exercise each candidate cubin with a fully masked head and new inputs."""
     from sglang.benchmark.remnant.glm_artifacts import verify_decode_combine_library
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         glm_packed_decode_combine,
