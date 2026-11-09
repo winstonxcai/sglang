@@ -2033,6 +2033,7 @@ def test_glm_cpu_preparation_requires_explicit_cache_paths(monkeypatch):
     with pytest.raises(RuntimeError, match="requires explicit paths"):
         artifacts.precompile_sm90()
 
+
 def test_v41_native_reference_preserves_tail_and_rounds_fp8_ties():
     import torch
 
@@ -2467,3 +2468,28 @@ def test_glm_upstream_result_identity_and_csv(tmp_path):
             glm.validate_timing(bad)
     with pytest.raises(RuntimeError, match="identity"):
         glm.resume_prefix(payload, payload["source"], "decode")
+
+
+def test_glm_upstream_goal_scores_all_cases_equally():
+    _, _, cases = glm.experiment(glm.UPSTREAM_SUITE, "decode")
+    records = [
+        {
+            "name": case.name,
+            "valid": True,
+            "paired_ratios": {
+                "direct_over_upstream": {
+                    "samples": [0.4, 0.8] * 15 if i % 2 else [0.96] * 30
+                }
+            },
+        }
+        for i, case in enumerate(cases)
+    ]
+    score = glm.upstream_decode_score(records)
+    assert score["geometric_mean_direct_over_upstream"] == pytest.approx(0.6 * 1.6**0.5)
+    assert score["speedup"] == pytest.approx(1 / (0.6 * 1.6**0.5))
+    assert score["meets_target"]
+    with pytest.raises(ValueError, match="all 24"):
+        glm.upstream_decode_score(records[:-1])
+    records[-1]["paired_ratios"]["direct_over_upstream"]["samples"][-1] = float("nan")
+    with pytest.raises(ValueError, match="Invalid"):
+        glm.upstream_decode_score(records)

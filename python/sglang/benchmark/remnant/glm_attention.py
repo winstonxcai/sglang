@@ -232,6 +232,7 @@ def parser() -> argparse.ArgumentParser:
         "--resume",
         help="Prior timing JSON from identical source/artifacts; requires REMNANT_BUILD_MANIFEST_PATH",
     )
+    p.add_argument("--profile-decode", action="store_true")
     p.add_argument("--output")
     p.add_argument("--max-seconds", type=int, default=850)
     p.add_argument("--check-imports", action="store_true")
@@ -1059,11 +1060,98 @@ def weighted_overhead(records: list[dict], *, baseline: str = "native") -> dict:
     )
 
 
+def upstream_decode_score(records: list[dict]) -> dict:
+    """Equal-case geometric mean of the 30 paired Direct/Native ratios."""
+    _, _, expected = experiment(UPSTREAM_SUITE, "decode")
+    if [row["name"] for row in records] != [case.name for case in expected]:
+        raise ValueError("Score requires all 24 upstream decode cases in order")
+    means = []
+    for row in records:
+        samples = row["paired_ratios"]["direct_over_upstream"]["samples"]
+        if (
+            not row.get("valid")
+            or len(samples) != ROUNDS
+            or not all(math.isfinite(value) and value > 0 for value in samples)
+        ):
+            raise ValueError(f"Invalid upstream decode samples: {row['name']}")
+        means.append(math.fsum(samples) / ROUNDS)
+    ratio = math.exp(math.fsum(map(math.log, means)) / len(means))
+    return {
+        "geometric_mean_direct_over_upstream": ratio,
+        "speedup": 1 / ratio,
+        "meets_target": ratio <= 1 / 1.20,
+    }
+
+
+def profile_upstream_decode(
+    matrix: list[Case], base: Path, deadline: float, source: dict
+):
+    """Trace representative steady-state graph replays separately from timing."""
+    import torch
+
+    selected = [
+        case for case in matrix if case.queries in (1, 8, 32, 64) and case.tail == 0
+    ]
+    payload = dict(
+        protocol="remnant-glm-upstream-decode-profile-v1",
+        source=source,
+        status="running",
+        cases=[],
+    )
+    record_path = base.with_suffix(".json")
+    trace_dir = base.with_suffix(".traces")
+    trace_dir.mkdir()
+    try:
+        with torch.inference_mode():
+            for case in selected:
+                fixture = Fixture(case, deadline, gpu_family="H200", upstream=True)
+                fixture.capture()
+                record = dict(name=case.name, fixture=fixture.identity, paths={})
+                payload["cases"].append(record)
+                for mode in fixture.modes:
+                    fixture.check()
+                    graph = fixture.graphs[mode]
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    with torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CUDA]
+                    ) as profiler:
+                        graph.replay()
+                        torch.cuda.synchronize()
+                    trace = trace_dir / f"{case.name}-{mode}.json"
+                    profiler.export_chrome_trace(str(trace))
+                    kernels = {}
+                    for event in json.loads(trace.read_text())["traceEvents"]:
+                        if event.get("cat") == "kernel" and event.get("ph") == "X":
+                            durations = kernels.setdefault(event["name"], [])
+                            durations.append(event["dur"])
+                    if sum(map(len, kernels.values())) < 3 * fixture.banks:
+                        raise RuntimeError(f"Incomplete CUDA graph trace: {trace}")
+                    record["paths"][mode] = {
+                        "trace": str(trace.relative_to(base.parent)),
+                        "kernel_us_per_call": {
+                            name: math.fsum(times) / fixture.banks
+                            for name, times in kernels.items()
+                        },
+                    }
+                del graph, fixture
+                gc.collect()
+                torch.cuda.empty_cache()
+        payload["status"] = "passed"
+    except BaseException as error:
+        payload.update(status="incomplete", error=repr(error))
+        raise
+    finally:
+        record_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def main() -> None:
     args = parser().parse_args()
     protocol, modes, matrix = experiment(args.suite, args.phase)
     upstream = args.suite == UPSTREAM_SUITE
     baseline = modes[0]
+    if args.profile_decode and (not upstream or args.resume or args.check_imports):
+        raise ValueError("Decode profiling requires a fresh upstream decode run")
     if args.modes is not None and args.modes != ",".join(modes):
         raise ValueError(f"{args.suite} requires {modes}")
     if upstream and args.packed_prefill_tile != 32:
@@ -1125,6 +1213,11 @@ def main() -> None:
         )
         payload["source"]["upstream"] = identity()
         payload["source"]["upstream_module_path"] = module.__file__
+    if args.profile_decode:
+        profile_upstream_decode(
+            matrix, base, time.monotonic() + args.max_seconds, payload["source"]
+        )
+        return
     if args.resume:
         checkpoint = Path(args.resume)
         payload["cases"] = resume_prefix(
@@ -1174,6 +1267,8 @@ def main() -> None:
                 torch.cuda.empty_cache()
         payload["status"] = "passed"
         validate_timing(payload)
+        if upstream:
+            payload["upstream_decode_score"] = upstream_decode_score(payload["cases"])
     except BaseException as error:
         payload.update(status="incomplete", error=repr(error))
         raise
