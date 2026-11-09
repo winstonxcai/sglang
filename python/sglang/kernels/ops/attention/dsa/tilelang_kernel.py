@@ -1082,6 +1082,55 @@ def sparse_mla_fwd_decode_combine(
     return main
 
 
+@tilelang.jit(out_idx=[-1], pass_configs=pass_configs)
+def glm_packed_decode_combine(heads: int, dim: int, groups: int, columns: int):
+    """Reduce split LSE in parallel and distribute output columns across CTAs."""
+    assert dim % columns == 0
+    seq_len = T.dynamic("seq_len")
+    padded_groups = 1 << (groups - 1).bit_length()
+
+    @T.prim_func
+    def main(
+        partial_o: T.Tensor([1, seq_len, groups, heads, dim], T.bfloat16),
+        partial_lse: T.Tensor([1, seq_len, groups, heads], T.float32),
+        output: T.Tensor([1, seq_len, heads, dim], T.bfloat16),
+    ):
+        # Author: Winston Cai. Each CTA writes a disjoint column slice of one
+        # head. LSE is small enough to reread for each slice at low batch sizes.
+        with T.Kernel(seq_len * heads, dim // columns, threads=128) as (row, chunk):
+            query, head = row // heads, row % heads
+            lse = T.alloc_fragment([1, padded_groups], T.float32)
+            maximum = T.alloc_fragment([1], T.float32)
+            total = T.alloc_fragment([1], T.float32)
+            weights = T.alloc_shared([groups], T.float32)
+            accum = T.alloc_fragment([columns], T.float32)
+
+            for _, group in T.Parallel(1, padded_groups):
+                if group < groups:
+                    lse[0, group] = partial_lse[0, query, group, head]
+                else:
+                    lse[0, group] = -T.infinity(T.float32)
+            T.reduce_max(lse, maximum, dim=1)
+            for _, group in T.Parallel(1, padded_groups):
+                lse[0, group] = T.exp2(lse[0, group] - maximum[0])
+            T.reduce_sum(lse, total, dim=1)
+            for group in T.Parallel(groups):
+                weights[group] = lse[0, group]
+
+            T.fill(accum, 0)
+            for group in T.serial(groups):
+                for column in T.Parallel(columns):
+                    accum[column] += weights[group] * partial_o[
+                        0, query, group, head, chunk * columns + column
+                    ].astype(T.float32)
+            for column in T.Parallel(columns):
+                output[0, query, head, chunk * columns + column] = (
+                    accum[column] / total[0]
+                )
+
+    return main.with_attr("global_symbol", "glm_packed_decode_combine")
+
+
 @tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
 def sparse_mla_fwd_decode_partial_fp8(
     num_heads: int,
