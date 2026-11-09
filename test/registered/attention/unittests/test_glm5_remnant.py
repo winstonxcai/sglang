@@ -1270,7 +1270,7 @@ def test_adapter_reconstruction_above_2gib():
 
 
 @pytest.mark.parametrize(("groups", "columns"), [(66, 128), (33, 512)])
-def test_packed_decode_combine_graph(groups, columns):
+def test_packed_decode_combine_graph(groups, columns, record_property):
     """Exercise the two candidate cubins with a fully masked head and new inputs."""
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         glm_packed_decode_combine,
@@ -1284,6 +1284,12 @@ def test_packed_decode_combine_graph(groups, columns):
     split_output[..., 0, :] = 0
     split_lse[..., 0] = sentinel
     combine = glm_packed_decode_combine(16, 512, groups, columns)
+    manifest = json.loads(Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text())
+    variant = manifest["decode_combine"][f"{groups}x{columns}"]
+    assert hashlib.sha256(combine.get_kernel_source().encode()).hexdigest() == variant["source_sha256"]
+    digest = hashlib.sha256(Path(variant["cubin_path"]).read_bytes()).hexdigest()
+    assert digest == variant["cubin_sha256"]
+    record_property("combine_cubin_sha256", digest)
     warm = combine(split_output, split_lse)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
