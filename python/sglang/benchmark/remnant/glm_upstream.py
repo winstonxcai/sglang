@@ -223,6 +223,9 @@ def precompile() -> dict:
         matrix_stores = len(re.findall(r"\bSTSM\.", sass))
         if (matrix_loads, matrix_stores) != (16, 0):
             raise RuntimeError(f"Unexpected register PV matrix instructions: {batch=}")
+        overlap_waits = len(re.findall(r"\bWARPGROUP\.DEPBAR\.LE[^;]*,\s*0x1\b", sass))
+        if overlap_waits != 2:
+            raise RuntimeError(f"Expected two overlapping PV waits, found {overlap_waits}: {batch=}")
         if len(re.findall(r"^\s*remnant_glm_wgmma_pv_registers\(", partial, re.M)) != 1:
             raise RuntimeError(f"Missing register PV call: {batch=}")
         local_sites = len(re.findall(r"\b(?:LDL|STL)\b", sass))
@@ -253,6 +256,7 @@ def precompile() -> dict:
             matrix_store_sites=matrix_stores,
             local_sites=local_sites,
             pv_operand="register",
+            pv_overlap_wait_sites=overlap_waits,
             loader_call=loader,
             shared_ranges=shared_ranges,
             dynamic_shared_bytes=dynamic_shared,
