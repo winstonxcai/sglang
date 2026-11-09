@@ -178,6 +178,10 @@ def precompile_sm90() -> None:
     from concurrent.futures import ProcessPoolExecutor
 
     from sglang.srt.remnant.glm import compile_kernels
+    from sglang.srt.remnant.glm_config import (
+        H200_PACKED_DECODE_COMBINE,
+        H200_PACKED_DECODE_INNER,
+    )
 
     store, unpack = compile_kernels()
     artifacts: CompileManifest = {
@@ -190,6 +194,10 @@ def precompile_sm90() -> None:
         (heads, inner, 32) for heads in (8, 16, 32, 64) for inner in (1, 2, 33, 66)
     ]
     cases.extend([(8, 17, 64), (16, 17, 64), (16, 9, 128)])
+    cases.extend(
+        (16, inner, 32)
+        for inner in sorted(set(H200_PACKED_DECODE_INNER.values()) - {1, 2})
+    )
     # Separate processes isolate TVM compiler state; each pair owns its combine
     # variant. The maintained runner supplies the overall bounded subprocess.
     with ProcessPoolExecutor(
@@ -211,7 +219,7 @@ def precompile_sm90() -> None:
         f"{groups}x{columns}": glm_packed_decode_combine(
             16, 512, groups, columns
         ).get_kernel_source()
-        for groups, columns in ((66, 128), (33, 512))
+        for groups, columns in H200_PACKED_DECODE_COMBINE
     }
     artifacts["cache_files"] = {
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()

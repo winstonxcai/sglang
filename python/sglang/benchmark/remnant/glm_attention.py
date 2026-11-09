@@ -490,12 +490,17 @@ class Fixture:
             from sglang.benchmark.remnant.glm_artifacts import (
                 verify_decode_combine_library,
             )
+            from sglang.srt.remnant.glm_config import H200_PACKED_DECODE_INNER
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 glm_packed_decode_combine,
             )
 
             columns = 128 if case.queries == 1 else 512
-            groups = 66 // inner
+            self.packed_decode_inner = H200_PACKED_DECODE_INNER[case.queries]
+            groups = 66 // self.packed_decode_inner
+            self.identity["path_geometry"]["direct"].update(
+                inner_iter=self.packed_decode_inner, partial_groups=groups
+            )
             manifest = json.loads(
                 Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text()
             )
@@ -550,6 +555,7 @@ class Fixture:
             DIM,
             packed_bitmap=cache.bitmaps,
             packed_prefill_tile=self.packed_prefill_tile,
+            packed_decode_inner=getattr(self, "packed_decode_inner", 0),
             packed_decode_combine_columns=(128 if self.case.queries == 1 else 512)
             if self.baseline_name == "upstream"
             else 0,
@@ -878,9 +884,12 @@ def _cpu_contract(owner: str):
     import sys
 
     name = __name__ + "_" + owner
-    spec = importlib.util.spec_from_file_location(
-        name, Path(__file__).with_name(owner + ".py")
+    path = (
+        Path(__file__).parents[2] / "srt/remnant/glm_config.py"
+        if owner == "glm_config"
+        else Path(__file__).with_name(owner + ".py")
     )
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -935,6 +944,17 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
                 mode: dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner)
                 for mode in modes
             }
+            compiled = (
+                payload.get("source", {})
+                .get("compiled_build", {})
+                .get("glm_compile", {})
+            )
+            if "decode_combine" in compiled:
+                policy = _cpu_contract("glm_config").H200_PACKED_DECODE_INNER
+                direct_inner = policy[definition.queries]
+                geometry["direct"].update(
+                    inner_iter=direct_inner, partial_groups=66 // direct_inner
+                )
             if (
                 fixture.get("changing_input_replay") != "passed"
                 or fixture.get(
@@ -1252,10 +1272,12 @@ def main() -> None:
         cases=[],
     )
     if upstream:
+        from sglang.srt.remnant.glm_config import H200_PACKED_DECODE_COMBINE
+
         build = payload["source"]["compiled_build"]
         compile_manifest = build.get("glm_compile", {})
         combines = compile_manifest.get("decode_combine", {})
-        if set(combines) != {"66x128", "33x512"} or any(
+        if set(combines) != {f"{g}x{c}" for g, c in H200_PACKED_DECODE_COMBINE} or any(
             not variant.get("cubin_path")
             or not variant.get("cubin_sha256")
             or compile_manifest["cache_files"].get(variant["cubin_path"])

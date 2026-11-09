@@ -1523,6 +1523,7 @@ def tilelang_sparse_fwd(
     packed_bitmap: torch.Tensor | None = None,
     packed_prefill_tile: int = 32,
     packed_decode_combine_columns: int = 0,
+    packed_decode_inner: int = 0,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1573,11 +1574,21 @@ def tilelang_sparse_fwd(
                 (ni + 1) // 2 if packed_prefill_tile != 32
                 else _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             )
-            if packed_decode_combine_columns and (
-                (ni + inner_iter - 1) // inner_iter,
-                packed_decode_combine_columns,
-            ) not in ((66, 128), (33, 512)):
-                raise ValueError("Unprepared Packed decode combine geometry")
+            if packed_decode_inner or packed_decode_combine_columns:
+                from sglang.srt.remnant.glm_config import (
+                    H200_PACKED_DECODE_COMBINE,
+                    H200_PACKED_DECODE_INNER,
+                )
+
+                if (
+                    not packed_decode_combine_columns
+                    or not packed_decode_inner
+                    or packed_decode_inner != H200_PACKED_DECODE_INNER.get(q.shape[0])
+                    or (ni // packed_decode_inner, packed_decode_combine_columns)
+                    not in H200_PACKED_DECODE_COMBINE
+                ):
+                    raise ValueError("Unprepared Packed decode geometry")
+                inner_iter = packed_decode_inner
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,

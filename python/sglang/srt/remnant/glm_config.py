@@ -15,6 +15,17 @@ MAX_QUERY_CHUNK = 128
 SELECTION_COLUMNS = 2112
 
 
+# Tile32 has 66 padded tiles. Keep at least two CTA waves for each supported
+# H200 batch when possible, using divisors that require no partial final tile.
+H200_PACKED_DECODE_INNER = {1: 1, 8: 2, 16: 3, 24: 6, 32: 6, 64: 11}
+H200_PACKED_DECODE_COMBINE = tuple(
+    dict.fromkeys(
+        (66 // inner, 128 if queries == 1 else 512)
+        for queries, inner in H200_PACKED_DECODE_INNER.items()
+    )
+)
+
+
 def enabled() -> bool:
     from sglang.srt.runtime_context import get_model
 

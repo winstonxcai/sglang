@@ -2507,3 +2507,20 @@ def test_glm_decode_trace_distinguishes_identical_native_symbols():
     assert stages["partial_attention"]["symbol"] == stages["combine"]["symbol"]
     with pytest.raises(RuntimeError, match="three CUDA kernels"):
         glm.decode_trace_stages(events[:-1], 2)
+
+
+def test_glm_upstream_direct_split_policy_bounds_partial_traffic():
+    policy = glm._cpu_contract("glm_config")
+    inner = policy.H200_PACKED_DECODE_INNER
+    assert list(inner) == [1, 8, 16, 24, 32, 64]
+    assert all(66 % split == 0 for split in inner.values())
+    assert inner[1] == 1 and inner[8] == 2
+    assert all(batch * (66 // inner[batch]) >= 2 * 132 for batch in inner if batch >= 8)
+    assert [66 // inner[batch] for batch in (16, 24, 32, 64)] == [22, 11, 11, 6]
+    assert set(policy.H200_PACKED_DECODE_COMBINE) == {
+        (66, 128),
+        (33, 512),
+        (22, 512),
+        (11, 512),
+        (6, 512),
+    }
