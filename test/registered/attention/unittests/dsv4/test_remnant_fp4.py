@@ -131,7 +131,7 @@ def test_fp4_startup_contract(monkeypatch):
                 dsv4_attn_backend="auto",
             )
         )
-        for cli in ("auto", "flashmla_sparse"):
+        for cli in ("auto", "flashmla_sparse", "flashmla_sparse_q8"):
             for override in ("1", "true", "yes", "on"):
                 monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", override)
                 assert resolve_dsv4_prefill_backend(cli) == "flashmla_sparse_q8"
@@ -143,16 +143,25 @@ def test_fp4_startup_contract(monkeypatch):
                             dsv4_prefill_backend=cli,
                         )
                     )
-            monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", "0")
-            assert resolve_dsv4_prefill_backend(cli) == "flashmla_sparse"
-            validate_v41_cache_args(
-                SimpleNamespace(
-                    _kv_cache_model_family="dsv41",
-                    kv_cache_format=mode,
-                    dsv4_prefill_backend=cli,
+            for override in ("0", "false", "no", "off"):
+                monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", override)
+                assert resolve_dsv4_prefill_backend(cli) == "flashmla_sparse"
+                validate_v41_cache_args(
+                    SimpleNamespace(
+                        _kv_cache_model_family="dsv41",
+                            kv_cache_format=mode,
+                            dsv4_prefill_backend=cli,
+                    )
                 )
+            monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL")
+            args = SimpleNamespace(
+                _kv_cache_model_family="dsv41", kv_cache_format=mode, dsv4_prefill_backend=cli
             )
-        monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL")
+            if cli == "flashmla_sparse_q8":
+                with pytest.raises(ValueError, match="SGLANG_DSV4_Q8KV8_PREFILL"):
+                    validate_v41_cache_args(args)
+            else:
+                validate_v41_cache_args(args)
         for field in (
             envs.SGLANG_DSV4_KV_LAYOUT,
             envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT,
@@ -912,6 +921,198 @@ def test_fp4_compressor_boundary(ratio, packed):
     expected[1, n * layout.data_bytes : 128 * layout.data_bytes].zero_()
     expected[1, 128 * layout.data_bytes + n * 32 :].zero_()
     torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)
+
+
+@GPU
+@pytest.mark.parametrize("packed", [False, True])
+@torch.inference_mode()
+def test_fp4_c2_decode_store(packed):
+    """Actual C2 decode pooling carries state into the Native/Packed writer.
+
+    Author: Winston Cai. Synthetic identity/zero-gate projections make the CPU
+    expected pair an exact average, independent of the production pooling code.
+    Staggered requests mix complete, incomplete and padded rows in one call.
+    """
+    from types import MethodType
+
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Compressor
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4SingleKVPool,
+        get_compress_state_ring_size,
+    )
+
+    compressor = DeepseekV41Compressor(512, 512, 2, 1e-6).cuda()
+    assert not compressor.use_fused_compress, "this fixture exercises H100 decode"
+    norm_weight = torch.tensor([0.5, 0.75, 1.0, 1.5] * 128)
+    compressor.wkv.weight.copy_(torch.eye(512, dtype=torch.bfloat16))
+    compressor.wgate.weight.zero_()
+    compressor.norm.weight.copy_(norm_weight)
+    ring = get_compress_state_ring_size(2)
+    state = CompressStatePool(
+        size=2 * ring,
+        ring_size=ring,
+        overlap=False,
+        head_dim=512,
+        dtype=torch.float32,
+        device="cuda",
+        enable_memory_saver=False,
+        ratio=2,
+        request_scoped=True,
+    )
+    layout = KVLayout.V41_FP4_REMNANT if packed else KVLayout.V41_FP4
+    page = 128
+    kv_pool = DeepSeekV4SingleKVPool(
+        size=256,
+        page_size=page,
+        dtype=torch.float8_e4m3fn,
+        qk_nope_head_dim=448,
+        qk_rope_head_dim=64,
+        layer_num=1,
+        device="cuda",
+        enable_memory_saver=False,
+        kv_layout=layout,
+        global_page_size=256,
+    )
+    captured = {}
+
+    def index_keys(latent, freqs):
+        captured["index_latent"] = latent.clone()
+        return latent[:, :128].contiguous()
+
+    def index_store(**kwargs):
+        captured["index_locations"] = kwargs["loc"].clone()
+
+    def store(*, layer_id, loc, cache_k, freqs_cis):
+        kv_pool.set_key_buffer_fused(0, loc, cache_k, freqs_cis)
+
+    pool = SimpleNamespace(
+        get_attention_compress_states=lambda _: state,
+        get_extra_key_layout=lambda _: layout,
+        set_extra_key_buffer_fused=store,
+        set_index_k_fp4=index_store,
+    )
+    # Exact quarter-turns still distinguish the pair's first position from its
+    # odd completion position without a CPU/GPU transcendental discrepancy.
+    phase = (torch.arange(4)[:, None] + torch.arange(32)[None, :]) % 4
+    freqs_cpu = torch.complex(
+        torch.tensor([1.0, 0.0, -1.0, 0.0])[phase],
+        torch.tensor([0.0, 1.0, 0.0, -1.0])[phase],
+    )
+    layer = SimpleNamespace(
+        layer_id=2,
+        compress_ratio=2,
+        compressor=compressor,
+        freqs_cis=freqs_cpu.cuda(),
+        rope_head_dim=64,
+        indexer=SimpleNamespace(owns_k=True, index_keys=index_keys),
+    )
+    core = SimpleNamespace()
+    backend = SimpleNamespace(
+        token_to_kv_pool=pool,
+        forward_metadata=SimpleNamespace(core_metadata=core),
+    )
+    backend._low_ratio_write_group = MethodType(
+        DeepseekV4AttnBackend._low_ratio_write_group, backend
+    )
+    req_cpu = torch.tensor([0, 1, 0], dtype=torch.int64)
+    req = req_cpu.cuda()
+    # Padding deliberately reuses live request 0; it must never write its ring.
+    calls = (
+        ((0, 0, 0), (256, 0, 0), (-1, 0, 0)),
+        ((1, 0, 1), (257, 512, 0), (128, -1, 0)),
+        ((2, 1, 2), (258, 513, 0), (-1, 256, 0)),
+        ((3, 2, 3), (259, 514, 0), (129, -1, 0)),
+        ((0, 3, 0), (0, 515, 0), (0, 257, 0)),
+    )
+    history = {}
+    expected_state = torch.zeros(state.kv_score_buffer.shape)
+    expected_state[:, 512:] = -float("inf")
+    expected_cache = torch.zeros(kv_pool.kv_buffer[0].shape, dtype=torch.uint8)
+    # Independent physical record widths, also asserted by the startup fixture.
+    data_bytes = 192 if packed else 256
+    coordinates = torch.arange(512)
+    for step, (positions, raw_locations, output_locations) in enumerate(calls):
+        x_cpu = torch.stack(
+            [
+                (
+                    (1 - 2 * ((coordinates // (1 << ((step + row) % 4))) % 2))
+                    * (2 + 2 * ((step + row) % 3))
+                ).bfloat16()
+                for row in range(3)
+            ]
+        )
+        pooled = x_cpu.float().clone()
+        for row, (request, position, raw_loc) in enumerate(
+            zip(req_cpu.tolist(), positions, raw_locations)
+        ):
+            if not raw_loc:
+                continue
+            if position:
+                pooled[row] = (history[request, position - 1] + pooled[row]) / 2
+            history[request, position] = x_cpu[row].float()
+            state_row = request * ring + position % ring
+            expected_state[state_row, :512] = x_cpu[row]
+            expected_state[state_row, 512:] = 0
+        v = pooled.bfloat16().float()
+        expected_latent = (
+            v * torch.rsqrt(v.square().mean(-1, keepdim=True) + 1e-6) * norm_weight
+        ).bfloat16()
+        group_positions = torch.tensor(positions) // 2 * 2
+        rotated = expected_latent.clone()
+        tail = torch.view_as_complex(
+            expected_latent[:, 448:].float().reshape(3, 32, 2)
+        )
+        rotated[:, 448:] = (
+            torch.view_as_real(tail * freqs_cpu[group_positions])
+            .flatten(1)
+            .bfloat16()
+        )
+        for row, loc in enumerate(output_locations):
+            if loc <= 0:
+                continue
+            # The indexer must see all coordinates even when the global writer
+            # subsequently removes half of them in Packed mode.
+            assert torch.count_nonzero(expected_latent[row]) == 512
+            record, _ = _oracle(rotated[row].reshape(1, 1, 512), packed)
+            page_id, slot = divmod(loc, page)
+            expected_cache[page_id, slot * data_bytes : (slot + 1) * data_bytes] = (
+                record[0, :data_bytes]
+            )
+            scale_start = page * data_bytes + slot * 32
+            expected_cache[page_id, scale_start : scale_start + 32] = record[
+                0, data_bytes : data_bytes + 32
+            ]
+        core.raw_out_loc = torch.tensor(
+            raw_locations, device="cuda", dtype=torch.int64
+        )
+        core.c2_out_loc = torch.tensor(
+            output_locations, device="cuda", dtype=torch.int64
+        )
+        captured.clear()
+        DeepseekV4AttnBackend._low_ratio_compress_decode(
+            backend,
+            layer,
+            x_cpu.cuda(),
+            req,
+            torch.tensor(positions, device="cuda", dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            captured["index_latent"].cpu(), expected_latent, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            captured["index_locations"].cpu(),
+            torch.tensor([max(loc, 0) for loc in output_locations]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            state.kv_score_buffer.kv_score.cpu(), expected_state, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            kv_pool.kv_buffer[0].cpu(), expected_cache, rtol=0, atol=0
+        )
 
 
 def test_fp4_backend_dispatch():

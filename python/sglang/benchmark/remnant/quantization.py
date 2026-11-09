@@ -12,6 +12,27 @@ from __future__ import annotations
 import torch
 
 
+def v41_native_fp8_reference(latent: torch.Tensor) -> torch.Tensor:
+    """Decode upstream H100's V4 store for post-RoPE BF16 [N,512] inputs.
+
+    Author: Winston Cai. No normalization or rotation belongs at this boundary.
+    Seven groups of 64 use FP8 E4M3 with power-of-two UE8M0 scales, while the
+    final 64 coordinates retain their BF16 values. This CPU reference is
+    independent of the production store and the persistent page reader.
+    """
+    if latent.device.type != "cpu" or latent.dtype != torch.bfloat16:
+        raise ValueError("V4.1 Native reference requires CPU BF16 producer values")
+    if latent.ndim != 2 or latent.shape[1] != 512:
+        raise ValueError("V4.1 Native reference requires [N,512] producer values")
+    groups = latent[:, :448].float().reshape(-1, 7, 64)
+    scale = torch.exp2(
+        torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448))
+    )
+    values = (groups / scale[..., None]).to(torch.float8_e4m3fn).float()
+    values = (values * scale[..., None]).reshape(-1, 448).bfloat16()
+    return torch.cat((values, latent[:, 448:]), dim=-1)
+
+
 def check_fp8_storage(
     decoded: torch.Tensor,
     codes: torch.Tensor,

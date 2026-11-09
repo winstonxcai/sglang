@@ -2033,6 +2033,114 @@ def test_glm_cpu_preparation_requires_explicit_cache_paths(monkeypatch):
     with pytest.raises(RuntimeError, match="requires explicit paths"):
         artifacts.precompile_sm90()
 
+def test_v41_native_reference_preserves_tail_and_rounds_fp8_ties():
+    import torch
+
+    reference = load_module(
+        "_v41_native_quantization",
+        ROOT / "python/sglang/benchmark/remnant/quantization.py",
+    ).v41_native_fp8_reference
+    values = torch.zeros((2, 512), dtype=torch.bfloat16)
+    values[0, :3] = torch.tensor([1.0, 1.0625, 1.1875])
+    values[:, 448:] = torch.arange(64).bfloat16() / 7
+    decoded = reference(values)
+    assert decoded.dtype == torch.bfloat16
+    assert decoded[0, :3].tolist() == [1.0, 1.0, 1.25]
+    assert torch.equal(decoded[1, :448], values[1, :448])
+    assert torch.equal(decoded[:, 448:], values[:, 448:])
+    for invalid in (values.float(), values[:, :448], values.reshape(1, 2, 512)):
+        with pytest.raises(ValueError, match="Native reference requires"):
+            reference(invalid)
+
+
+def test_v41_three_path_ratios():
+    ratios = cases.paired_ratios(
+        {"native": [1.0, 2.0], "dense_fp4": [2.0, 4.0], "kernel": [3.0, 6.0]}
+    )
+    assert ratios["kernel_over_native"]["mean"] == 3.0
+    assert ratios["dense_fp4_over_native"]["mean"] == 2.0
+    assert ratios["kernel_over_dense_fp4"]["mean"] == 1.5
+
+
+def test_v41_native_call_does_not_reuse_warmup_metadata():
+    """Exercise the actual callback without CUDA; fresh schedules must reach the API."""
+    import ast
+    from types import SimpleNamespace
+
+    tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
+    factory = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "fp4_decode_operations"
+    )
+    callback = next(
+        n
+        for n in ast.walk(factory)
+        if isinstance(n, ast.FunctionDef) and n.name == "call"
+    )
+    received = []
+
+    def decode(*args, **kwargs):
+        received.append(args[5])
+        return "output", "lse"
+
+    namespace = {
+        name: object()
+        for name in (
+            "q",
+            "swa_view",
+            "swa_indices",
+            "swa_lengths",
+            "cache_view",
+            "physical",
+            "lengths",
+            "sink",
+        )
+    }
+    namespace.update(
+        packed=False,
+        mode="native",
+        upstream_flash_mla=SimpleNamespace(
+            get_mla_metadata=lambda: (object(), None), flash_mla_with_kvcache=decode
+        ),
+    )
+    exec(
+        compile(ast.Module(body=[callback], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    assert namespace["call"]() == namespace["call"]() == ("output", "lse")
+    assert len(received) == 2 and received[0] is not received[1]
+
+
+@pytest.mark.parametrize("global_page_size", [128, 256])
+def test_gpu_v41_upstream_native_comparison(global_page_size, benchmark):
+    """Both production page sizes; original control, graphs and a nondefault stream."""
+    import torch
+
+    case = next(
+        c
+        for c in cases.fp4_decode_cases()
+        if c.batch == 8 and c.global_page_size == global_page_size
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        operations, identity = benchmark.fp4_decode_operations(case, cases.SEED)
+        assert tuple(op.key for op in operations) == cases.FP4_DECODE_MODES
+        assert (
+            identity["native_control"]["source_commit"] == cases.UPSTREAM_FLASHMLA_SHA
+        )
+        for operation in operations:
+            operation.validate()
+            graph, output = benchmark.capture(operation, 3)
+            # Selection order changes in place, while the selected set and
+            # lengths stay fixed. Upstream permits reusing this same schedule.
+            indices = operation.owned[2]
+            indices.copy_(indices.flip(-1))
+            graph.replay()
+            operation.validate_output(output)
+    torch.cuda.current_stream().wait_stream(stream)
+
 
 def test_v41_fp4_matrix_and_timing_gate():
     """Production V4.1 geometry only; stale or incomplete timing cannot qualify."""
@@ -2040,6 +2148,12 @@ def test_v41_fp4_matrix_and_timing_gate():
     from dataclasses import asdict
 
     args = cases.parser().parse_args(["--suite", "v41-fp4-decode"])
+    assert cases.FP4_DECODE_MODES == ("native", "dense_fp4", "kernel")
+    for modes in ("native,kernel", "dense_fp4", "native,triton,kernel"):
+        args.modes = modes
+        with pytest.raises(ValueError, match="V4.1 compares"):
+            cases.selected_cases(args)
+    args.modes = ",".join(cases.FP4_DECODE_MODES)
     for flag, value in (
         ("--heads", "128"),
         ("--batches", "1"),
@@ -2060,7 +2174,7 @@ def test_v41_fp4_matrix_and_timing_gate():
     }
     payload = {
         "status": "passed",
-        "protocol": "remnant-v41-fp4-decode-v3",
+        "protocol": "remnant-v41-fp4-decode-v5",
         "config": vars(args),
         "cases": [],
     }
@@ -2072,13 +2186,28 @@ def test_v41_fp4_matrix_and_timing_gate():
                 "valid": True,
                 "execution": "cuda_graph",
                 "repeats": 100,
+                "baseline": "upstream H100 auto FP8/BF16; synchronization corrected",
+                "native_scheduler": "first use per ratio; regenerated inside graph",
+                "native_control": {
+                    "source_commit": cases.UPSTREAM_FLASHMLA_SHA,
+                    "source_sha256": "b" * 64,
+                    "binary_sha256": "c" * 64,
+                    "python_sha256": "d" * 64,
+                    "architectures": ["sm_90a"],
+                },
                 "common_inputs_sha256": "a" * 64,
                 "paths": {
-                    mode: {"samples": [1.0] * 30} for mode in ("native", "kernel")
+                    mode: {"samples": [1.0] * 30}
+                    for mode in ("native", "dense_fp4", "kernel")
                 },
                 "path_layouts": {
                     "native": {
-                        "implementation": "Native FP4 Direct",
+                        "implementation": "Upstream H100 auto FP8/BF16",
+                        "record_bytes": 584,
+                        "packed_keep_count": 512,
+                    },
+                    "dense_fp4": {
+                        "implementation": "Custom dense FP4 Direct",
                         "record_bytes": 288,
                         "packed_keep_count": 512,
                     },
@@ -2101,6 +2230,11 @@ def test_v41_fp4_matrix_and_timing_gate():
         "window-as-page",
         "nonproduction-heads",
         "old-protocol",
+        "missing-diagnostic",
+        "custom-baseline",
+        "fork-control",
+        "missing-control",
+        "warmed-scheduler",
     ):
         broken = copy.deepcopy(payload)
         if fault == "missing-case":
@@ -2110,7 +2244,17 @@ def test_v41_fp4_matrix_and_timing_gate():
         elif fault == "bad-sample":
             broken["cases"][0]["paths"]["native"]["samples"][0] = float("nan")
         elif fault == "wrong-layout":
-            broken["cases"][0]["path_layouts"]["native"]["record_bytes"] = 584
+            broken["cases"][0]["path_layouts"]["native"]["record_bytes"] = 288
+        elif fault == "missing-diagnostic":
+            broken["cases"][0]["paths"].pop("dense_fp4")
+        elif fault == "custom-baseline":
+            broken["cases"][0]["baseline"] = "unpruned dense Native FP4"
+        elif fault == "fork-control":
+            broken["cases"][0]["native_control"]["source_commit"] = "3eb8594"
+        elif fault == "missing-control":
+            broken["cases"][0].pop("native_control")
+        elif fault == "warmed-scheduler":
+            broken["cases"][0]["native_scheduler"] = "cached before capture"
         elif fault == "wrong-geometry":
             broken["cases"][0]["case"]["swa_page_size"] = 64 + 128
         elif fault == "nonproduction-swa":
@@ -2120,7 +2264,7 @@ def test_v41_fp4_matrix_and_timing_gate():
         elif fault == "nonproduction-heads":
             broken["cases"][0]["case"]["heads"] = 128
         else:
-            broken["protocol"] = "remnant-v41-fp4-decode-v2"
+            broken["protocol"] = "remnant-v41-fp4-decode-v3"
         with pytest.raises((RuntimeError, ValueError)):
             cases.validate_timing(broken, suite="v41-fp4-decode")
 

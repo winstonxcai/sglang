@@ -384,10 +384,7 @@ def validate_v41_cache_args(args: Any) -> None:
     if getattr(args, "dsv4_attn_backend", "auto") not in ("auto", "flashmla"):
         conflicts.append("dsv4_attn_backend (requires flashmla)")
     prefill_backend = getattr(args, "dsv4_prefill_backend", "auto")
-    if (
-        prefill_backend not in ("auto", "flashmla_sparse")
-        or resolve_dsv4_prefill_backend(prefill_backend) != "flashmla_sparse"
-    ):
+    if resolve_dsv4_prefill_backend(prefill_backend) != "flashmla_sparse":
         conflicts.append(
             "dsv4_prefill_backend/SGLANG_DSV4_Q8KV8_PREFILL (requires BF16 sparse prefill)"
         )
