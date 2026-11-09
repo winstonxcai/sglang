@@ -1513,7 +1513,15 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main.with_attr("global_symbol", "glm_packed_partial") if packed else main
 
 
-@tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        **pass_configs,
+        # WGMMA still reads Q and KV after TileLang's synchronous liveness
+        # analysis sees their final access. Keep the transpose disjoint.
+        tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
+    },
+)
 def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
     """Hopper experiment with one warpgroup and 64 selected rows per tile."""
     heads, dim, topk, rows = 16, 512, 2112, 64

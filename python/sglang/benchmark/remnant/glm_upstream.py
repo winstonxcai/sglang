@@ -98,6 +98,27 @@ def load_baseline():
     return module
 
 
+def wgmma_shared_ranges(source: str) -> dict[str, tuple[int, int]]:
+    """Read the generated allocation offsets and reject asynchronous aliases."""
+    sizes = dict(q=16 * 512, kv=64 * 512, v_t=512 * 64, p=16 * 64, scratch=32 * 272)
+    offsets = dict(
+        re.findall(
+            r"void\* (q|kv|v_t|p|scratch) = .*buf_dyn_shmem \+ (\d+)\)\);",
+            source,
+        )
+    )
+    if offsets.keys() != sizes.keys():
+        raise RuntimeError("Cannot verify WGMMA shared-memory offsets")
+    ranges = {
+        name: (int(offset), int(offset) + sizes[name])
+        for name, offset in offsets.items()
+    }
+    ordered = sorted(ranges.values())
+    if any(end > start for (_, end), (start, _) in zip(ordered, ordered[1:])):
+        raise RuntimeError(f"Aliased WGMMA shared-memory operands: {ranges}")
+    return ranges
+
+
 def precompile() -> dict:
     """Compile only heads16 decode partial/combine variants on CPU/SM90a."""
     from sglang.benchmark.remnant.glm_artifacts import (
@@ -171,6 +192,7 @@ def precompile() -> dict:
     compiled["decode_wgmma"] = {}
     for batch, (partial, combine) in wgmma.items():
         variant = bind_decode_library(partial, artifacts)
+        shared_ranges = wgmma_shared_ranges(partial)
         loader = next(
             (line.strip() for line in partial.splitlines()
              if "remnant_glm_expand_wide_tile<64, true>(" in line),
@@ -195,6 +217,7 @@ def precompile() -> dict:
             cta_barrier_sites=barriers,
             local_sites=len(re.findall(r"\b(?:LDL|STL)\b", sass)),
             loader_call=loader,
+            shared_ranges=shared_ranges,
             resource_usage=subprocess.check_output(
                 ["cuobjdump", "--dump-resource-usage", variant["cubin_path"]],
                 text=True, timeout=30,
