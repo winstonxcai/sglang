@@ -1248,6 +1248,11 @@ def profile_upstream_decode(
                     stages = decode_trace_stages(
                         json.loads(trace.read_text())["traceEvents"], fixture.banks
                     )
+                    if mode == "direct" and case.queries > 1 and (
+                        stages["partial_attention"]["symbol"]
+                        != "glm_packed_partial_wgmma_kernel"
+                    ):
+                        raise RuntimeError(f"{case.name}: trace did not run the WGMMA partial")
                     record["paths"][mode] = {
                         "trace": str(trace.relative_to(base.parent)),
                         "stages": stages,

@@ -1544,6 +1544,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
             v_t = T.alloc_shared([dim, rows], fp8)
             p = T.alloc_shared([heads, rows], fp8)
             scratch = T.alloc_shared([32, 272], T.uint8)
+            transpose_tile = T.alloc_local([16, 16], fp8)
             scores = T.alloc_fragment([rows, heads], T.float32)
             numerator = T.alloc_fragment([dim, heads], T.float32)
             maximum = T.alloc_fragment([heads], T.float32)
@@ -1593,7 +1594,15 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 # K @ Q^T puts 64 selected rows on the warpgroup M axis.
                 # V's transpose reads the same tile while QK is in flight.
                 T.wgmma_gemm(kv, q, scores, transpose_B=True, clear_accum=True)
-                T.transpose(kv, v_t)
+                # One 16×16 tile per lane. Vectorize both shared-memory axes
+                # through registers to avoid a barrier per scalar transpose.
+                for row_tile, col_tile in T.Parallel(rows // 16, dim // 16):
+                    for i in T.unroll(16):
+                        for j in T.vectorized(16):
+                            transpose_tile[i, j] = kv[row_tile * 16 + i, col_tile * 16 + j]
+                    for j in T.unroll(16):
+                        for i in T.vectorized(16):
+                            v_t[col_tile * 16 + j, row_tile * 16 + i] = transpose_tile[i, j]
                 T.warpgroup_wait(0)
                 T.warpgroup_fence_operand(scores, num_regs=rows * heads // 128)
 

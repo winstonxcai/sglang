@@ -185,10 +185,14 @@ def precompile() -> dict:
         qgmma = len(re.findall(r"\bQGMMA\.", sass))
         if qgmma < 32:
             raise RuntimeError(f"WGMMA partial has only {qgmma} QGMMA sites: {batch=}")
+        barriers = len(re.findall(r"\bBAR\.SYNC\b", sass))
+        if barriers > 64:
+            raise RuntimeError(f"WGMMA transpose emitted {barriers} CTA barriers: {batch=}")
         compiled["decode_wgmma"][batch] = dict(
             partial=variant,
             combine=bind_decode_library(combine, artifacts),
             qgmma_sites=qgmma,
+            cta_barrier_sites=barriers,
             local_sites=len(re.findall(r"\b(?:LDL|STL)\b", sass)),
             loader_call=loader,
             resource_usage=subprocess.check_output(
