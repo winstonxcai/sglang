@@ -236,7 +236,7 @@ def precompile_sm90() -> None:
         digest = hashlib.sha256(source.encode()).hexdigest()
         cache = artifacts["cache_files"]
         libraries = [
-            str(Path(path).with_name("kernel_lib.so"))
+            str(Path(path).with_name("executable.so"))
             for path, h in cache.items()
             if path.endswith("/device_kernel.cu") and h == digest
         ]
@@ -338,7 +338,7 @@ def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
             and variant["heads"] == 16
             and variant.get("block_i", 32) == 32
         ):
-            libraries = [str(path.with_name("kernel_lib.so")) for path in matches]
+            libraries = [str(path.with_name("executable.so")) for path in matches]
             variant["libraries"] = {
                 path: cache[path] for path in libraries if path in cache
             }
