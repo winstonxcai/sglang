@@ -489,10 +489,12 @@ class Fixture:
         if upstream:
             from sglang.benchmark.remnant.glm_artifacts import (
                 verify_decode_combine_library,
+                verify_decode_partial_library,
             )
             from sglang.srt.remnant.glm_config import H200_PACKED_DECODE_INNER
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 glm_packed_decode_combine,
+                sparse_mla_fwd_decode_partial_fp8,
             )
 
             columns = 128 if case.queries == 1 else 512
@@ -504,6 +506,26 @@ class Fixture:
             manifest = json.loads(
                 Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text()
             )
+            (partial_variant,) = (
+                item
+                for item in manifest["tilelang"]
+                if item["packed"]
+                and item["heads"] == case.heads
+                and item.get("block_i", 32) == 32
+                and item["inner"] == self.packed_decode_inner
+            )
+            partial = sparse_mla_fwd_decode_partial_fp8(
+                case.heads,
+                DIM,
+                0,
+                COLUMNS,
+                packed=True,
+                sm_scale=SCALE,
+                block_I=32,
+                inner_iter=self.packed_decode_inner,
+                threads=128,
+            )
+            verify_decode_partial_library(partial, partial_variant)
             variant = manifest["decode_combine"][f"{groups}x{columns}"]
             combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
             verify_decode_combine_library(combine, variant)
@@ -1276,10 +1298,34 @@ def main() -> None:
         cases=[],
     )
     if upstream:
-        from sglang.srt.remnant.glm_config import H200_PACKED_DECODE_COMBINE
+        from sglang.srt.remnant.glm_config import (
+            H200_PACKED_DECODE_COMBINE,
+            H200_PACKED_DECODE_INNER,
+        )
 
         build = payload["source"]["compiled_build"]
         compile_manifest = build.get("glm_compile", {})
+        expected_inner = set(H200_PACKED_DECODE_INNER.values())
+        partials = [
+            variant
+            for variant in compile_manifest.get("tilelang", [])
+            if variant["packed"]
+            and variant["heads"] == 16
+            and variant.get("block_i", 32) == 32
+            and variant["inner"] in expected_inner
+        ]
+        if (
+            len(partials) != len(expected_inner)
+            or {v["inner"] for v in partials} != expected_inner
+        ):
+            raise RuntimeError("Missing CPU-prepared Packed decode partials")
+        cache_files = compile_manifest["cache_files"]
+        if any(
+            not v.get("libraries")
+            or any(cache_files.get(path) != h for path, h in v["libraries"].items())
+            for v in partials
+        ):
+            raise RuntimeError("Unbound CPU-prepared Packed decode partial libraries")
         combines = compile_manifest.get("decode_combine", {})
         if set(combines) != {f"{g}x{c}" for g, c in H200_PACKED_DECODE_COMBINE} or any(
             not variant.get("cubin_path")

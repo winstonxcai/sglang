@@ -38,6 +38,7 @@ class PartialVariant(TypedDict):
     symbol: NotRequired[str]
     parameters: NotRequired[list[CudaParameter]]
     dynamic_shared: NotRequired[int]
+    libraries: NotRequired[dict[str, str]]
 
 
 class CompileManifest(TypedDict):
@@ -271,6 +272,20 @@ def verify_decode_combine_library(kernel, variant: dict[str, str]) -> None:
         raise RuntimeError("Prepared GLM combine library or device source changed")
 
 
+def verify_decode_partial_library(kernel, variant: PartialVariant) -> None:
+    """Check the Packed partial's loaded TVM FFI library and device source."""
+    library = getattr(kernel.adapter, "libpath", None)
+    prepared = variant.get("libraries", {})
+    if library is None or str(library) not in prepared:
+        raise RuntimeError(f"GLM partial did not load a prepared library: {library}")
+    if (
+        hashlib.sha256(Path(library).read_bytes()).hexdigest() != prepared[str(library)]
+        or hashlib.sha256(kernel.get_kernel_source().encode()).hexdigest()
+        != variant["source_sha256"]
+    ):
+        raise RuntimeError("Prepared GLM partial library or device source changed")
+
+
 def _verified_sm90_cubin(source: str, cache: dict[str, str]) -> Path:
     """Resolve a generated SM90 cubin against its CPU preparation cache hashes."""
     import tilelang
@@ -318,6 +333,17 @@ def bind_partial_launch_metadata(compiled: CompileManifest) -> None:
         if hashlib.sha256(source.encode()).hexdigest() != variant["source_sha256"]:
             raise RuntimeError(f"GLM generated source changed: {matches[0]}")
         cubin = _verified_sm90_cubin(source, cache)
+        if (
+            variant["packed"]
+            and variant["heads"] == 16
+            and variant.get("block_i", 32) == 32
+        ):
+            libraries = [str(path.with_name("kernel_lib.so")) for path in matches]
+            variant["libraries"] = {
+                path: cache[path] for path in libraries if path in cache
+            }
+            if not variant["libraries"]:
+                raise RuntimeError("Missing CPU-prepared GLM partial runtime library")
         symbol = "glm_packed_partial_kernel" if variant["packed"] else "main_kernel"
         match = re.search(r"\b" + symbol + r"\(([^)]*)\)\s*\{", source)
         if not match:
