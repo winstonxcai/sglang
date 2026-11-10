@@ -41,9 +41,11 @@ import torch
 from sgl_kernel import flash_mla
 
 from sglang.benchmark.remnant.cases import (
+    FP4_DECODE_MODES,
     FP4_DECODE_PROTOCOL,
     PREFILL_PROTOCOL,
     PROTOCOL,
+    UPSTREAM_FLASHMLA_SHA,
     DecodeCase,
     FP4DecodeCase,
     PrefillReadCase,
@@ -61,7 +63,10 @@ from sglang.benchmark.remnant.cases import (
     verify_profile_replay,
     write_results,
 )
-from sglang.benchmark.remnant.quantization import check_fp8_storage
+from sglang.benchmark.remnant.quantization import (
+    check_fp8_storage,
+    v41_native_fp8_reference,
+)
 from sglang.benchmark.remnant.timing import measure, paired_samples
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
@@ -349,13 +354,47 @@ def check_packed_bytes(left, right, name: str) -> None:
         raise AssertionError(f"{name}: Packed producer bytes differ: {differences}")
 
 
-def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
-    """Paired production FP4 APIs; fixture/reference work is outside timing.
+def upstream_native_control():
+    """Load only the CPU-built, source-bound upstream control. Author: Winston Cai."""
+    import flash_mla
+    import flash_mla.cuda
+    import flash_mla.flash_mla_interface
 
-    Author: Winston Cai. CPU oracle independently quantizes and selects; Native
-    is dense FP4, never V4 FP8 or a pruned matched control.
+    path = os.environ.get("REMNANT_NATIVE_CONTROL_MANIFEST")
+    if not path:
+        raise RuntimeError(
+            "V4.1 Native requires the CPU-built upstream control manifest"
+        )
+    control = json.loads(Path(path).read_text())
+    if control.get("source_commit") != UPSTREAM_FLASHMLA_SHA or control.get(
+        "architectures"
+    ) != ["sm_90a"]:
+        raise RuntimeError(f"V4.1 Native control source/target mismatch: {path}")
+    for name, module in (
+        ("binary", flash_mla.cuda),
+        ("python", flash_mla.flash_mla_interface),
+    ):
+        actual = Path(module.__file__).resolve()
+        if (
+            str(actual) != control[name]
+            or hashlib.sha256(actual.read_bytes()).hexdigest()
+            != control[name + "_sha256"]
+        ):
+            raise RuntimeError(f"V4.1 Native loaded an unverified {name}: {actual}")
+    return flash_mla, control
+
+
+def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
+    """Upstream Native versus custom dense/Packed FP4; setup is outside timing.
+
+    Author: Winston Cai. Native preserves upstream H100 FP8/BF16 arithmetic with synchronization fixes.
+    Dense FP4 is a diagnostic control, with its own name and independent oracle.
     """
+    upstream_flash_mla, native_control = upstream_native_control()
+
+    from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
     from sglang.kernels.ops.attention.dsv4.fp4_cache import store_fp4_cache
+    from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
     from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
         dequantize_k_cache_v41_fp4,
         quantize_k_cache_v41_fp4,
@@ -363,15 +402,16 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
 
     page, rows = case.global_page_size, case.batch * 512
     rng = torch.Generator().manual_seed(case_seed(case, seed))
-    # Post-normalization/post-RoPE BF16 producer boundary, shared by both paths.
+    # Post-normalization/post-RoPE BF16 producer boundary, shared by all paths.
     x = torch.randn((rows, 512), generator=rng).bfloat16()
     dense_bytes = quantize_k_cache_v41_fp4(x.reshape(-1, page, 512))
-    native_values = dequantize_k_cache_v41_fp4(dense_bytes, page).reshape(rows, 512)
-    selected = torch.argsort(native_values.abs(), dim=-1, descending=True, stable=True)[
-        :, :256
-    ]
-    packed_values = torch.zeros_like(native_values).scatter_(
-        1, selected, native_values.gather(1, selected)
+    dense_fp4_values = dequantize_k_cache_v41_fp4(dense_bytes, page).reshape(rows, 512)
+    native_values = v41_native_fp8_reference(dense_fp4_values)
+    selected = torch.argsort(
+        dense_fp4_values.abs(), dim=-1, descending=True, stable=True
+    )[:, :256]
+    packed_values = torch.zeros_like(dense_fp4_values).scatter_(
+        1, selected, dense_fp4_values.gather(1, selected)
     )
     q_cpu = torch.randn((case.batch, 1, case.heads, 512), generator=rng).bfloat16()
     q = q_cpu.cuda()
@@ -417,16 +457,37 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
     from sglang.kernels.ops.attention.dsv4.kv_layout import NATIVE_FP4, PACKED_FP4
 
     for mode, values, layout in (
-        ("native", native_values, NATIVE_FP4),
+        ("native", native_values, KVLayout.V4),
+        ("dense_fp4", dense_fp4_values, NATIVE_FP4),
         ("kernel", packed_values, PACKED_FP4),
     ):
-        record_bytes = layout.record_bytes
+        record_bytes = 584 if mode == "native" else layout.record_bytes
         packed = mode == "kernel"
-        cache = torch.zeros(
-            (rows // page + 1, page * record_bytes), device="cuda", dtype=torch.uint8
+        page_bytes = (
+            KVLayout.V4.page_bytes(page) if mode == "native" else page * record_bytes
         )
-        store_fp4_cache(x_gpu, cache, loc, page, packed=packed)
-        cache_view = cache.view(-1, page, 1, record_bytes)
+        cache = torch.zeros(
+            (rows // page + 1, page_bytes), device="cuda", dtype=torch.uint8
+        )
+        if mode == "native":
+            # The upstream C1/C2 producer fake-quantizes to FP4, then the H100
+            # auto pool stores that unpruned latent in its V4 cache format.
+            fused_store_cache(
+                dense_fp4_values.cuda(),
+                cache,
+                loc,
+                page_size=page,
+                type="flashmla",
+                layout=KVLayout.V4,
+            )
+            decoded = decode_native(cache.cpu(), page)[page : page + rows].bfloat16()
+            torch.testing.assert_close(decoded, values, rtol=0, atol=0)
+        else:
+            store_fp4_cache(x_gpu, cache, loc, page, packed=packed)
+        cache_view = cache.as_strided(
+            (len(cache), page, 1, record_bytes),
+            (cache.stride(0), record_bytes, record_bytes, 1),
+        )
         gathered = values[physical_cpu.long()]
         kv = torch.cat((swa_values[:, None], gathered), dim=2).float()
         scores = torch.einsum("bshd,bskd->bshk", q_cpu.float(), kv) * 512**-0.5
@@ -439,7 +500,28 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
             lse.transpose(1, 2),
         )
 
-        def call(cache_view=cache_view, packed=packed):
+        def call(cache_view=cache_view, packed=packed, mode=mode):
+            if mode == "native":
+                # SGLang resets metadata after graph warmup, so capture records
+                # the first use of each ratio's schedule. Create it here to
+                # include scheduling in every replay of this standalone call.
+                scheduler = upstream_flash_mla.get_mla_metadata()[0]
+                return upstream_flash_mla.flash_mla_with_kvcache(
+                    q,
+                    swa_view,
+                    None,
+                    None,
+                    512,
+                    scheduler,
+                    softmax_scale=512**-0.5,
+                    is_fp8_kvcache=True,
+                    indices=swa_indices,
+                    topk_length=swa_lengths,
+                    extra_k_cache=cache_view,
+                    extra_indices_in_kvcache=physical,
+                    extra_topk_length=lengths,
+                    attn_sink=sink,
+                )
             return flash_mla.flash_mla_with_fp4_kvcache(
                 q,
                 swa_view,
@@ -467,9 +549,18 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
 
         operations.append(
             Operation(
-                mode=mode,
+                mode="native" if mode == "dense_fp4" else mode,
+                label="dense_fp4" if mode == "dense_fp4" else None,
                 call=call,
-                owned=(cache, q, physical, swa_cache, sink, lengths, swa_lengths),
+                owned=(
+                    cache,
+                    q,
+                    physical,
+                    swa_cache,
+                    sink,
+                    lengths,
+                    swa_lengths,
+                ),
                 validate=validate,
                 expected_kernels=(),
                 keep_count=256,
@@ -480,6 +571,7 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
         "common_inputs_sha256": tensor_hash(
             {
                 "x": x,
+                "upstream_store_input": dense_fp4_values,
                 "q": q_cpu,
                 "physical": physical_cpu,
                 "swa": swa_values,
@@ -488,7 +580,12 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
         ),
         "path_layouts": {
             "native": {
-                "implementation": "Native FP4 Direct",
+                "implementation": "Upstream H100 auto FP8/BF16",
+                "record_bytes": 584,
+                "packed_keep_count": 512,
+            },
+            "dense_fp4": {
+                "implementation": "Custom dense FP4 Direct",
                 "record_bytes": 288,
                 "packed_keep_count": 512,
             },
@@ -499,7 +596,9 @@ def fp4_decode_operations(case: FP4DecodeCase, seed: int, *_unused):
             },
         },
         "global_page_size": page,
-        "baseline": "unpruned dense Native FP4",
+        "baseline": "upstream H100 auto FP8/BF16; synchronization corrected",
+        "native_control": native_control,
+        "native_scheduler": "first use per ratio; regenerated inside graph",
     }
 
 
@@ -1333,7 +1432,11 @@ def source_manifest() -> dict:
     binaries = {}
     for name, module in tuple(sys.modules.items()):
         path = getattr(module, "__file__", None)
-        if name.startswith("sgl_kernel") and path and path.endswith(".so"):
+        if (
+            name.startswith(("sgl_kernel", "flash_mla"))
+            and path
+            and path.endswith(".so")
+        ):
             binaries[path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
     return {
         "revisions": {
@@ -1355,12 +1458,16 @@ def main() -> None:
     cases = selected_cases(args)
     is_prefill = args.suite == "prefill-read"
     is_fp4 = args.suite == "v41-fp4-decode"
-    if is_fp4:
-        args.modes = "native,kernel"
-    modes = () if is_prefill else benchmark_modes(args.keep_count, args.modes)
+    modes = (
+        FP4_DECODE_MODES
+        if is_fp4
+        else (() if is_prefill else benchmark_modes(args.keep_count, args.modes))
+    )
     if not is_prefill:
         args.modes = ",".join(modes)
     if args.check_imports:
+        if is_fp4:
+            upstream_native_control()
         from sgl_kernel import remnant_ops  # noqa: F401 -- registers checked operator
 
         if getattr(flash_mla, "_flashmla_import_error", None) is not None:

@@ -28,6 +28,10 @@ from sglang.srt.remnant.glm import (
     normalize_and_store,
     reconstruct,
 )
+from sglang.srt.remnant.glm_config import (
+    H200_PACKED_DECODE_COMBINE,
+    H200_PACKED_DECODE_INNER,
+)
 from sglang.srt.remnant.reference import topmag_keep_mask
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -789,6 +793,7 @@ def _benchmark_bank_graph(
     f = Fixture.__new__(Fixture)
     f.case = Case(phase, heads, queries, 3, "independent", "rotating")
     f.packed_prefill_tile = 32
+    f.wgmma_kernels = None
     f.deadline = time.monotonic() + 1200
     f.banks, f.memory_limit = (
         banks,
@@ -972,12 +977,13 @@ def test_packed_loader_bytes():
 
 
 class _CachedPartial:
-    """Launch one partition of the exact CPU-built production cubin.
+    """Launch selected partitions of the exact CPU-built production cubin.
 
     Restricting the grid does not change the binary, tensor strides, barriers or
     arithmetic. It removes 32/65 empty CTAs and the unchanged combine kernel from
     sanitizer iteration. All arguments and shared bytes come from verified CPU
     metadata, never a guessed ABI. CUDA modules outlive their captured graphs.
+    Use the full Y grid for a separate probe of a short final partition.
     """
 
     def __init__(self, variant):
@@ -1014,7 +1020,7 @@ class _CachedPartial:
                 f"Focused production partial CUDA Driver error: {status}"
             )
 
-    def __call__(self, tensors, *, slots, stream):
+    def __call__(self, tensors, *, slots, stream, partitions=1):
         C = self.C
         arguments = []
         for param in self.variant["parameters"]:
@@ -1028,7 +1034,7 @@ class _CachedPartial:
             self.driver.cuLaunchKernel(
                 self.function,
                 1,
-                1,
+                partitions,
                 1,
                 128,
                 1,
@@ -1046,15 +1052,17 @@ class _CachedPartial:
             self.module.value = None
 
 
-@pytest.mark.parametrize("inner", [1, 2])
-@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize(
+    ("heads", "inner"),
+    [(8, 1), (8, 2)] + [(16, inner) for inner in sorted(set(H200_PACKED_DECODE_INNER.values()))],
+)
 def test_decode_partial_graph(heads, inner, record_property):
     """Essential sanitizer: one exact production CTA, two banks, tails 0..3.
 
     Fixture creation, reconstruction, finiteness and comparisons run on CPU.
     The instrumented GPU work is only the changed partial kernel, with stock
     Native on independently reconstructed Packed rows as its control. The full
-    66/33-partition attention and combine path has a separate uninstrumented gate.
+    attention and combine path has a separate uninstrumented gate.
     """
     _check_cached_partial_graph(heads, inner, record_property, packed_tile=32)
 
@@ -1267,3 +1275,211 @@ def test_adapter_reconstruction_above_2gib():
         torch.cuda.synchronize()
         del values, bitmap
         torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(("groups", "columns"), H200_PACKED_DECODE_COMBINE)
+def test_packed_decode_combine_graph(groups, columns, record_property):
+    """Exercise each candidate cubin with a fully masked head and new inputs."""
+    manifest = json.loads(Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text())
+    variant = manifest["decode_combine"][f"{groups}x{columns}"]
+    _check_decode_combine_graph(groups, columns, variant, record_property)
+
+
+def _check_decode_combine_graph(groups, columns, variant, record_property):
+    from sglang.benchmark.remnant.glm_artifacts import verify_decode_library
+    from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+        glm_packed_decode_combine,
+    )
+
+    generator = torch.Generator().manual_seed(20261024 + groups)
+    sentinel = -(2**30)
+    split_output = torch.randn((1, 1, groups, 16, 512), generator=generator)
+    split_output = split_output.to(device="cuda", dtype=torch.bfloat16)
+    split_lse = torch.randn((1, 1, groups, 16), generator=generator).cuda()
+    split_output[..., 0, :] = 0
+    split_lse[..., 0] = sentinel
+    combine = glm_packed_decode_combine(16, 512, groups, columns)
+    verify_decode_library(combine, variant)
+    digest = hashlib.sha256(Path(variant["cubin_path"]).read_bytes()).hexdigest()
+    assert digest == variant["cubin_sha256"]
+    record_property("combine_cubin_sha256", digest)
+    warm = combine(split_output, split_lse)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = combine(split_output, split_lse)
+    for _ in range(2):
+        graph.replay()
+        weights = torch.softmax(split_lse * 0.6931471805599453, dim=2)
+        expected = (split_output.float() * weights[..., None]).sum(dim=2)
+        torch.testing.assert_close(result.float(), expected, atol=0.02, rtol=0.02)
+        assert torch.count_nonzero(result[..., 0, :]).item() == 0
+        split_lse[..., 1:].neg_()
+        split_output.neg_()
+    del warm
+
+
+if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
+    from sglang.benchmark.remnant.glm_upstream import WGMMA_INNER, wgmma_geometry
+
+    def test_wgmma_query_conversion_bytes():
+        from sglang.benchmark.remnant.glm_artifacts import (
+            verify_decode_library,
+            wgmma_query_probe,
+        )
+
+        manifest = json.loads(
+            Path(os.environ["REMNANT_BUILD_MANIFEST_PATH"]).read_text()
+        )
+        probe = wgmma_query_probe()
+        verify_decode_library(
+            probe, manifest["upstream_compile"]["query_conversion_probe"]
+        )
+        raw = (
+            torch.arange(1 << 16, dtype=torch.int32, device="cuda")
+            .to(torch.int16)
+            .view(torch.bfloat16)
+            .reshape(8, 16, 512)
+        )
+        expected = raw.to(torch.float8_e4m3fn).view(torch.uint8)
+        torch.testing.assert_close(probe(raw), expected, atol=0, rtol=0)
+
+    def _wgmma_variant(batch):
+        manifest = json.loads(
+            Path(os.environ["REMNANT_BUILD_MANIFEST_PATH"]).read_text()
+        )
+        variant = manifest["upstream_compile"]["decode_wgmma"][str(batch)]
+        assert variant["geometry"] == wgmma_geometry(batch)
+        return variant
+
+    @pytest.mark.parametrize("batch", tuple(WGMMA_INNER))
+    def test_wgmma_decode_partial_graph(batch, record_property):
+        """Instrument one exact CTA with changing Q, invalid rows and tails."""
+        import math
+
+        import numpy as np
+
+        variant = _wgmma_variant(batch)
+        geometry = variant["geometry"]
+        partial = variant["partial"]
+        record_property("partial_cubin_sha256", partial["cubin_sha256"])
+        record_property("decode_geometry", json.dumps(geometry))
+        slots, heads, dim = 513, 16, 512
+        locations = (0, 1, 255, 256, 511, 512)
+        rng = np.random.default_rng(20261024 + batch)
+        dtype = torch.float8_e4m3fn
+        values = torch.from_numpy(
+            rng.normal(0, 0.25, (slots, 256)).astype(np.float32)
+        ).to(dtype).view(torch.uint8)
+        words = np.zeros((slots, 8), dtype=np.uint64)
+        dense = np.zeros((slots, dim), dtype=np.uint8)
+        for loc in locations:
+            mask = np.zeros(dim, dtype=np.bool_)
+            mask[rng.choice(dim, 256, replace=False)] = True
+            dense[loc, mask] = values[loc].numpy()
+            words[loc] = np.packbits(mask).view(">u8").astype(np.uint64)
+        dense = torch.from_numpy(dense).view(dtype).float()
+        count = geometry["tile_rows"] * geometry["inner_iter"]
+        groups = geometry["partial_groups"]
+        short_split = 2112 % count != 0
+        record_property("short_split_ctas", groups if short_split else 0)
+        owner, stream = torch.cuda.current_stream(), torch.cuda.Stream()
+        stream.wait_stream(owner)
+        graph, kernel = None, None
+
+        def check_result(buffers, q, active, group):
+            selected = active[(active >= 0) & (active < slots)]
+            kv = dense[selected]
+            score = (q[0, 0].to(dtype).float() @ kv.T) * ATTENTION_SCALE
+            expected = torch.softmax(score, dim=-1) @ kv
+            expected_lse = torch.logsumexp(score, dim=-1) / math.log(2)
+            torch.testing.assert_close(
+                buffers["partial_o"][0, 0, group].cpu().float(),
+                expected, atol=0.02, rtol=0.02,
+            )
+            torch.testing.assert_close(
+                buffers["partial_lse"][0, 0, group].cpu(),
+                expected_lse, atol=0.02, rtol=0.02,
+            )
+
+        try:
+            with torch.cuda.stream(stream):
+                buffers = dict(
+                    q_bf16=torch.zeros(
+                        (1, 1, heads, dim), dtype=torch.bfloat16, device="cuda"
+                    ),
+                    kv_fp8=values.cuda(),
+                    bitmap=torch.from_numpy(words).cuda(),
+                    indices=torch.full(
+                        (1, 1, 1, 2112), -1, dtype=torch.int32, device="cuda"
+                    ),
+                    partial_o=torch.empty(
+                        (1, 1, groups, heads, dim), dtype=torch.bfloat16, device="cuda"
+                    ),
+                    partial_lse=torch.empty(
+                        (1, 1, groups, heads), dtype=torch.float32, device="cuda"
+                    ),
+                )
+                kernel = _CachedPartial(partial)
+                kernel(buffers, slots=slots, stream=stream)
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    kernel(buffers, slots=slots, stream=stream)
+                # One selected row and zero Q make the partial exactly that
+                # row at every head. This checks the BF16 store order directly.
+                buffers["indices"][0, 0, 0, 0] = locations[0]
+                graph.replay()
+                stream.synchronize()
+                torch.testing.assert_close(
+                    buffers["partial_o"][0, 0, 0].cpu(),
+                    dense[locations[0]].to(torch.bfloat16).expand(heads, -1),
+                    atol=0, rtol=0,
+                )
+                torch.testing.assert_close(
+                    buffers["partial_lse"][0, 0, 0].cpu(),
+                    torch.zeros(heads),
+                    atol=0, rtol=0,
+                )
+                for tail in range(4):
+                    q = torch.from_numpy(
+                        rng.normal(0, 0.15, (1, 1, heads, dim)).astype(np.float32)
+                    ).to(torch.bfloat16)
+                    indices = np.full((1, 1, 1, 2112), -1, dtype=np.int32)
+                    active = indices[0, 0, 0, :count]
+                    active[:-3] = np.resize((*locations, 256, -1, slots), count - 3)
+                    if tail == 0 and count > geometry["tile_rows"]:
+                        active[:geometry["tile_rows"]] = -1
+                    active[count - 3:count - 3 + tail] = locations[:tail]
+                    buffers["q_bf16"].copy_(q)
+                    buffers["indices"].copy_(torch.from_numpy(indices))
+                    graph.replay()
+                    stream.synchronize()
+                    check_result(buffers, q, active, 0)
+                if short_split:
+                    # The real block index selects the short final partition.
+                    # Leave all other CTAs empty in this single extra launch.
+                    indices.fill(-1)
+                    final = indices[0, 0, 0, (groups - 1) * count:]
+                    final[:3] = locations[:3]
+                    buffers["indices"].copy_(torch.from_numpy(indices))
+                    kernel(buffers, slots=slots, stream=stream, partitions=groups)
+                    stream.synchronize()
+                    check_result(buffers, q, final, groups - 1)
+        finally:
+            stream.synchronize()
+            if graph is not None:
+                graph.reset()
+            if kernel is not None:
+                kernel.close()
+            owner.wait_stream(stream)
+
+    @pytest.mark.parametrize("batch", tuple(WGMMA_INNER))
+    def test_wgmma_decode_combine_graph(batch, record_property):
+        variant = _wgmma_variant(batch)
+        _check_decode_combine_graph(
+            variant["geometry"]["partial_groups"],
+            variant["combine_columns"],
+            variant["combine"],
+            record_property,
+        )

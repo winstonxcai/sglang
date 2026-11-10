@@ -26,6 +26,9 @@ PROTOCOL = "remnant-glm-attention-v1"
 DECODE_PROTOCOL = "remnant-glm-decode-v1"
 PREFILL_PROTOCOL = "remnant-glm-prefill-v1"
 PREFILL_SMALL_PROTOCOL = "remnant-glm-prefill-small-v1"
+UPSTREAM_PROTOCOL = "remnant-glm-upstream-decode-v1"
+UPSTREAM_PROFILE_PROTOCOL = "remnant-glm-upstream-decode-profile-v2"
+UPSTREAM_SUITE = "glm-upstream-decode"
 PROTOCOLS = {
     "all": PROTOCOL,
     "decode": DECODE_PROTOCOL,
@@ -37,6 +40,7 @@ SEED = 20261024
 HISTORY, PAGE, DIM, KEEP, COLUMNS, GROUPS = 131072, 256, 512, 256, 2112, 512
 SCALE, ATOL, RTOL = 256**-0.5, 0.02, 0.02
 ROUNDS = 30
+DECODE_TRACE_STAGES = ("query_conversion", "partial_attention", "combine")
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,21 @@ def cases(phase_scope: str = "all") -> list[Case]:
         )
         for policy in ("warm", "rotating")
     ]
+
+
+def experiment(suite: str, phase: str) -> tuple[str, tuple[str, str], list[Case]]:
+    """Keep the pristine upstream experiment distinct from historical matrices."""
+    if suite == UPSTREAM_SUITE:
+        if phase != "decode":
+            raise ValueError("glm-upstream-decode requires --phase decode")
+        return (
+            UPSTREAM_PROTOCOL,
+            ("upstream", "direct"),
+            [case for case in cases("decode") if case.heads == 16],
+        )
+    if suite != "glm-attention":
+        raise ValueError(f"Unsupported GLM suite: {suite}")
+    return PROTOCOLS[phase], MODES, cases(phase)
 
 
 def case_seed(case: Case, bank: int = 0) -> int:
@@ -203,14 +222,19 @@ def cycles_per_sample(banks: int) -> int:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model-family", choices=("glm53",), default="glm53")
-    p.add_argument("--suite", choices=("glm-attention",), default="glm-attention")
+    p.add_argument(
+        "--suite", choices=("glm-attention", UPSTREAM_SUITE), default="glm-attention"
+    )
     p.add_argument("--phase", choices=tuple(PROTOCOLS), default="all")
     p.add_argument("--packed-prefill-tile", type=int, choices=(32, 64, 128), default=32)
-    p.add_argument("--modes", choices=("native,direct",), default="native,direct")
+    p.add_argument(
+        "--modes", choices=("native,direct", "upstream,direct"), default=None
+    )
     p.add_argument(
         "--resume",
         help="Prior timing JSON from identical source/artifacts; requires REMNANT_BUILD_MANIFEST_PATH",
     )
+    p.add_argument("--profile-decode", action="store_true")
     p.add_argument("--output")
     p.add_argument("--max-seconds", type=int, default=850)
     p.add_argument("--check-imports", action="store_true")
@@ -324,8 +348,12 @@ class Fixture:
         *,
         packed_prefill_tile: int = 32,
         gpu_family: str = "H100",
+        upstream: bool = False,
+        wgmma: dict | None = None,
     ):
+        self.upstream = upstream
         self.packed_prefill_tile = packed_prefill_tile
+        self.wgmma_kernels = None
         import torch
 
         from sglang.srt.layers.layernorm import RMSNorm
@@ -371,6 +399,10 @@ class Fixture:
             torch.cuda.get_device_properties(0).multi_processor_count,
             1,
         )
+        if upstream and inner != (1 if case.queries == 1 else 2):
+            raise RuntimeError(
+                f"Unprepared H200 decode split: {inner}; refusing GPU compilation"
+            )
         output_budget //= min(inner, 33) if packed_prefill_tile != 32 else inner
         self.projected_bytes = cache_bytes + input_bytes + output_budget + 512 * 1024**2
         if self.projected_bytes >= self.memory_limit:
@@ -447,7 +479,7 @@ class Fixture:
             inner_iter=inner,
             partial_groups=66 // inner,
             path_geometry={
-                "native": dict(
+                self.baseline_name: dict(
                     tile_rows=32, inner_iter=inner, partial_groups=66 // inner
                 ),
                 "direct": dict(
@@ -458,9 +490,73 @@ class Fixture:
             },
             first_query_sequence_length=HISTORY + (4 if case.tail == 0 else 3),
         )
+        if upstream:
+            from sglang.benchmark.remnant.glm_artifacts import (
+                verify_decode_library,
+                verify_decode_partial_library,
+            )
+            from sglang.benchmark.remnant.glm_upstream import wgmma_geometry
+            from sglang.srt.remnant.glm_config import H200_PACKED_DECODE_INNER
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                glm_packed_decode_combine,
+                glm_packed_wgmma_partial,
+                sparse_mla_fwd_decode_partial_fp8,
+            )
+
+            columns = 128 if case.queries == 1 else 512
+            if wgmma is not None and case.queries > 1:
+                variant = wgmma[str(case.queries)]
+                columns = variant["combine_columns"]
+                geometry = wgmma_geometry(
+                    8 if case.queries == 16 and variant is wgmma.get("8") else case.queries
+                )
+                inner = geometry["inner_iter"]
+                tile_rows = geometry["tile_rows"]
+                groups = geometry["partial_groups"]
+                partial = glm_packed_wgmma_partial(inner, SCALE)
+                verify_decode_library(partial, variant["partial"])
+                combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
+                verify_decode_library(combine, variant["combine"])
+                self.wgmma_kernels = partial, combine
+                self.identity["direct_query_conversion"] = "fused"
+            else:
+                tile_rows = 32
+                inner = self.packed_decode_inner = H200_PACKED_DECODE_INNER[case.queries]
+                groups = 66 // inner
+                manifest = json.loads(
+                    Path(os.environ["REMNANT_GLM_COMPILE_MANIFEST"]).read_text()
+                )
+                (partial_variant,) = (
+                    item
+                    for item in manifest["tilelang"]
+                    if item["packed"]
+                    and item["heads"] == case.heads
+                    and item.get("block_i", 32) == tile_rows
+                    and item["inner"] == inner
+                )
+                partial = sparse_mla_fwd_decode_partial_fp8(
+                    case.heads, DIM, 0, COLUMNS, packed=True, sm_scale=SCALE,
+                    block_I=tile_rows, inner_iter=inner, threads=128,
+                )
+                verify_decode_partial_library(partial, partial_variant)
+                variant = manifest["decode_combine"][f"{groups}x{columns}"]
+                combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
+                verify_decode_library(combine, variant)
+            self.identity["path_geometry"]["direct"].update(
+                tile_rows=tile_rows, inner_iter=inner, partial_groups=groups
+            )
+            self.identity["direct_combine_columns"] = columns
         self.graphs = {}
         self.outputs = {}
         self.validate()
+
+    @property
+    def baseline_name(self) -> str:
+        return "upstream" if getattr(self, "upstream", False) else "native"
+
+    @property
+    def modes(self) -> tuple[str, str]:
+        return self.baseline_name, "direct"
 
     def check(self) -> None:
         if time.monotonic() >= self.deadline - 5:
@@ -472,7 +568,11 @@ class Fixture:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
         from sglang.srt.remnant.glm import attention
 
-        if mode == "native":
+        if mode == self.baseline_name:
+            if self.baseline_name == "upstream":
+                from sglang.benchmark.remnant.glm_upstream import load_baseline
+
+                tilelang_sparse_fwd = load_baseline().tilelang_sparse_fwd
             return tilelang_sparse_fwd(
                 self.q,
                 self.native[bank].view(torch.float8_e4m3fn).unsqueeze(1),
@@ -483,7 +583,15 @@ class Fixture:
         if mode != "direct":
             raise ValueError(f"Unsupported GLM path {mode}")
         cache = self.packed[bank]
-        if self.packed_prefill_tile == 32:
+        if self.wgmma_kernels is not None:
+            partial, combine = self.wgmma_kernels
+            return combine(*partial(
+                self.q.unsqueeze(0),
+                cache.values.view(torch.float8_e4m3fn)[None, :, None, :],
+                cache.bitmaps,
+                self.ids[bank].unsqueeze(0),
+            ))
+        if self.packed_prefill_tile == 32 and self.baseline_name != "upstream":
             return attention(self.q, cache, self.ids[bank], SCALE)
         return tilelang_sparse_fwd(
             self.q,
@@ -493,6 +601,10 @@ class Fixture:
             DIM,
             packed_bitmap=cache.bitmaps,
             packed_prefill_tile=self.packed_prefill_tile,
+            packed_decode_inner=getattr(self, "packed_decode_inner", 0),
+            packed_decode_combine_columns=(128 if self.case.queries == 1 else 512)
+            if self.baseline_name == "upstream"
+            else 0,
         )
 
     def validate(self, *, reference_device=None) -> None:
@@ -500,6 +612,10 @@ class Fixture:
 
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
+        if self.baseline_name == "upstream":
+            from sglang.benchmark.remnant.glm_upstream import load_baseline
+
+            tilelang_sparse_fwd = load_baseline().tilelang_sparse_fwd
         cpu = reference_device == "cpu"
         sample = torch.linspace(
             0,
@@ -529,7 +645,10 @@ class Fixture:
             direct_ref = attention_reference(
                 query, dense, local, device=reference_device
             )
-            for mode, reference in (("native", native_ref), ("direct", direct_ref)):
+            for mode, reference in (
+                (self.baseline_name, native_ref),
+                ("direct", direct_ref),
+            ):
                 output = self.call(mode, bank)
                 checked = output.cpu() if cpu else output
                 if not bool(torch.isfinite(checked).all()):
@@ -564,7 +683,7 @@ class Fixture:
 
         if warmup_calls < 1:
             raise ValueError("Capture requires positive warmup count")
-        for mode in MODES:
+        for mode in self.modes:
             self.check()
             for i in range(max(warmup_calls, self.banks)):
                 output = self.call(mode, i % self.banks)
@@ -608,13 +727,31 @@ class Fixture:
     def validate_replay(self, *, reference_device=None) -> None:
         import torch
 
-        for mode in ("direct", "native", "direct", "native"):
+        for mode in ("direct", self.baseline_name, "direct", self.baseline_name):
             self.graphs[mode].replay()
             expected = self.call(mode, self.banks - 1)
             actual = self.outputs[mode]
             if reference_device == "cpu":
                 actual, expected = actual.cpu(), expected.cpu()
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+        if self.baseline_name == "upstream":
+            # Q keeps its address but changes in place after capture. This
+            # tests replay inputs in both the pristine and production paths.
+            self.q.neg_()
+            try:
+                for mode in self.modes:
+                    self.graphs[mode].replay()
+                    expected = self.call(mode, self.banks - 1)
+                    torch.testing.assert_close(
+                        self.outputs[mode], expected, atol=0, rtol=0
+                    )
+            finally:
+                self.q.neg_()
+                for mode in self.modes:
+                    self.graphs[mode].replay()
+                torch.cuda.synchronize()
+            self.identity["changing_input_replay"] = "passed"
 
     def time(self) -> dict:
         from sglang.benchmark.remnant.cases import summary
@@ -623,7 +760,7 @@ class Fixture:
         self.capture()
         repeats = cycles_per_sample(self.banks)
         samples, orders = paired_samples(
-            {mode: self.graphs[mode].replay for mode in MODES},
+            {mode: self.graphs[mode].replay for mode in self.modes},
             ROUNDS,
             case_seed(self.case),
             repeats,
@@ -640,8 +777,8 @@ class Fixture:
             execution="cuda_graph",
             paths={m: summary(t) for m, t in samples.items()},
             paired_ratios={
-                "direct_over_native": paired_ratio_summary(
-                    samples["direct"], samples["native"]
+                f"direct_over_{self.baseline_name}": paired_ratio_summary(
+                    samples["direct"], samples[self.baseline_name]
                 )
             },
             round_orders=orders,
@@ -654,6 +791,8 @@ def runtime_hashes(root: Path) -> dict[str, str]:
     paths = (
         "kernels/ops/attention/dsa/tilelang_kernel.py",
         "kernels/jit/include/sgl_kernel/glm_packed_decode.cuh",
+        "kernels/jit/include/sgl_kernel/glm_wgmma_pv.cuh",
+        "kernels/jit/include/sgl_kernel/glm_wgmma_query.cuh",
         "srt/remnant/glm.py",
         "srt/remnant/glm_pool.py",
         "srt/remnant/reference.py",
@@ -671,6 +810,7 @@ def benchmark_source_hashes(root: Path) -> dict[str, str]:
     """
     paths = (
         "benchmark/remnant/glm_attention.py",
+        "benchmark/remnant/glm_upstream.py",
         "benchmark/remnant/timing.py",
         "benchmark/remnant/cases.py",
         "srt/remnant/config.py",
@@ -748,6 +888,11 @@ def write_results(payload: dict, base: Path) -> None:
     tmp = base.with_suffix(".json.partial")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     tmp.replace(base.with_suffix(".json"))
+    ratio_name = (
+        "direct_over_upstream"
+        if payload.get("protocol") == UPSTREAM_PROTOCOL
+        else "direct_over_native"
+    )
     with base.with_suffix(".csv").open("w", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -758,7 +903,7 @@ def write_results(payload: dict, base: Path) -> None:
                 "median_ms",
                 "p95_round_average_ms",
                 "samples_ms",
-                "direct_over_native",
+                ratio_name,
                 "fixture",
             ),
             lineterminator="\n",
@@ -774,10 +919,29 @@ def write_results(payload: dict, base: Path) -> None:
                         median_ms=stats["median"],
                         p95_round_average_ms=stats["p95"],
                         samples_ms=json.dumps(stats["samples"]),
-                        direct_over_native=json.dumps(case["paired_ratios"]),
+                        **{ratio_name: json.dumps(case["paired_ratios"])},
                         fixture=json.dumps(case["fixture"]),
                     )
                 )
+
+
+@cache
+def _cpu_contract(owner: str):
+    """Import a pure sibling contract without initializing the serving package."""
+    import importlib.util
+    import sys
+
+    name = __name__ + "_" + owner
+    path = (
+        Path(__file__).parents[2] / "srt/remnant/glm_config.py"
+        if owner == "glm_config"
+        else Path(__file__).with_name(owner + ".py")
+    )
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 @cache
@@ -787,45 +951,150 @@ def _summary_function() -> Callable[[list[float]], dict]:
     Local preflights import this contract by file path on hosts with no serving
     dependencies. Keep the same summary implementation as GPU measurement.
     """
-    import importlib.util
-    import sys
+    return _cpu_contract("timing").summary
 
-    name = __name__ + "_cases"
-    spec = importlib.util.spec_from_file_location(
-        name, Path(__file__).with_name("timing.py")
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module.summary
+
+def _validate_paired_timing(case: dict, modes: tuple[str, str], banks: int) -> None:
+    name = case["name"]
+    baseline = modes[0]
+    orders = case["round_orders"]
+    if (
+        len(orders) != ROUNDS
+        or orders.count([baseline, "direct"]) != ROUNDS // 2
+        or orders.count(["direct", baseline]) != ROUNDS // 2
+    ):
+        raise RuntimeError(f"Unbalanced GLM timing {name}")
+    if (
+        case["execution"] != "cuda_graph"
+        or case["calls_per_sample"] != case["cycles_per_sample"] * banks
+        or case["calls_per_sample"] < 100
+    ):
+        raise RuntimeError(f"Invalid GLM sample normalization {name}")
+    for mode, path in case["paths"].items():
+        if len(path["samples"]) != ROUNDS or any(
+            not math.isfinite(x) or x <= 0 for x in path["samples"]
+        ):
+            raise RuntimeError(f"Missing/invalid GLM rounds {name}")
+        if path != _summary_function()(path["samples"]):
+            raise RuntimeError(f"Invalid GLM derived statistics {name}/{mode}")
+    paired = case["paired_ratios"][f"direct_over_{baseline}"]
+    ratios = [
+        d / n
+        for d, n in zip(
+            case["paths"]["direct"]["samples"], case["paths"][baseline]["samples"]
+        )
+    ]
+    if paired["samples"] != ratios:
+        raise RuntimeError(f"Invalid GLM paired ratios {name}")
+    if paired != _summary_function()(ratios):
+        raise RuntimeError(f"Invalid GLM derived paired statistics {name}")
+
+
+def upstream_wgmma_launches(build: dict) -> dict:
+    """Select from the prepared artifact table without changing that table."""
+    variants = build.get("upstream_compile", {}).get("decode_wgmma", {})
+    artifact = build.get("upstream_batch16_artifact")
+    if artifact is None:
+        return variants
+    one_tile = variants.get("8", {})
+    if (
+        artifact != "8"
+        or "16" not in variants
+        or one_tile.get("geometry")
+        != {"tile_rows": 64, "inner_iter": 1, "partial_groups": 33}
+        or one_tile.get("combine_columns") != 128
+        or one_tile.get("query_conversion") != "fused"
+    ):
+        raise RuntimeError("Unbound batch-16 one-tile launch")
+    return {**variants, "16": one_tile}
 
 
 def validate_timing(payload: dict, *, prefix: bool = False) -> None:
     phase = payload.get("phase", "all")
-    protocol = PROTOCOLS[phase]
+    protocol, modes, expected = experiment(payload.get("suite", "glm-attention"), phase)
+    baseline = modes[0]
+    wgmma = {}
+    upstream_contract = None
+    if protocol == UPSTREAM_PROTOCOL:
+        upstream_contract = _cpu_contract("glm_upstream")
+        source = payload.get("source", {})
+        build = source.get("compiled_build", {})
+        if source.get("upstream") != upstream_contract.identity():
+            raise RuntimeError("Missing pristine upstream baseline identity")
+        wgmma = upstream_wgmma_launches(build)
+        expected_candidate = upstream_contract.WGMMA_CANDIDATE if wgmma else None
+        if payload.get("direct_candidate") != expected_candidate or (
+            wgmma and set(wgmma) != {str(b) for b in upstream_contract.WGMMA_INNER}
+        ):
+            raise RuntimeError("Missing or mismatched WGMMA candidate identity")
     if payload.get("protocol") != protocol or (
         not prefix and payload.get("status") != "passed"
     ):
         raise RuntimeError("GLM timing protocol incomplete")
     if phase == "prefill" and payload.get("packed_prefill_tile") != 64:
         raise RuntimeError("Full GLM prefill requires the 64-row Packed tile")
-    expected = cases(phase)
+    expected_count = len(expected)
     if prefix:
         if len(payload["cases"]) > len(expected):
             raise RuntimeError("GLM checkpoint exceeds the required matrix")
         expected = expected[: len(payload["cases"])]
     if [c["name"] for c in payload["cases"]] != [c.name for c in expected]:
         raise RuntimeError(
-            f"GLM timing requires the ordered {len(cases(phase))}-case {phase} matrix"
+            f"GLM timing requires the ordered {expected_count}-case {phase} matrix"
         )
     for case, definition in zip(payload["cases"], expected):
         if (
             not case.get("valid")
-            or set(case.get("paths", {})) != set(MODES)
+            or set(case.get("paths", {})) != set(modes)
             or case.get("case") != asdict(definition)
         ):
             raise RuntimeError(f"Incomplete GLM case {case['name']}")
         fixture = case["fixture"]
+        if protocol == UPSTREAM_PROTOCOL:
+            inner = 1 if definition.queries == 1 else 2
+            geometry = {
+                mode: dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner)
+                for mode in modes
+            }
+            compiled = (
+                payload.get("source", {})
+                .get("compiled_build", {})
+                .get("glm_compile", {})
+            )
+            variants = set(compiled.get("decode_combine", {}))
+            expected_columns = None
+            expected_query_conversion = None
+            if variants:
+                config = _cpu_contract("glm_config")
+                tuned = {f"{g}x{c}" for g, c in config.H200_PACKED_DECODE_COMBINE}
+                if variants == tuned:
+                    direct_inner = config.H200_PACKED_DECODE_INNER[definition.queries]
+                    geometry["direct"].update(
+                        inner_iter=direct_inner, partial_groups=66 // direct_inner
+                    )
+                elif variants != {"66x128", "33x512"}:
+                    raise RuntimeError("Unknown upstream decode combine geometry")
+                expected_columns = 128 if definition.queries == 1 else 512
+            if wgmma and definition.queries > 1:
+                variant = wgmma[str(definition.queries)]
+                artifact_batch = definition.queries
+                if artifact_batch == 16 and build.get("upstream_batch16_artifact") == "8":
+                    artifact_batch = 8
+                geometry["direct"] = upstream_contract.wgmma_geometry(artifact_batch)
+                if variant.get("geometry", geometry["direct"]) != geometry["direct"]:
+                    raise RuntimeError(f"Invalid WGMMA geometry: {case['name']}")
+                expected_columns = variant.get("combine_columns", 512)
+                expected_query_conversion = variant.get("query_conversion")
+            if (
+                fixture.get("changing_input_replay") != "passed"
+                or fixture.get("direct_combine_columns") != expected_columns
+                or fixture.get("direct_query_conversion") != expected_query_conversion
+                or fixture.get("path_geometry") != geometry
+                or "H200" not in payload.get("source", {}).get("device", "")
+            ):
+                raise RuntimeError(
+                    f"Missing upstream decode graph/device geometry: {case['name']}"
+                )
         if phase == "prefill":
             native_inner = fixture.get("inner_iter")
             if native_inner not in (33, 66) or fixture.get("path_geometry") != {
@@ -858,49 +1127,30 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             or fixture["projected_bytes"] >= fixture["memory_limit_bytes"]
         ):
             raise RuntimeError(f"Invalid GLM memory/cache policy {case['name']}")
-        orders = case["round_orders"]
-        if (
-            len(orders) != ROUNDS
-            or orders.count(["native", "direct"]) != ROUNDS // 2
-            or orders.count(["direct", "native"]) != ROUNDS // 2
-        ):
-            raise RuntimeError(f"Unbalanced GLM timing {case['name']}")
-        if (
-            case["execution"] != "cuda_graph"
-            or case["calls_per_sample"] != case["cycles_per_sample"] * banks
-            or case["calls_per_sample"] < 100
-        ):
-            raise RuntimeError(f"Invalid GLM sample normalization {case['name']}")
-        for mode, path in case["paths"].items():
-            if len(path["samples"]) != ROUNDS or any(
-                not math.isfinite(x) or x <= 0 for x in path["samples"]
-            ):
-                raise RuntimeError(f"Missing/invalid GLM rounds {case['name']}")
-            if path != _summary_function()(path["samples"]):
-                raise RuntimeError(
-                    f"Invalid GLM derived statistics {case['name']}/{mode}"
-                )
-        ratios = case["paired_ratios"]["direct_over_native"]["samples"]
-        if ratios != [
-            d / n
-            for d, n in zip(
-                case["paths"]["direct"]["samples"], case["paths"]["native"]["samples"]
-            )
-        ]:
-            raise RuntimeError(f"Invalid GLM paired ratios {case['name']}")
-        if case["paired_ratios"]["direct_over_native"] != _summary_function()(ratios):
-            raise RuntimeError(f"Invalid GLM derived paired statistics {case['name']}")
+        _validate_paired_timing(case, modes, banks)
     if phase == "decode" and (not prefix or "summary" in payload):
-        if payload.get("summary") != weighted_overhead(payload["cases"]):
+        if payload.get("summary") != weighted_overhead(
+            payload["cases"], baseline=baseline
+        ):
             raise RuntimeError("Invalid GLM derived decode summary")
+    if wgmma and not prefix and payload.get("upstream_decode_score") != upstream_decode_score(
+        payload["cases"], target_ratio=upstream_contract.WGMMA_TARGET_RATIO
+    ):
+        raise RuntimeError("Invalid WGMMA upstream decode score")
 
 
 def resume_prefix(
-    previous: dict, source: dict, phase: str = "all", *, packed_prefill_tile: int = 32
+    previous: dict,
+    source: dict,
+    phase: str = "all",
+    *,
+    packed_prefill_tile: int = 32,
+    suite: str = "glm-attention",
 ) -> list[dict]:
     """Reuse only validated cases from an identical fixture/toolchain snapshot."""
     if (
-        previous.get("phase", "all") != phase
+        previous.get("suite", "glm-attention") != suite
+        or previous.get("phase", "all") != phase
         or previous.get("source") != source
         or previous.get("seed") != SEED
         or previous.get("rounds") != ROUNDS
@@ -919,8 +1169,10 @@ def resume_prefix(
     return records
 
 
-def weighted_overhead(records: list[dict]) -> dict:
+def weighted_overhead(records: list[dict], *, baseline: str = "native") -> dict:
     """Batch-weighted mean of paired round overheads; other axes equal weight."""
+
+    ratio_name = f"direct_over_{baseline}"
 
     def score(rows):
         weight = sum(c["case"]["queries"] for c in rows)
@@ -929,11 +1181,7 @@ def weighted_overhead(records: list[dict]) -> dict:
                 100
                 * sum(
                     c["case"]["queries"]
-                    * (
-                        sum(c["paired_ratios"]["direct_over_native"]["samples"])
-                        / ROUNDS
-                        - 1
-                    )
+                    * (sum(c["paired_ratios"][ratio_name]["samples"]) / ROUNDS - 1)
                     for c in rows
                 )
                 / weight
@@ -952,14 +1200,267 @@ def weighted_overhead(records: list[dict]) -> dict:
         unacceptable_2x_cases=[
             c["name"]
             for c in rows
-            if sum(c["paired_ratios"]["direct_over_native"]["samples"]) / ROUNDS >= 2
+            if sum(c["paired_ratios"][ratio_name]["samples"]) / ROUNDS >= 2
         ],
     )
 
 
+def upstream_decode_score(
+    records: list[dict], *, target_ratio: float = 1 / 1.20
+) -> dict:
+    """Equal-case geometric mean of the 30 paired Direct/Native ratios."""
+    _, _, expected = experiment(UPSTREAM_SUITE, "decode")
+    if [row["name"] for row in records] != [case.name for case in expected]:
+        raise ValueError("Score requires all 24 upstream decode cases in order")
+    means = []
+    for row in records:
+        samples = row["paired_ratios"]["direct_over_upstream"]["samples"]
+        if (
+            not row.get("valid")
+            or len(samples) != ROUNDS
+            or not all(math.isfinite(value) and value > 0 for value in samples)
+        ):
+            raise ValueError(f"Invalid upstream decode samples: {row['name']}")
+        means.append(math.fsum(samples) / ROUNDS)
+    ratio = math.exp(math.fsum(map(math.log, means)) / len(means))
+    return {
+        "geometric_mean_direct_over_upstream": ratio,
+        "speedup": 1 / ratio,
+        "meets_target": ratio <= target_ratio,
+    }
+
+
+def decode_trace_stages(
+    events: list[dict], banks: int, *, fused_query: bool = False
+) -> dict:
+    """Attribute one complete replay by launch order, even for identical symbols."""
+    kernels = sorted(
+        (
+            event
+            for event in events
+            if event.get("cat") == "kernel" and event.get("ph") == "X"
+        ),
+        key=lambda event: event["ts"],
+    )
+    stage_names = DECODE_TRACE_STAGES[1:] if fused_query else DECODE_TRACE_STAGES
+    launches_per_bank = len(stage_names)
+    if (
+        banks < 1
+        or len(kernels) != launches_per_bank * banks
+        or len({(event["pid"], event["tid"]) for event in kernels}) != 1
+        or any(
+            not math.isfinite(event["dur"]) or event["dur"] <= 0 for event in kernels
+        )
+    ):
+        count = "two" if fused_query else "three"
+        raise RuntimeError(f"Expected {count} CUDA kernels per bank on one graph stream")
+    stages = {}
+    for position, name in enumerate(stage_names):
+        launches = kernels[position::launches_per_bank]
+        symbols = {event["name"] for event in launches}
+        if len(symbols) != 1:
+            raise RuntimeError(f"Inconsistent {name} kernel across graph banks")
+        stages[name] = {
+            "symbol": symbols.pop(),
+            "us_per_call": math.fsum(event["dur"] for event in launches) / banks,
+        }
+    return stages
+
+
+def profile_upstream_decode(
+    matrix: list[Case], base: Path, deadline: float, source: dict
+):
+    """Trace representative steady-state graph replays separately from timing."""
+    import torch
+    from sglang.benchmark.remnant.glm_upstream import WGMMA_CANDIDATE
+
+    selected = [case for case in matrix if case.tail == 0]
+    compiled = source["compiled_build"]["upstream_compile"]
+    wgmma = compiled["decode_wgmma"]
+    payload = dict(
+        protocol=UPSTREAM_PROFILE_PROTOCOL,
+        direct_candidate=WGMMA_CANDIDATE,
+        source=source,
+        status="running",
+        cases=[],
+        batch8_combine_sweep={},
+    )
+    record_path = base.with_suffix(".json")
+    trace_dir = base.with_suffix(".traces")
+    trace_dir.mkdir()
+
+    def checkpoint() -> None:
+        temporary = record_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n")
+        temporary.replace(record_path)
+
+    def collect(case: Case, variants: dict, suffix: str = "") -> dict:
+        fixture = Fixture(
+            case, deadline, gpu_family="H200", upstream=True, wgmma=variants
+        )
+        record = dict(name=case.name, fixture=fixture.identity, paths={})
+        if case.queries == 8:
+            record["paired"] = fixture.time()
+        else:
+            fixture.capture()
+            fixture.validate()
+        for mode in fixture.modes:
+            fixture.check()
+            graph = fixture.graphs[mode]
+            graph.replay()
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as profiler:
+                graph.replay()
+                torch.cuda.synchronize()
+            trace = trace_dir / f"{case.name}{suffix}-{mode}.json"
+            profiler.export_chrome_trace(str(trace))
+            fused_query = (
+                mode == "direct"
+                and fixture.identity.get("direct_query_conversion") == "fused"
+            )
+            stages = decode_trace_stages(
+                json.loads(trace.read_text())["traceEvents"],
+                fixture.banks,
+                fused_query=fused_query,
+            )
+            if fused_query and (
+                stages["partial_attention"]["symbol"] != "glm_packed_partial_wgmma_kernel"
+            ):
+                raise RuntimeError(f"{case.name}: trace did not run the WGMMA partial")
+            record["paths"][mode] = {
+                "trace": str(trace.relative_to(base.parent)),
+                "stages": stages,
+            }
+        del graph, fixture
+        gc.collect()
+        torch.cuda.empty_cache()
+        return record
+
+    try:
+        with torch.inference_mode():
+            for case in selected:
+                if case.queries != 8:
+                    payload["cases"].append(collect(case, wgmma))
+                    checkpoint()
+                    continue
+                primary = wgmma["8"]
+                alternatives = {}
+                payload["batch8_combine_sweep"][case.name] = alternatives
+                combines = compiled["batch8_combines"]
+                # Counterbalance order across cache policies. Pair each width
+                # with a freshly timed upstream control on the same fixture.
+                for width in sorted(combines, key=int, reverse=case.policy == "rotating"):
+                    if int(width) == primary["combine_columns"]:
+                        payload["cases"].append(collect(case, wgmma))
+                    else:
+                        variants = {
+                            **wgmma,
+                            "8": {
+                                **primary,
+                                "combine": combines[width],
+                                "combine_columns": int(width),
+                            },
+                        }
+                        alternatives[width] = collect(case, variants, f"-c{width}")
+                    checkpoint()
+        payload["status"] = "passed"
+        validate_decode_profile(payload)
+    except BaseException as error:
+        payload.update(status="incomplete", error=repr(error))
+        raise
+    finally:
+        checkpoint()
+
+
+def _validate_profile_trace(case: Case, result: dict, modes: tuple[str, str]) -> None:
+    if (
+        result["name"] != case.name
+        or set(result["paths"]) != set(modes)
+        or result["fixture"]["changing_input_replay"] != "passed"
+    ):
+        raise RuntimeError(f"Incomplete GLM profile case: {case.name}")
+    for mode, trace in result["paths"].items():
+        fused = mode == "direct" and case.queries > 1
+        expected = DECODE_TRACE_STAGES[1:] if fused else DECODE_TRACE_STAGES
+        stages = trace.get("stages", {})
+        if (
+            not trace.get("trace")
+            or set(stages) != set(expected)
+            or any(
+                not stage.get("symbol")
+                or not math.isfinite(stage["us_per_call"])
+                or stage["us_per_call"] <= 0
+                for stage in stages.values()
+            )
+            or (fused and stages["partial_attention"]["symbol"]
+                != "glm_packed_partial_wgmma_kernel")
+        ):
+            raise RuntimeError(f"Invalid GLM profile trace: {case.name}/{mode}")
+
+
+def validate_decode_profile(payload: dict) -> None:
+    """Require the 12 zero-tail profiles and all matched batch-8 pairs."""
+    _, modes, matrix = experiment(UPSTREAM_SUITE, "decode")
+    expected = [case for case in matrix if case.tail == 0]
+    rows = payload["cases"]
+    sweeps = payload["batch8_combine_sweep"]
+    contract = _cpu_contract("glm_upstream")
+    compiled = payload["source"]["compiled_build"]["upstream_compile"]
+    primary = str(compiled["decode_wgmma"]["8"]["combine_columns"])
+    widths = {str(width) for width in contract.WGMMA_BATCH8_COMBINE_WIDTHS}
+    if (
+        payload.get("protocol") != UPSTREAM_PROFILE_PROTOCOL
+        or payload.get("status") != "passed"
+        or payload.get("direct_candidate") != contract.WGMMA_CANDIDATE
+        or primary not in widths
+        or set(compiled["batch8_combines"]) != widths
+        or [row["name"] for row in rows] != [case.name for case in expected]
+        or set(sweeps) != {case.name for case in expected if case.queries == 8}
+    ):
+        raise RuntimeError("Incomplete GLM upstream decode profile")
+    for case, row in zip(expected, rows):
+        _validate_profile_trace(case, row, modes)
+        if case.queries != 8:
+            continue
+        alternatives = sweeps[case.name]
+        if set(alternatives) != widths - {primary}:
+            raise RuntimeError(f"Incomplete batch-8 combine sweep: {case.name}")
+        orders = _cpu_contract("timing").round_orders(
+            modes, ROUNDS, case_seed(case), balanced=True
+        )
+        for width, result in {primary: row, **alternatives}.items():
+            _validate_profile_trace(case, result, modes)
+            fixture = result["fixture"]
+            paired = result["paired"]
+            if (
+                fixture["direct_combine_columns"] != int(width)
+                or fixture["common_inputs_sha256"]
+                != row["fixture"]["common_inputs_sha256"]
+                or fixture["banks"] != row["fixture"]["banks"]
+                or set(paired["paths"]) != set(modes)
+                or paired["round_orders"] != orders
+            ):
+                raise RuntimeError(f"Invalid batch-8 combine comparison: {case.name}/{width}")
+            _validate_paired_timing(
+                {**paired, "name": f"{case.name}/{width}"}, modes, fixture["banks"]
+            )
+
+
 def main() -> None:
     args = parser().parse_args()
-    protocol = PROTOCOLS[args.phase]
+    protocol, modes, matrix = experiment(args.suite, args.phase)
+    upstream = args.suite == UPSTREAM_SUITE
+    baseline = modes[0]
+    wgmma = None
+    target_ratio = 1 / 1.20
+    if args.profile_decode and (not upstream or args.resume or args.check_imports):
+        raise ValueError("Decode profiling requires a fresh upstream decode run")
+    if args.modes is not None and args.modes != ",".join(modes):
+        raise ValueError(f"{args.suite} requires {modes}")
+    if upstream and args.packed_prefill_tile != 32:
+        raise ValueError("Upstream decode requires production Direct tile32")
     if args.phase == "prefill":
         if args.packed_prefill_tile != 64:
             raise ValueError("Full GLM prefill requires --packed-prefill-tile 64")
@@ -973,12 +1474,12 @@ def main() -> None:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
         from sglang.srt.remnant.glm import compile_kernels
 
+        if upstream:
+            from sglang.benchmark.remnant.glm_upstream import load_baseline
+
+            tilelang_sparse_fwd = load_baseline().tilelang_sparse_fwd
         assert callable(tilelang_sparse_fwd) and callable(compile_kernels)
-        print(
-            json.dumps(
-                dict(protocol=protocol, cases=len(cases(args.phase)), modes=MODES)
-            )
-        )
+        print(json.dumps(dict(protocol=protocol, cases=len(matrix), modes=modes)))
         return
     limit = 2400 if args.phase == "prefill" else 1200
     if not args.output or not 60 <= args.max_seconds <= limit:
@@ -995,6 +1496,7 @@ def main() -> None:
     payload = dict(
         protocol=protocol,
         phase=args.phase,
+        **({"suite": args.suite} if upstream else {}),
         packed_prefill_tile=args.packed_prefill_tile,
         status="running",
         seed=SEED,
@@ -1003,6 +1505,71 @@ def main() -> None:
         source=source_manifest(),
         cases=[],
     )
+    if upstream:
+        from sglang.srt.remnant.glm_config import (
+            H200_PACKED_DECODE_COMBINE,
+            H200_PACKED_DECODE_INNER,
+        )
+
+        build = payload["source"]["compiled_build"]
+        compile_manifest = build.get("glm_compile", {})
+        expected_inner = set(H200_PACKED_DECODE_INNER.values())
+        partials = [
+            variant
+            for variant in compile_manifest.get("tilelang", [])
+            if variant["packed"]
+            and variant["heads"] == 16
+            and variant.get("block_i", 32) == 32
+            and variant["inner"] in expected_inner
+        ]
+        if (
+            len(partials) != len(expected_inner)
+            or {v["inner"] for v in partials} != expected_inner
+        ):
+            raise RuntimeError("Missing CPU-prepared Packed decode partials")
+        cache_files = compile_manifest["cache_files"]
+        if any(
+            not v.get("libraries")
+            or any(cache_files.get(path) != h for path, h in v["libraries"].items())
+            for v in partials
+        ):
+            raise RuntimeError("Unbound CPU-prepared Packed decode partial libraries")
+        combines = compile_manifest.get("decode_combine", {})
+        if set(combines) != {f"{g}x{c}" for g, c in H200_PACKED_DECODE_COMBINE} or any(
+            not variant.get("cubin_path")
+            or not variant.get("cubin_sha256")
+            or compile_manifest["cache_files"].get(variant["cubin_path"])
+            != variant["cubin_sha256"]
+            or not variant.get("library_path")
+            or not variant.get("library_sha256")
+            or compile_manifest["cache_files"].get(variant["library_path"])
+            != variant["library_sha256"]
+            for variant in combines.values()
+        ):
+            raise RuntimeError("Missing CPU-prepared Packed decode combine cubins")
+        from sglang.benchmark.remnant.glm_upstream import (
+            WGMMA_CANDIDATE,
+            WGMMA_TARGET_RATIO,
+            identity,
+            load_baseline,
+            verify_compilation,
+        )
+
+        module = load_baseline()
+        compiled_upstream = build.get("upstream_compile", {})
+        verify_compilation(compiled_upstream, require_wgmma=True)
+        wgmma = upstream_wgmma_launches(build)
+        if args.profile_decode and build.get("upstream_batch16_artifact"):
+            raise ValueError("The selected batch-16 schedule requires paired timing")
+        payload["direct_candidate"] = WGMMA_CANDIDATE
+        target_ratio = WGMMA_TARGET_RATIO
+        payload["source"]["upstream"] = identity()
+        payload["source"]["upstream_module_path"] = module.__file__
+    if args.profile_decode:
+        profile_upstream_decode(
+            matrix, base, time.monotonic() + args.max_seconds, payload["source"]
+        )
+        return
     if args.resume:
         checkpoint = Path(args.resume)
         payload["cases"] = resume_prefix(
@@ -1010,6 +1577,7 @@ def main() -> None:
             payload["source"],
             args.phase,
             packed_prefill_tile=args.packed_prefill_tile,
+            suite=args.suite,
         )
         payload["resumed_from"] = dict(
             path=str(checkpoint),
@@ -1017,12 +1585,10 @@ def main() -> None:
             accepted_cases=len(payload["cases"]),
         )
         if args.phase == "decode":
-            payload["summary"] = weighted_overhead(payload["cases"])
+            payload["summary"] = weighted_overhead(payload["cases"], baseline=baseline)
     deadline = time.monotonic() + args.max_seconds
-    fixture = None
     try:
         with torch.inference_mode():
-            matrix = cases(args.phase)
             for case in matrix[len(payload["cases"]) :]:
                 record = dict(name=case.name, case=asdict(case), valid=False)
                 payload["cases"].append(record)
@@ -1032,24 +1598,31 @@ def main() -> None:
                     deadline,
                     packed_prefill_tile=args.packed_prefill_tile,
                     gpu_family="H200"
-                    if args.phase in ("prefill", "prefill-small")
+                    if upstream or args.phase in ("prefill", "prefill-small")
                     else "H100",
+                    upstream=upstream,
+                    wgmma=wgmma,
                 )
                 record["fixture"] = fixture.identity
                 record.update(fixture.time())
                 record["valid"] = True
                 if args.phase == "decode":
-                    payload["summary"] = weighted_overhead(payload["cases"])
+                    payload["summary"] = weighted_overhead(
+                        payload["cases"], baseline=baseline
+                    )
                 write_results(payload, base)
-                if args.phase == "prefill":
+                if upstream or args.phase == "prefill":
                     print(
                         f"{len(payload['cases'])}/{len(matrix)} {case.name}", flush=True
                     )
                 del fixture
-                fixture = None
                 gc.collect()
                 torch.cuda.empty_cache()
         payload["status"] = "passed"
+        if upstream:
+            payload["upstream_decode_score"] = upstream_decode_score(
+                payload["cases"], target_ratio=target_ratio
+            )
         validate_timing(payload)
     except BaseException as error:
         payload.update(status="incomplete", error=repr(error))

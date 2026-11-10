@@ -1082,6 +1082,63 @@ def sparse_mla_fwd_decode_combine(
     return main
 
 
+@tilelang.jit(
+    out_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def glm_packed_decode_combine(heads: int, dim: int, groups: int, columns: int):
+    """Reduce split LSE in parallel and distribute output columns across CTAs."""
+    assert dim % columns == 0
+    seq_len = T.dynamic("seq_len")
+    padded_groups = 1 << (groups - 1).bit_length()
+
+    @T.prim_func
+    def main(
+        partial_o: T.Tensor([1, seq_len, groups, heads, dim], T.bfloat16),
+        partial_lse: T.Tensor([1, seq_len, groups, heads], T.float32),
+        output: T.Tensor([1, seq_len, heads, dim], T.bfloat16),
+    ):
+        # Author: Winston Cai. Each CTA writes a disjoint column slice of one
+        # head. LSE is small enough to reread for each slice at low batch sizes.
+        with T.Kernel(seq_len * heads, dim // columns, threads=128) as (row, chunk):
+            query, head = row // heads, row % heads
+            lse = T.alloc_fragment([1, padded_groups], T.float32)
+            maximum = T.alloc_fragment([1], T.float32)
+            total = T.alloc_fragment([1], T.float32)
+            weights = T.alloc_shared([groups], T.float32)
+            accum = T.alloc_fragment([columns], T.float32)
+
+            for _, group in T.Parallel(1, padded_groups):
+                if group < groups:
+                    lse[0, group] = partial_lse[0, query, group, head]
+                else:
+                    lse[0, group] = -T.infinity(T.float32)
+            T.reduce_max(lse, maximum, dim=1)
+            for _, group in T.Parallel(1, padded_groups):
+                lse[0, group] = T.exp2(lse[0, group] - maximum[0])
+            T.reduce_sum(lse, total, dim=1)
+            for _, group in T.Parallel(1, padded_groups):
+                if group < groups:
+                    weights[group] = lse[0, group]
+            T.sync_threads()
+
+            T.fill(accum, 0)
+            for group in T.serial(groups):
+                for column in T.Parallel(columns):
+                    accum[column] += weights[group] * partial_o[
+                        0, query, group, head, chunk * columns + column
+                    ].astype(T.float32)
+            for column in T.Parallel(columns):
+                output[0, query, head, chunk * columns + column] = (
+                    accum[column] / total[0]
+                )
+
+    return main.with_attr("global_symbol", "glm_packed_decode_combine")
+
+
 @tilelang.jit(out_idx=[-2, -1], pass_configs=pass_configs)
 def sparse_mla_fwd_decode_partial_fp8(
     num_heads: int,
@@ -1456,6 +1513,206 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main.with_attr("global_symbol", "glm_packed_partial") if packed else main
 
 
+def _glm_wgmma_query_source() -> str:
+    return (
+        Path(__file__).resolve().parents[3]
+        / "jit/include/sgl_kernel/glm_wgmma_query.cuh"
+    ).read_text()
+
+
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        **pass_configs,
+        # WGMMA still reads Q and KV after TileLang's synchronous liveness
+        # analysis sees their final access. Keep the operands disjoint.
+        tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
+    },
+)
+def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
+    """Hopper experiment with one warpgroup and 64 selected rows per tile."""
+    heads, dim, topk, rows = 16, 512, 2112, 64
+    tile_count = topk // rows
+    groups = (tile_count + inner_iter - 1) // inner_iter
+    log2_scale = sm_scale * 1.44269504
+    seq_len = T.symbolic("seq_len")
+    num_pages = T.symbolic("num_pages")
+    fp8 = "float8_e4m3fn"
+    include = Path(__file__).resolve().parents[3] / "jit/include/sgl_kernel"
+    source = "\n".join(
+        (include / header).read_text()
+        for header in ("glm_packed_decode.cuh", "glm_wgmma_pv.cuh")
+    ) + "\n" + _glm_wgmma_query_source()
+    # Match the WGMMA m64n16 reduction layout. Passing these fragments to
+    # CUDA exposes their four per-lane register slots, so pin the mapping.
+    head_state_layout = T.Fragment(
+        [heads],
+        forward_thread_fn=lambda head, replica: (
+            replica % 4 * 32 + replica // 4 * 4 + head % 8 // 2
+        ),
+        forward_index_fn=lambda head: head // 8 * 2 + head % 2,
+        replicate=32,
+    )
+
+    @T.prim_func
+    def main(
+        q_bf16: T.Tensor([1, seq_len, heads, dim], T.bfloat16),
+        kv_fp8: T.Tensor([1, num_pages, 1, 256], fp8),
+        bitmap: T.Tensor([num_pages, 8], T.uint64),
+        indices: T.Tensor([1, seq_len, 1, topk], T.int32),
+        partial_o: T.Tensor([1, seq_len, groups, heads, dim], T.bfloat16),
+        partial_lse: T.Tensor([1, seq_len, groups, heads], T.float32),
+    ):
+        with T.Kernel(seq_len, groups, threads=128) as (query, group):
+            T.import_source(source)
+            q = T.alloc_shared([heads, dim], fp8)
+            kv = T.alloc_shared([rows, dim], fp8)
+            p = T.alloc_shared([heads, rows], fp8)
+            scratch = T.alloc_shared([32, 272], T.uint8)
+            scores = T.alloc_fragment([rows, heads], T.float32)
+            numerator = T.alloc_fragment([dim, heads], T.float32)
+            maximum = T.alloc_fragment([heads], T.float32)
+            previous = T.alloc_fragment([heads], T.float32)
+            alpha = T.alloc_fragment([heads], T.float32)
+            tile_sum = T.alloc_fragment([heads], T.float32)
+            denominator = T.alloc_fragment([heads], T.float32)
+            valid = T.alloc_fragment([rows], T.bool)
+
+            T.annotate_layout(
+                {
+                    q: tilelang.layout.make_full_bank_swizzled_layout(q),
+                    kv: tilelang.layout.make_full_bank_swizzled_layout(kv),
+                    p: tilelang.layout.make_half_bank_swizzled_layout(p),
+                    maximum: head_state_layout,
+                    alpha: head_state_layout,
+                    # The register source maps hardware rows r and r+8 to
+                    # adjacent logical features 2r and 2r+1 within each warp.
+                    numerator: T.Fragment(
+                        [dim, heads],
+                        forward_thread_fn=lambda column, head: (
+                            (column % 64 // 16) * 32
+                            + (column % 16 // 2) * 4
+                            + head % 8 // 2
+                        ),
+                        forward_index_fn=lambda column, head: (
+                            (column // 64) * 8
+                            + (head // 8) * 4
+                            + (column % 2) * 2
+                            + head % 2
+                        ),
+                    ),
+                }
+            )
+            T.evaluate(
+                T.call_extern(
+                    "int32",
+                    "remnant_glm_stage_wgmma_query",
+                    T.access_ptr(q_bf16[0, query, 0, 0], "r", extent=heads * dim),
+                    T.access_ptr(q, "w"),
+                )
+            )
+            T.fill(numerator, 0)
+            T.fill(maximum, -(2**30))
+            T.fill(denominator, 0)
+
+            # The last split can be short. All lanes take the same loop bound.
+            for step in T.serial(T.min(inner_iter, tile_count - group * inner_iter)):
+                start = (group * inner_iter + step) * rows
+                for row in T.Parallel(rows):
+                    index = indices[0, query, 0, start + row]
+                    valid[row] = (index >= 0) & (index < num_pages)
+                # TileLang's SW128 layout stores four consecutive K panels.
+                # Each panel has the 128-byte row swizzle used by the loader.
+                T.sync_threads()
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_expand_wide_tile<64, true>",
+                        T.access_ptr(
+                            kv_fp8, "r", extent=T.Cast("int64", num_pages) * 256
+                        ),
+                        T.access_ptr(
+                            bitmap, "r", extent=T.Cast("int64", num_pages) * 8
+                        ),
+                        T.access_ptr(indices, "r"),
+                        T.access_ptr(scratch, "rw"),
+                        T.access_ptr(kv[0, 0], "w", extent=rows * 128),
+                        T.access_ptr(kv[0, 128], "w", extent=rows * 128),
+                        T.access_ptr(kv[0, 256], "w", extent=rows * 128),
+                        T.access_ptr(kv[0, 384], "w", extent=rows * 128),
+                        T.Cast("int64", num_pages),
+                        T.Cast("int64", query) * topk + start,
+                    )
+                )
+                T.fence_proxy_async()
+                T.sync_threads()
+                # K @ Q^T puts 64 selected rows on the warpgroup M axis.
+                T.wgmma_gemm(kv, q, scores, transpose_B=True, clear_accum=True)
+                T.warpgroup_wait(0)
+                T.warpgroup_fence_operand(scores, num_regs=rows * heads // 128)
+
+                for row, head in T.Parallel(rows, heads):
+                    scores[row, head] = T.if_then_else(
+                        valid[row], scores[row, head], -T.infinity(T.float32)
+                    )
+                T.copy(maximum, previous)
+                # Each lane owns four heads in the m64n16 accumulator layout.
+                # Batch their reductions to share the CTA barriers.
+                T.reduce_max(scores, maximum, dim=0, clear=False, batch=4)
+                for head in T.Parallel(heads):
+                    alpha[head] = T.exp2((previous[head] - maximum[head]) * log2_scale)
+                for row, head in T.Parallel(rows, heads):
+                    scores[row, head] = T.exp2(
+                        scores[row, head] * log2_scale - maximum[head] * log2_scale
+                    )
+                    p[head, row] = scores[row, head] * 448.0
+                T.reduce_sum(scores, tile_sum, dim=0, batch=4)
+                for head in T.Parallel(heads):
+                    denominator[head] = denominator[head] * alpha[head] + tile_sum[head]
+                for column, head in T.Parallel(dim, heads):
+                    numerator[column, head] *= alpha[head]
+
+                # Consume KV directly from the same tile. The helper waits
+                # for its register-fed PV batches before returning.
+                T.fence_proxy_async()
+                T.sync_threads()
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_wgmma_pv_registers",
+                        T.access_ptr(kv, "r"),
+                        T.access_ptr(p, "r"),
+                        T.access_ptr(numerator[0, 0], "rw", extent=dim * heads // 128),
+                    )
+                )
+
+            for head in T.Parallel(heads):
+                alpha[head] = T.if_then_else(
+                    denominator[head] > 0, 1.0 / (denominator[head] * 448.0), 0.0
+                )
+                # Reuse the per-head maximum fragment for final LSE.
+                maximum[head] = T.if_then_else(
+                    denominator[head] > 0,
+                    T.log2(denominator[head]) + maximum[head] * log2_scale,
+                    -(2**30),
+                )
+            T.evaluate(
+                T.call_extern(
+                    "int32",
+                    "remnant_glm_write_wgmma_output",
+                    T.access_ptr(numerator[0, 0], "r", extent=dim * heads // 128),
+                    T.access_ptr(alpha[0], "r", extent=4),
+                    T.access_ptr(maximum[0], "r", extent=4),
+                    T.access_ptr(
+                        partial_o[0, query, group, 0, 0], "w", extent=heads * dim
+                    ),
+                    T.access_ptr(partial_lse[0, query, group, 0], "w", extent=heads),
+                )
+            )
+
+    return main.with_attr("global_symbol", "glm_packed_partial_wgmma")
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1465,6 +1722,8 @@ def tilelang_sparse_fwd(
     *,
     packed_bitmap: torch.Tensor | None = None,
     packed_prefill_tile: int = 32,
+    packed_decode_combine_columns: int = 0,
+    packed_decode_inner: int = 0,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1474,6 +1733,19 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if (packed_decode_inner or packed_decode_combine_columns) and (
+        not packed_decode_inner
+        or packed_decode_combine_columns not in (128, 512)
+        or packed_bitmap is None
+        or not is_fp8_kv
+        or _is_hip
+        or num_heads != 16
+        or d_v != 512
+        or tail_dim != 0
+        or topk != 2112
+        or packed_prefill_tile != 32
+    ):
+        raise ValueError("Packed decode combine requires Hopper FP8 heads16 tile32")
     if packed_prefill_tile != 32 and (
         packed_prefill_tile not in (64, 128)
         or packed_bitmap is None
@@ -1503,6 +1775,19 @@ def tilelang_sparse_fwd(
                 (ni + 1) // 2 if packed_prefill_tile != 32
                 else _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             )
+            if packed_decode_inner or packed_decode_combine_columns:
+                from sglang.srt.remnant.glm_config import (
+                    H200_PACKED_DECODE_COMBINE,
+                    H200_PACKED_DECODE_INNER,
+                )
+
+                if (
+                    packed_decode_inner != H200_PACKED_DECODE_INNER.get(q.shape[0])
+                    or (ni // packed_decode_inner, packed_decode_combine_columns)
+                    not in H200_PACKED_DECODE_COMBINE
+                ):
+                    raise ValueError("Unprepared Packed decode geometry")
+                inner_iter = packed_decode_inner
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
@@ -1546,14 +1831,19 @@ def tilelang_sparse_fwd(
                 q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
             )
         n_groups = (ni + inner_iter - 1) // inner_iter
-        kernel_combine = sparse_mla_fwd_decode_combine(
-            num_heads,
-            d_v,
-            n_groups * block_I,
-            head_per_block=4,
-            block_I=block_I,
-            threads=threads,
-        )
+        if packed_decode_combine_columns:
+            kernel_combine = glm_packed_decode_combine(
+                num_heads, d_v, n_groups, packed_decode_combine_columns
+            )
+        else:
+            kernel_combine = sparse_mla_fwd_decode_combine(
+                num_heads,
+                d_v,
+                n_groups * block_I,
+                head_per_block=4,
+                block_I=block_I,
+                threads=threads,
+            )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
         kernel_factory = (

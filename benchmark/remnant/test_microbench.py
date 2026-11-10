@@ -1433,7 +1433,8 @@ def test_glm_cli_rejects_adapter_and_deepseek_options():
     args = glm.parser().parse_args(
         ["--model-family", "glm53", "--suite", "glm-attention"]
     )
-    assert args.modes == "native,direct"
+    assert args.modes is None
+    assert glm.experiment(args.suite, args.phase)[1] == ("native", "direct")
 
 
 def test_glm_entrypoint_dispatches_before_deepseek_imports():
@@ -2033,12 +2034,127 @@ def test_glm_cpu_preparation_requires_explicit_cache_paths(monkeypatch):
         artifacts.precompile_sm90()
 
 
+def test_v41_native_reference_preserves_tail_and_rounds_fp8_ties():
+    import torch
+
+    reference = load_module(
+        "_v41_native_quantization",
+        ROOT / "python/sglang/benchmark/remnant/quantization.py",
+    ).v41_native_fp8_reference
+    values = torch.zeros((2, 512), dtype=torch.bfloat16)
+    values[0, :3] = torch.tensor([1.0, 1.0625, 1.1875])
+    values[:, 448:] = torch.arange(64).bfloat16() / 7
+    decoded = reference(values)
+    assert decoded.dtype == torch.bfloat16
+    assert decoded[0, :3].tolist() == [1.0, 1.0, 1.25]
+    assert torch.equal(decoded[1, :448], values[1, :448])
+    assert torch.equal(decoded[:, 448:], values[:, 448:])
+    for invalid in (values.float(), values[:, :448], values.reshape(1, 2, 512)):
+        with pytest.raises(ValueError, match="Native reference requires"):
+            reference(invalid)
+
+
+def test_v41_three_path_ratios():
+    ratios = cases.paired_ratios(
+        {"native": [1.0, 2.0], "dense_fp4": [2.0, 4.0], "kernel": [3.0, 6.0]}
+    )
+    assert ratios["kernel_over_native"]["mean"] == 3.0
+    assert ratios["dense_fp4_over_native"]["mean"] == 2.0
+    assert ratios["kernel_over_dense_fp4"]["mean"] == 1.5
+
+
+def test_v41_native_call_does_not_reuse_warmup_metadata():
+    """Exercise the actual callback without CUDA; fresh schedules must reach the API."""
+    import ast
+    from types import SimpleNamespace
+
+    tree = ast.parse((ROOT / "benchmark/remnant/microbench.py").read_text())
+    factory = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "fp4_decode_operations"
+    )
+    callback = next(
+        n
+        for n in ast.walk(factory)
+        if isinstance(n, ast.FunctionDef) and n.name == "call"
+    )
+    received = []
+
+    def decode(*args, **kwargs):
+        received.append(args[5])
+        return "output", "lse"
+
+    namespace = {
+        name: object()
+        for name in (
+            "q",
+            "swa_view",
+            "swa_indices",
+            "swa_lengths",
+            "cache_view",
+            "physical",
+            "lengths",
+            "sink",
+        )
+    }
+    namespace.update(
+        packed=False,
+        mode="native",
+        upstream_flash_mla=SimpleNamespace(
+            get_mla_metadata=lambda: (object(), None), flash_mla_with_kvcache=decode
+        ),
+    )
+    exec(
+        compile(ast.Module(body=[callback], type_ignores=[]), "microbench.py", "exec"),
+        namespace,
+    )
+    assert namespace["call"]() == namespace["call"]() == ("output", "lse")
+    assert len(received) == 2 and received[0] is not received[1]
+
+
+@pytest.mark.parametrize("global_page_size", [128, 256])
+def test_gpu_v41_upstream_native_comparison(global_page_size, benchmark):
+    """Both production page sizes; original control, graphs and a nondefault stream."""
+    import torch
+
+    case = next(
+        c
+        for c in cases.fp4_decode_cases()
+        if c.batch == 8 and c.global_page_size == global_page_size
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        operations, identity = benchmark.fp4_decode_operations(case, cases.SEED)
+        assert tuple(op.key for op in operations) == cases.FP4_DECODE_MODES
+        assert (
+            identity["native_control"]["source_commit"] == cases.UPSTREAM_FLASHMLA_SHA
+        )
+        for operation in operations:
+            operation.validate()
+            graph, output = benchmark.capture(operation, 3)
+            # Selection order changes in place, while the selected set and
+            # lengths stay fixed. Upstream permits reusing this same schedule.
+            indices = operation.owned[2]
+            indices.copy_(indices.flip(-1))
+            graph.replay()
+            operation.validate_output(output)
+    torch.cuda.current_stream().wait_stream(stream)
+
+
 def test_v41_fp4_matrix_and_timing_gate():
     """Production V4.1 geometry only; stale or incomplete timing cannot qualify."""
     import copy
     from dataclasses import asdict
 
     args = cases.parser().parse_args(["--suite", "v41-fp4-decode"])
+    assert cases.FP4_DECODE_MODES == ("native", "dense_fp4", "kernel")
+    for modes in ("native,kernel", "dense_fp4", "native,triton,kernel"):
+        args.modes = modes
+        with pytest.raises(ValueError, match="V4.1 compares"):
+            cases.selected_cases(args)
+    args.modes = ",".join(cases.FP4_DECODE_MODES)
     for flag, value in (
         ("--heads", "128"),
         ("--batches", "1"),
@@ -2059,7 +2175,7 @@ def test_v41_fp4_matrix_and_timing_gate():
     }
     payload = {
         "status": "passed",
-        "protocol": "remnant-v41-fp4-decode-v3",
+        "protocol": "remnant-v41-fp4-decode-v5",
         "config": vars(args),
         "cases": [],
     }
@@ -2071,13 +2187,28 @@ def test_v41_fp4_matrix_and_timing_gate():
                 "valid": True,
                 "execution": "cuda_graph",
                 "repeats": 100,
+                "baseline": "upstream H100 auto FP8/BF16; synchronization corrected",
+                "native_scheduler": "first use per ratio; regenerated inside graph",
+                "native_control": {
+                    "source_commit": cases.UPSTREAM_FLASHMLA_SHA,
+                    "source_sha256": "b" * 64,
+                    "binary_sha256": "c" * 64,
+                    "python_sha256": "d" * 64,
+                    "architectures": ["sm_90a"],
+                },
                 "common_inputs_sha256": "a" * 64,
                 "paths": {
-                    mode: {"samples": [1.0] * 30} for mode in ("native", "kernel")
+                    mode: {"samples": [1.0] * 30}
+                    for mode in ("native", "dense_fp4", "kernel")
                 },
                 "path_layouts": {
                     "native": {
-                        "implementation": "Native FP4 Direct",
+                        "implementation": "Upstream H100 auto FP8/BF16",
+                        "record_bytes": 584,
+                        "packed_keep_count": 512,
+                    },
+                    "dense_fp4": {
+                        "implementation": "Custom dense FP4 Direct",
                         "record_bytes": 288,
                         "packed_keep_count": 512,
                     },
@@ -2100,6 +2231,11 @@ def test_v41_fp4_matrix_and_timing_gate():
         "window-as-page",
         "nonproduction-heads",
         "old-protocol",
+        "missing-diagnostic",
+        "custom-baseline",
+        "fork-control",
+        "missing-control",
+        "warmed-scheduler",
     ):
         broken = copy.deepcopy(payload)
         if fault == "missing-case":
@@ -2109,7 +2245,17 @@ def test_v41_fp4_matrix_and_timing_gate():
         elif fault == "bad-sample":
             broken["cases"][0]["paths"]["native"]["samples"][0] = float("nan")
         elif fault == "wrong-layout":
-            broken["cases"][0]["path_layouts"]["native"]["record_bytes"] = 584
+            broken["cases"][0]["path_layouts"]["native"]["record_bytes"] = 288
+        elif fault == "missing-diagnostic":
+            broken["cases"][0]["paths"].pop("dense_fp4")
+        elif fault == "custom-baseline":
+            broken["cases"][0]["baseline"] = "unpruned dense Native FP4"
+        elif fault == "fork-control":
+            broken["cases"][0]["native_control"]["source_commit"] = "3eb8594"
+        elif fault == "missing-control":
+            broken["cases"][0].pop("native_control")
+        elif fault == "warmed-scheduler":
+            broken["cases"][0]["native_scheduler"] = "cached before capture"
         elif fault == "wrong-geometry":
             broken["cases"][0]["case"]["swa_page_size"] = 64 + 128
         elif fault == "nonproduction-swa":
@@ -2119,7 +2265,7 @@ def test_v41_fp4_matrix_and_timing_gate():
         elif fault == "nonproduction-heads":
             broken["cases"][0]["case"]["heads"] = 128
         else:
-            broken["protocol"] = "remnant-v41-fp4-decode-v2"
+            broken["protocol"] = "remnant-v41-fp4-decode-v3"
         with pytest.raises((RuntimeError, ValueError)):
             cases.validate_timing(broken, suite="v41-fp4-decode")
 
@@ -2146,3 +2292,488 @@ def test_shared_statistics_preserve_exact_summary_and_paired_rounds():
     ):
         with pytest.raises(ValueError):
             shared_timing.paired_ratio_summary(left, right)
+
+
+upstream = load_module(
+    "_glm_upstream_contract", ROOT / "python/sglang/benchmark/remnant/glm_upstream.py"
+)
+
+
+def test_glm_upstream_decode_matrix_and_labels():
+    protocol, modes, matrix = glm.experiment(glm.UPSTREAM_SUITE, "decode")
+    assert protocol == "remnant-glm-upstream-decode-v1"
+    assert modes == ("upstream", "direct")
+    assert len(matrix) == len({c.name for c in matrix}) == 24
+    assert {c.heads for c in matrix} == {16}
+    assert {c.queries for c in matrix} == {1, 8, 16, 24, 32, 64}
+    assert {c.tail for c in matrix} == {0, 3}
+    assert {c.policy for c in matrix} == {"warm", "rotating"}
+    assert matrix == [c for c in glm.cases("decode") if c.heads == 16]
+    for phase in ("all", "prefill", "prefill-small"):
+        with pytest.raises(ValueError, match="phase decode"):
+            glm.experiment(glm.UPSTREAM_SUITE, phase)
+    fixture = glm.Fixture.__new__(glm.Fixture)
+    assert fixture.modes == ("native", "direct")
+    fixture.upstream = True
+    assert fixture.modes == modes
+
+
+def test_glm_upstream_source_and_helper_provenance(tmp_path):
+    import hashlib
+    import json
+    import subprocess
+
+    directory = tmp_path / "upstream"
+    package = tmp_path / "package"
+    directory.mkdir()
+    for name in upstream.FILES:
+        path = (
+            directory / "tilelang_kernel.py"
+            if name == upstream.MODULE
+            else package / name
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name == upstream.MODULE:
+            prepared = os.environ.get(upstream.SOURCE_ENV)
+            data = (
+                (Path(prepared) / "tilelang_kernel.py").read_bytes()
+                if prepared
+                else subprocess.check_output(
+                    [
+                        "git",
+                        "-C",
+                        str(ROOT),
+                        "show",
+                        f"{upstream.COMMIT}:python/sglang/{name}",
+                    ],
+                    timeout=30,
+                )
+            )
+        else:
+            data = (ROOT / "python/sglang" / name).read_bytes()
+        path.write_bytes(data)
+        assert hashlib.sha256(data).hexdigest() == upstream.FILES[name]
+    (directory / "source.json").write_text(json.dumps(upstream.identity()))
+    assert upstream.verify_source(directory, package) == upstream.identity()
+    for name in upstream.FILES:
+        path = (
+            directory / "tilelang_kernel.py"
+            if name == upstream.MODULE
+            else package / name
+        )
+        original = path.read_bytes()
+        path.write_bytes(original + b"\n# changed\n")
+        with pytest.raises(RuntimeError, match="changed"):
+            upstream.verify_source(directory, package)
+        path.write_bytes(original)
+    (directory / "source.json").write_text(json.dumps({"commit": "wrong"}))
+    with pytest.raises(RuntimeError, match="receipt"):
+        upstream.verify_source(directory, package)
+
+
+def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
+    import copy
+    import hashlib
+
+    cubin = tmp_path / "kernel.cubin"
+    cubin.write_bytes(b"independent CPU fixture")
+    digest = hashlib.sha256(cubin.read_bytes()).hexdigest()
+    compiled = dict(
+        source=upstream.identity(),
+        cache_files={str(cubin): digest},
+        tilelang=[
+            dict(
+                heads=16,
+                inner=i,
+                packed=False,
+                cubin_path=str(cubin),
+                cubin_sha256=digest,
+            )
+            for i in (1, 2)
+        ],
+    )
+    upstream.verify_compilation(compiled)
+    with pytest.raises(RuntimeError, match="requires CPU-prepared WGMMA"):
+        upstream.verify_compilation(compiled, require_wgmma=True)
+    wgmma = dict(
+        cubin_path=str(cubin), cubin_sha256=digest,
+        library_path=str(cubin), library_sha256=digest,
+    )
+    candidate = copy.deepcopy(compiled)
+    candidate["decode_wgmma"] = {
+        str(batch): dict(partial=dict(wgmma), combine=dict(wgmma), qgmma_sites=32)
+        for batch in upstream.WGMMA_INNER
+    }
+    upstream.verify_compilation(candidate)
+    for change in ("geometry", "instructions", "library"):
+        broken = copy.deepcopy(candidate)
+        variants = broken["decode_wgmma"]
+        if change == "geometry":
+            variants.pop("64")
+        elif change == "instructions":
+            variants["64"]["qgmma_sites"] = 16
+        else:
+            variants["64"]["partial"]["library_sha256"] = "wrong"
+        with pytest.raises(RuntimeError, match="WGMMA"):
+            upstream.verify_compilation(broken)
+    for batch, record in candidate["decode_wgmma"].items():
+        record.update(
+            geometry=upstream.wgmma_geometry(int(batch)),
+            combine_columns=upstream.wgmma_combine_columns(int(batch)),
+            query_conversion="fused",
+        )
+        record["partial"].update(
+            symbol="glm_packed_partial_wgmma_kernel",
+            parameters=["q_bf16"],
+            dynamic_shared=65536,
+        )
+    candidate["query_conversion_probe"] = dict(wgmma)
+    candidate["batch8_combines"] = {
+        str(width): dict(wgmma) for width in upstream.WGMMA_BATCH8_COMBINE_WIDTHS
+    }
+    upstream.verify_compilation(candidate, require_wgmma=True)
+    alternate = next(
+        str(width)
+        for width in upstream.WGMMA_BATCH8_COMBINE_WIDTHS
+        if width != upstream.wgmma_combine_columns(8)
+    )
+    broken = copy.deepcopy(candidate)
+    broken["batch8_combines"].pop(alternate)
+    with pytest.raises(RuntimeError, match="Incomplete batch-8"):
+        upstream.verify_compilation(broken, require_wgmma=True)
+    broken = copy.deepcopy(candidate)
+    broken["batch8_combines"][alternate]["library_sha256"] = "wrong"
+    with pytest.raises(RuntimeError, match="Unbound batch-8"):
+        upstream.verify_compilation(broken, require_wgmma=True)
+    for change in ("missing", "source", "binary", "missing_binding"):
+        candidate = copy.deepcopy(compiled)
+        if change == "missing":
+            candidate["tilelang"].pop()
+        elif change == "source":
+            candidate["source"]["commit"] = "wrong"
+        elif change == "missing_binding":
+            candidate["tilelang"][0].pop("cubin_path")
+            candidate["tilelang"][0].pop("cubin_sha256")
+        else:
+            candidate["tilelang"][0]["cubin_sha256"] = "wrong"
+        with pytest.raises(RuntimeError):
+            upstream.verify_compilation(candidate)
+    cubin.write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="changed"):
+        upstream.verify_compilation(compiled)
+
+
+def test_glm_wgmma_shared_ranges_reject_async_operand_aliases():
+    offsets = dict(q=0, kv=8192, scratch=40960, p=49664)
+
+    def generated() -> str:
+        return "\n".join(
+            f"void* {name} = ((void*)((char*)buf_dyn_shmem + {offset}));"
+            for name, offset in offsets.items()
+        )
+
+    assert upstream.wgmma_shared_ranges(generated())["kv"] == (8192, 40960)
+    offsets["v_t"] = 50688
+    with pytest.raises(RuntimeError, match="Cannot verify WGMMA shared-memory offsets"):
+        upstream.wgmma_shared_ranges(generated())
+    del offsets["v_t"]
+    offsets["p"] = 0
+    with pytest.raises(RuntimeError, match="Aliased WGMMA"):
+        upstream.wgmma_shared_ranges(generated())
+
+
+def test_glm_decode_cache_binding_uses_exact_wrapper_entry(tmp_path, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+
+    artifacts = load_module(
+        "_glm_decode_artifact_contract",
+        ROOT / "python/sglang/benchmark/remnant/glm_artifacts.py",
+    )
+    device, host = "device program", "selected host wrapper"
+    entry, stale = tmp_path / "selected", tmp_path / "stale"
+    cubin = tmp_path / "device.cubin"
+    cache = {
+        str(entry / "device_kernel.cu"): hashlib.sha256(device.encode()).hexdigest(),
+        str(stale / "device_kernel.cu"): hashlib.sha256(device.encode()).hexdigest(),
+        str(entry / "host_kernel.cu"): hashlib.sha256(host.encode()).hexdigest(),
+        str(entry / "executable.so"): "selected binary",
+        str(stale / "executable.so"): "old binary",
+        str(cubin): "cubin",
+    }
+    monkeypatch.setattr(artifacts, "_verified_sm90_cubin", lambda *_: cubin)
+    kernel = SimpleNamespace(
+        _tilelang_cache_path=entry,
+        get_kernel_source=lambda: device,
+        adapter=SimpleNamespace(get_host_source=lambda: host),
+    )
+    assert artifacts.bind_decode_library(kernel, cache)["library_path"] == str(
+        entry / "executable.so"
+    )
+    kernel._tilelang_cache_path = stale
+    with pytest.raises(RuntimeError, match="does not match"):
+        artifacts.bind_decode_library(kernel, cache)
+
+
+def _glm_upstream_payload():
+    payload = _glm_complete_timing_payload()
+    payload.update(
+        suite=glm.UPSTREAM_SUITE,
+        protocol=glm.UPSTREAM_PROTOCOL,
+        phase="decode",
+        source={"upstream": upstream.identity(), "device": "NVIDIA H200"},
+        cases=[
+            c
+            for c in payload["cases"]
+            if c["case"]["phase"] == "decode" and c["case"]["heads"] == 16
+        ],
+    )
+    for case in payload["cases"]:
+        inner = 1 if case["case"]["queries"] == 1 else 2
+        case["fixture"].update(
+            changing_input_replay="passed",
+            path_geometry={
+                mode: dict(tile_rows=32, inner_iter=inner, partial_groups=66 // inner)
+                for mode in ("upstream", "direct")
+            },
+        )
+        case["paths"]["upstream"] = case["paths"].pop("native")
+        case["paired_ratios"]["direct_over_upstream"] = case["paired_ratios"].pop(
+            "direct_over_native"
+        )
+        case["round_orders"] = [["upstream", "direct"], ["direct", "upstream"]] * 15
+    payload["summary"] = glm.weighted_overhead(payload["cases"], baseline="upstream")
+    return payload
+
+
+def test_glm_upstream_result_identity_and_csv(tmp_path):
+    import copy
+
+    payload = _glm_upstream_payload()
+    glm.validate_timing(payload)
+    glm.write_results(payload, tmp_path / "timing")
+    csv = (tmp_path / "timing.csv").read_text()
+    assert "direct_over_upstream" in csv and "direct_over_native" not in csv
+    for change in ("scope", "source", "label", "rounds", "ratio"):
+        bad = copy.deepcopy(payload)
+        if change == "scope":
+            bad["cases"].pop()
+        elif change == "source":
+            bad["source"]["upstream"]["commit"] = "wrong"
+        elif change == "label":
+            bad["cases"][0]["paths"]["native"] = bad["cases"][0]["paths"].pop(
+                "upstream"
+            )
+        elif change == "rounds":
+            bad["cases"][0]["round_orders"][0] = ["direct", "upstream"]
+        else:
+            bad["cases"][0]["paired_ratios"]["direct_over_upstream"]["samples"][0] = 2
+        with pytest.raises(RuntimeError):
+            glm.validate_timing(bad)
+    with pytest.raises(RuntimeError, match="identity"):
+        glm.resume_prefix(payload, payload["source"], "decode")
+
+
+def test_glm_upstream_goal_scores_all_cases_equally():
+    _, _, cases = glm.experiment(glm.UPSTREAM_SUITE, "decode")
+    records = [
+        {
+            "name": case.name,
+            "valid": True,
+            "paired_ratios": {
+                "direct_over_upstream": {
+                    "samples": [0.4, 0.8] * 15 if i % 2 else [0.96] * 30
+                }
+            },
+        }
+        for i, case in enumerate(cases)
+    ]
+    score = glm.upstream_decode_score(records)
+    assert score["geometric_mean_direct_over_upstream"] == pytest.approx(0.6 * 1.6**0.5)
+    assert score["speedup"] == pytest.approx(1 / (0.6 * 1.6**0.5))
+    assert score["meets_target"]
+    assert not glm.upstream_decode_score(records, target_ratio=0.5)["meets_target"]
+    with pytest.raises(ValueError, match="all 24"):
+        glm.upstream_decode_score(records[:-1])
+    records[-1]["paired_ratios"]["direct_over_upstream"]["samples"][-1] = float("nan")
+    with pytest.raises(ValueError, match="Invalid"):
+        glm.upstream_decode_score(records)
+
+
+def test_glm_decode_trace_distinguishes_identical_native_symbols():
+    events = [
+        dict(cat="kernel", ph="X", pid=0, tid=1, ts=i * 100, name=symbol, dur=duration)
+        for i, (symbol, duration) in enumerate(
+            [("copy", 2), ("main_kernel", 8), ("main_kernel", 5)] * 2
+        )
+    ]
+    stages = glm.decode_trace_stages(events[::-1], 2)
+    assert [stage["us_per_call"] for stage in stages.values()] == [2, 8, 5]
+    assert stages["partial_attention"]["symbol"] == stages["combine"]["symbol"]
+    with pytest.raises(RuntimeError, match="three CUDA kernels"):
+        glm.decode_trace_stages(events[:-1], 2)
+    fused = [event for event in events if event["name"] != "copy"]
+    stages = glm.decode_trace_stages(fused, 2, fused_query=True)
+    assert list(stages) == ["partial_attention", "combine"]
+    assert [stage["us_per_call"] for stage in stages.values()] == [8, 5]
+    with pytest.raises(RuntimeError, match="two CUDA kernels"):
+        glm.decode_trace_stages(events, 2, fused_query=True)
+
+
+def test_glm_upstream_direct_split_policy_bounds_partial_traffic():
+    policy = glm._cpu_contract("glm_config")
+    inner = policy.H200_PACKED_DECODE_INNER
+    assert list(inner) == [1, 8, 16, 24, 32, 64]
+    assert all(66 % split == 0 for split in inner.values())
+    assert inner[1] == 1 and inner[8] == 2
+    assert all(batch * (66 // inner[batch]) >= 2 * 132 for batch in inner if batch >= 8)
+    assert [66 // inner[batch] for batch in (16, 24, 32, 64)] == [22, 11, 11, 6]
+    assert set(policy.H200_PACKED_DECODE_COMBINE) == {
+        (66, 128),
+        (33, 512),
+        (22, 512),
+        (11, 512),
+        (6, 512),
+    }
+
+
+def test_glm_upstream_geometry_is_bound_to_combine_artifact_scope():
+    cfg = glm._cpu_contract("glm_config")
+    for tuned in (False, True):
+        payload = _glm_upstream_payload()
+        variants = cfg.H200_PACKED_DECODE_COMBINE if tuned else ((66, 128), (33, 512))
+        compiled = {"decode_combine": {f"{g}x{c}": {} for g, c in variants}}
+        payload["source"]["compiled_build"] = {"glm_compile": compiled}
+        for row in payload["cases"]:
+            queries = row["case"]["queries"]
+            fixture = row["fixture"]
+            fixture["direct_combine_columns"] = 128 if queries == 1 else 512
+            if tuned:
+                inner = cfg.H200_PACKED_DECODE_INNER[queries]
+                fixture["path_geometry"]["direct"] = dict(
+                    tile_rows=32, inner_iter=inner, partial_groups=66 // inner
+                )
+        glm.validate_timing(payload)
+        payload["cases"][0]["fixture"].pop("direct_combine_columns")
+        with pytest.raises(RuntimeError, match="geometry"):
+            glm.validate_timing(payload)
+
+
+def test_glm_upstream_wgmma_timing_requires_candidate_geometry_and_score():
+    import copy
+
+    payload = _glm_upstream_payload()
+    payload["direct_candidate"] = upstream.WGMMA_CANDIDATE
+    payload["source"]["compiled_build"] = {
+        "glm_compile": {"decode_combine": {"66x128": {}, "33x512": {}}},
+        "upstream_compile": {"decode_wgmma": {str(b): {} for b in (8, 16, 24, 32, 64)}},
+    }
+    for row in payload["cases"]:
+        batch = row["case"]["queries"]
+        fixture = row["fixture"]
+        fixture["direct_combine_columns"] = 128 if batch == 1 else 512
+        if batch != 1:
+            inner, groups = {
+                8: (1, 33), 16: (2, 17), 24: (3, 11), 32: (4, 9), 64: (8, 5)
+            }[batch]
+            fixture["path_geometry"]["direct"] = dict(
+                tile_rows=64, inner_iter=inner, partial_groups=groups
+            )
+    payload["upstream_decode_score"] = glm.upstream_decode_score(
+        payload["cases"], target_ratio=0.5
+    )
+    glm.validate_timing(payload)
+    for field in ("identity", "geometry", "score"):
+        bad = copy.deepcopy(payload)
+        if field == "identity":
+            bad.pop("direct_candidate")
+        elif field == "geometry":
+            bad["cases"][4]["fixture"]["path_geometry"]["direct"]["tile_rows"] = 32
+        else:
+            score = bad["upstream_decode_score"]
+            score["meets_target"] = not score["meets_target"]
+        with pytest.raises(RuntimeError, match=field):
+            glm.validate_timing(bad)
+
+
+def test_glm_upstream_profile_requires_complete_matched_combine_sweep():
+    import copy
+
+    _, modes, matrix = glm.experiment(glm.UPSTREAM_SUITE, "decode")
+    timing = glm._cpu_contract("timing")
+    compiled = {
+        "decode_wgmma": {"8": {"combine_columns": 256}},
+        "batch8_combines": {"128": {}, "256": {}, "512": {}},
+    }
+    profile = dict(
+        protocol=glm.UPSTREAM_PROFILE_PROTOCOL,
+        direct_candidate=upstream.WGMMA_CANDIDATE,
+        source={"compiled_build": {"upstream_compile": compiled}},
+        status="passed",
+        cases=[],
+        batch8_combine_sweep={},
+    )
+    for case, paired in zip(matrix, _glm_upstream_payload()["cases"]):
+        if case.tail:
+            continue
+        row = dict(
+            name=case.name,
+            fixture=paired["fixture"],
+            paths={},
+        )
+        for mode in modes:
+            fused = mode == "direct" and case.queries > 1
+            stages = glm.DECODE_TRACE_STAGES[1:] if fused else glm.DECODE_TRACE_STAGES
+            row["paths"][mode] = {
+                "trace": f"{case.name}-{mode}.json",
+                "stages": {
+                    stage: {
+                        "us_per_call": 1.0,
+                        "symbol": "glm_packed_partial_wgmma_kernel" if fused else stage,
+                    }
+                    for stage in stages
+                },
+            }
+        profile["cases"].append(row)
+        if case.queries == 8:
+            paired["round_orders"] = timing.round_orders(
+                modes, glm.ROUNDS, glm.case_seed(case), balanced=True
+            )
+            row["paired"] = paired
+            row["fixture"]["direct_combine_columns"] = 256
+            profile["batch8_combine_sweep"][case.name] = {
+                str(width): {**row, "fixture": {**row["fixture"], "direct_combine_columns": width}}
+                for width in (128, 512)
+            }
+    glm.validate_decode_profile(profile)
+    for change, error in (
+        ("missing_case", "Incomplete GLM upstream"),
+        ("missing_width", "Incomplete batch-8"),
+        ("input", "Invalid batch-8"),
+        ("trace", "Invalid GLM profile trace"),
+        ("orders", "Invalid batch-8"),
+        ("calls", "Invalid GLM sample normalization"),
+        ("samples", "Missing/invalid GLM rounds"),
+        ("ratios", "Invalid GLM paired ratios"),
+    ):
+        broken = copy.deepcopy(profile)
+        widths = next(iter(broken["batch8_combine_sweep"].values()))
+        trial = widths["128"]
+        if change == "missing_case":
+            broken["cases"].pop()
+        elif change == "missing_width":
+            widths.pop("128")
+        elif change == "input":
+            trial["fixture"]["common_inputs_sha256"] = "1" * 64
+        elif change == "trace":
+            trial["paths"]["direct"]["stages"].pop("combine")
+        elif change == "orders":
+            trial["paired"]["round_orders"] = []
+        elif change == "calls":
+            trial["paired"]["calls_per_sample"] = 101
+        elif change == "samples":
+            trial["paired"]["paths"]["direct"]["samples"] = [0.0] * glm.ROUNDS
+        else:
+            trial["paired"]["paired_ratios"]["direct_over_upstream"]["samples"][0] = 0.1
+        with pytest.raises(RuntimeError, match=error):
+            glm.validate_decode_profile(broken)
