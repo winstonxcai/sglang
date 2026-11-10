@@ -507,7 +507,9 @@ class Fixture:
             if wgmma is not None and case.queries > 1:
                 variant = wgmma[str(case.queries)]
                 columns = variant["combine_columns"]
-                geometry = wgmma_geometry(case.queries)
+                geometry = wgmma_geometry(
+                    8 if case.queries == 16 and variant is wgmma.get("8") else case.queries
+                )
                 inner = geometry["inner_iter"]
                 tile_rows = geometry["tile_rows"]
                 groups = geometry["partial_groups"]
@@ -988,6 +990,25 @@ def _validate_paired_timing(case: dict, modes: tuple[str, str], banks: int) -> N
         raise RuntimeError(f"Invalid GLM derived paired statistics {name}")
 
 
+def upstream_wgmma_launches(build: dict) -> dict:
+    """Select from the prepared artifact table without changing that table."""
+    variants = build.get("upstream_compile", {}).get("decode_wgmma", {})
+    artifact = build.get("upstream_batch16_artifact")
+    if artifact is None:
+        return variants
+    one_tile = variants.get("8", {})
+    if (
+        artifact != "8"
+        or "16" not in variants
+        or one_tile.get("geometry")
+        != {"tile_rows": 64, "inner_iter": 1, "partial_groups": 33}
+        or one_tile.get("combine_columns") != 128
+        or one_tile.get("query_conversion") != "fused"
+    ):
+        raise RuntimeError("Unbound batch-16 one-tile launch")
+    return {**variants, "16": one_tile}
+
+
 def validate_timing(payload: dict, *, prefix: bool = False) -> None:
     phase = payload.get("phase", "all")
     protocol, modes, expected = experiment(payload.get("suite", "glm-attention"), phase)
@@ -997,13 +1018,10 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
     if protocol == UPSTREAM_PROTOCOL:
         upstream_contract = _cpu_contract("glm_upstream")
         source = payload.get("source", {})
+        build = source.get("compiled_build", {})
         if source.get("upstream") != upstream_contract.identity():
             raise RuntimeError("Missing pristine upstream baseline identity")
-        wgmma = (
-            source.get("compiled_build", {})
-            .get("upstream_compile", {})
-            .get("decode_wgmma", {})
-        )
+        wgmma = upstream_wgmma_launches(build)
         expected_candidate = upstream_contract.WGMMA_CANDIDATE if wgmma else None
         if payload.get("direct_candidate") != expected_candidate or (
             wgmma and set(wgmma) != {str(b) for b in upstream_contract.WGMMA_INNER}
@@ -1058,13 +1076,15 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
                     raise RuntimeError("Unknown upstream decode combine geometry")
                 expected_columns = 128 if definition.queries == 1 else 512
             if wgmma and definition.queries > 1:
-                geometry["direct"] = upstream_contract.wgmma_geometry(definition.queries)
-                expected_columns = wgmma[str(definition.queries)].get(
-                    "combine_columns", 512
-                )
-                expected_query_conversion = wgmma[str(definition.queries)].get(
-                    "query_conversion"
-                )
+                variant = wgmma[str(definition.queries)]
+                artifact_batch = definition.queries
+                if artifact_batch == 16 and build.get("upstream_batch16_artifact") == "8":
+                    artifact_batch = 8
+                geometry["direct"] = upstream_contract.wgmma_geometry(artifact_batch)
+                if variant.get("geometry", geometry["direct"]) != geometry["direct"]:
+                    raise RuntimeError(f"Invalid WGMMA geometry: {case['name']}")
+                expected_columns = variant.get("combine_columns", 512)
+                expected_query_conversion = variant.get("query_conversion")
             if (
                 fixture.get("changing_input_replay") != "passed"
                 or fixture.get("direct_combine_columns") != expected_columns
@@ -1538,7 +1558,9 @@ def main() -> None:
         module = load_baseline()
         compiled_upstream = build.get("upstream_compile", {})
         verify_compilation(compiled_upstream, require_wgmma=True)
-        wgmma = compiled_upstream["decode_wgmma"]
+        wgmma = upstream_wgmma_launches(build)
+        if args.profile_decode and build.get("upstream_batch16_artifact"):
+            raise ValueError("The selected batch-16 schedule requires paired timing")
         payload["direct_candidate"] = WGMMA_CANDIDATE
         target_ratio = WGMMA_TARGET_RATIO
         payload["source"]["upstream"] = identity()
