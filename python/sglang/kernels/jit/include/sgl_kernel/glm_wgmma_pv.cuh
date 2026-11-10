@@ -88,10 +88,18 @@ __device__ __forceinline__ int remnant_glm_wgmma_pv_registers(
 // two adjacent features in each 64-feature panel. Write each BF16 pair
 // together so one store covers the full four bytes owned by the lane.
 __device__ __forceinline__ int remnant_glm_write_wgmma_output(
-    const float* numerator, const float* scale, void* output_raw) {
+    const float* numerator, const float* scale, const float* lse,
+    void* output_raw, float* output_lse) {
   auto* output = static_cast<uint32_t*>(output_raw);
   const int feature_pair = threadIdx.x / 4;
   const int first_head = 2 * (threadIdx.x % 4);
+  // The reduced head values are replicated across feature pairs.
+  if (feature_pair == 0) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      output_lse[first_head + (i / 2) * 8 + i % 2] = lse[i];
+    }
+  }
 #pragma unroll
   for (int panel = 0; panel < 8; ++panel) {
 #pragma unroll
