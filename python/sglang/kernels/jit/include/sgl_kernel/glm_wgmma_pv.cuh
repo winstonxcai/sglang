@@ -40,34 +40,23 @@ __device__ __forceinline__ int remnant_glm_wgmma_pv_registers(
   const int warp_feature = (threadIdx.x >> 5) * 16;
   tl::GmmaDescriptor descriptor;
   tl::initialize_wgmma_descriptor<2, 1, 32>(descriptor, p);
-  constexpr int panels = 8;
   constexpr int panels_per_group = 2;
   constexpr int registers_per_panel = 8;
-  constexpr int registers_per_group = panels_per_group * registers_per_panel;
-  uint32_t values[2][registers_per_group];
 #pragma unroll
-  for (int first = 0; first < panels; first += panels_per_group) {
-    uint32_t* group_values = values[(first / panels_per_group) & 1];
+  for (int first = 0; first < 8; first += panels_per_group) {
+    uint32_t values[panels_per_group][2][4];
     float* accum = numerator + first * registers_per_panel;
-    if (first >= 2 * panels_per_group) {
-      // This slot belongs to the older outstanding group. The younger
-      // group can continue while we prepare the next pair of panels.
-      tl::warpgroup_wait<1>();
-      tl::warpgroup_fence_operand(group_values, registers_per_group);
-      tl::warpgroup_fence_operand(
-          accum - 2 * registers_per_group, registers_per_group);
-    }
 #pragma unroll
     for (int panel = 0; panel < panels_per_group; ++panel) {
 #pragma unroll
       for (int slice = 0; slice < 2; ++slice) {
-        uint32_t* fragment = group_values + (panel * 2 + slice) * 4;
         remnant_glm_load_pv_registers(
-            kv, (first + panel) * 64 + warp_feature, slice * 32, fragment);
+            kv, (first + panel) * 64 + warp_feature, slice * 32,
+            values[panel][slice]);
+        tl::warpgroup_fence_operand(values[panel][slice], 4);
       }
     }
-    tl::warpgroup_fence_operand(group_values, registers_per_group);
-    tl::warpgroup_fence_operand(accum, registers_per_group);
+    tl::warpgroup_fence_operand(accum, panels_per_group * registers_per_panel);
     tl::warpgroup_arrive();
 #pragma unroll
     for (int panel = 0; panel < panels_per_group; ++panel) {
@@ -75,19 +64,22 @@ __device__ __forceinline__ int remnant_glm_wgmma_pv_registers(
       for (int slice = 0; slice < 2; ++slice) {
         tl::wgmma_rs<tl::DataType::kFloat8_e4m3, tl::DataType::kFloat8_e4m3,
                      tl::DataType::kFloat32, 64, 16, 32, false, false>(
-            group_values + (panel * 2 + slice) * 4,
-            uint64_t(descriptor + 2 * slice),
+            values[panel][slice], uint64_t(descriptor + 2 * slice),
             reinterpret_cast<uint32_t*>(accum + panel * registers_per_panel),
             true);
       }
     }
     tl::warpgroup_commit_batch();
+    tl::warpgroup_wait<0>();
+    // Source and accumulator registers remain live until this group drains.
+#pragma unroll
+    for (int panel = 0; panel < panels_per_group; ++panel) {
+#pragma unroll
+      for (int slice = 0; slice < 2; ++slice) {
+        tl::warpgroup_fence_operand(values[panel][slice], 4);
+      }
+    }
+    tl::warpgroup_fence_operand(accum, panels_per_group * registers_per_panel);
   }
-  tl::warpgroup_wait<0>();
-  tl::warpgroup_fence_operand(values[0], registers_per_group);
-  tl::warpgroup_fence_operand(values[1], registers_per_group);
-  tl::warpgroup_fence_operand(
-      numerator + (panels - 2 * panels_per_group) * registers_per_panel,
-      2 * registers_per_group);
   return 0;
 }
