@@ -43,7 +43,7 @@ def wgmma_geometry(batch: int) -> dict[str, int]:
 
 
 def wgmma_combine_columns(batch: int) -> int:
-    return 256 if batch == 8 else 512
+    return 128 if batch == 8 else 512
 
 
 def identity() -> dict:

@@ -2432,12 +2432,17 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
         str(width): dict(wgmma) for width in upstream.WGMMA_BATCH8_COMBINE_WIDTHS
     }
     upstream.verify_compilation(candidate, require_wgmma=True)
+    alternate = next(
+        str(width)
+        for width in upstream.WGMMA_BATCH8_COMBINE_WIDTHS
+        if width != upstream.wgmma_combine_columns(8)
+    )
     broken = copy.deepcopy(candidate)
-    broken["batch8_combines"].pop("128")
+    broken["batch8_combines"].pop(alternate)
     with pytest.raises(RuntimeError, match="Incomplete batch-8"):
         upstream.verify_compilation(broken, require_wgmma=True)
     broken = copy.deepcopy(candidate)
-    broken["batch8_combines"]["128"]["library_sha256"] = "wrong"
+    broken["batch8_combines"][alternate]["library_sha256"] = "wrong"
     with pytest.raises(RuntimeError, match="Unbound batch-8"):
         upstream.verify_compilation(broken, require_wgmma=True)
     for change in ("missing", "source", "binary", "missing_binding"):
