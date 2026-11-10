@@ -1543,6 +1543,16 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
         (include / header).read_text()
         for header in ("glm_packed_decode.cuh", "glm_wgmma_pv.cuh")
     ) + "\n" + _glm_wgmma_query_source()
+    # Match the WGMMA m64n16 reduction layout. Passing these fragments to
+    # CUDA exposes their four per-lane register slots, so pin the mapping.
+    head_state_layout = T.Fragment(
+        [heads],
+        forward_thread_fn=lambda head, replica: (
+            replica % 4 * 32 + replica // 4 * 4 + head % 8 // 2
+        ),
+        forward_index_fn=lambda head: head // 8 * 2 + head % 2,
+        replicate=32,
+    )
 
     @T.prim_func
     def main(
@@ -1573,6 +1583,8 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                     q: tilelang.layout.make_full_bank_swizzled_layout(q),
                     kv: tilelang.layout.make_full_bank_swizzled_layout(kv),
                     p: tilelang.layout.make_half_bank_swizzled_layout(p),
+                    maximum: head_state_layout,
+                    alpha: head_state_layout,
                     # The register source maps hardware rows r and r+8 to
                     # adjacent logical features 2r and 2r+1 within each warp.
                     numerator: T.Fragment(
