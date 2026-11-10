@@ -7,21 +7,12 @@ __device__ __forceinline__ uint32_t remnant_glm_query_fp8_pair(uint32_t bits) {
   const uint32_t lo = bits & 0xffff;
   const uint32_t hi = bits >> 16;
   uint16_t packed;
-  // BF16 bits extend exactly to FP32. Hopper packs the two rounded E4M3
-  // codes with the first source in the high byte.
+  // BF16 bits extend exactly to FP32. Use the same saturating E4M3
+  // conversion as the pinned Torch CUDA path, with the high byte first.
   asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
       : "=h"(packed)
       : "f"(__uint_as_float(hi << 16)), "f"(__uint_as_float(lo << 16)));
-  // 464 rounds to 448 at the even tie. Values beyond it, including infinities
-  // and NaNs, use Torch's signed E4M3FN NaN code instead of saturation.
-  constexpr uint32_t last_finite_bf16 = 0x43e8;
-  const uint32_t code_lo = (lo & 0x7fff) > last_finite_bf16
-      ? (lo >> 8 & 0x80) | 0x7f
-      : packed & 0xff;
-  const uint32_t code_hi = (hi & 0x7fff) > last_finite_bf16
-      ? (hi >> 8 & 0x80) | 0x7f
-      : packed >> 8;
-  return code_lo | (code_hi << 8);
+  return packed;
 }
 
 // Stage one contiguous [16,512] BF16 query in TileLang's SW128 FP8 layout.
