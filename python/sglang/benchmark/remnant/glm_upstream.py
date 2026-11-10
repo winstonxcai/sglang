@@ -135,6 +135,7 @@ def precompile() -> dict:
         bind_partial_launch_metadata,
         dynamic_shared_bytes,
         partial_parameters,
+        wgmma_query_probe,
     )
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
         glm_packed_decode_combine,
@@ -185,6 +186,7 @@ def precompile() -> dict:
         partial = glm_packed_wgmma_partial(inner, 256**-0.5)
         combine = glm_packed_decode_combine(16, 512, groups, 512)
         wgmma[str(batch)] = partial, combine
+    query_probe = wgmma_query_probe()
     compiled = dict(
         source=identity(),
         tilelang=variants,
@@ -197,6 +199,7 @@ def precompile() -> dict:
     )
     bind_partial_launch_metadata(compiled)
     artifacts = compiled["cache_files"]
+    compiled["query_conversion_probe"] = bind_decode_library(query_probe, artifacts)
     compiled["decode_wgmma"] = {}
     for batch, (partial_kernel, combine) in wgmma.items():
         partial = partial_kernel.get_kernel_source()
@@ -225,6 +228,8 @@ def precompile() -> dict:
             raise RuntimeError(f"Unexpected register PV matrix instructions: {batch=}")
         if len(re.findall(r"^\s*remnant_glm_wgmma_pv_registers\(", partial, re.M)) != 1:
             raise RuntimeError(f"Missing register PV call: {batch=}")
+        if not re.search(r"^\s*remnant_glm_stage_wgmma_query\(", partial, re.M):
+            raise RuntimeError(f"Missing fused query staging: {batch=}")
         local_sites = len(re.findall(r"\b(?:LDL|STL)\b", sass))
         if local_sites:
             raise RuntimeError(f"Register PV generated local-memory traffic: {batch=}")
@@ -242,7 +247,9 @@ def precompile() -> dict:
             partial=dict(
                 **variant,
                 symbol=symbol,
-                parameters=partial_parameters(partial, symbol, packed=True),
+                parameters=partial_parameters(
+                    partial, symbol, packed=True, query_parameter="q_bf16"
+                ),
                 dynamic_shared=dynamic_shared,
             ),
             combine=bind_decode_library(combine, artifacts),
@@ -253,6 +260,7 @@ def precompile() -> dict:
             matrix_store_sites=matrix_stores,
             local_sites=local_sites,
             pv_operand="register",
+            query_conversion="fused",
             loader_call=loader,
             shared_ranges=shared_ranges,
             dynamic_shared_bytes=dynamic_shared,
@@ -288,6 +296,14 @@ def verify_compilation(compiled: dict, *, require_wgmma: bool = False) -> None:
     wgmma = compiled.get("decode_wgmma")
     if require_wgmma and not wgmma:
         raise RuntimeError("Upstream decode requires CPU-prepared WGMMA variants")
+    probe = compiled.get("query_conversion_probe", {})
+    if require_wgmma and any(
+        not probe.get(f"{artifact}_sha256")
+        or artifacts.get(probe.get(f"{artifact}_path"))
+        != probe[f"{artifact}_sha256"]
+        for artifact in ("cubin", "library")
+    ):
+        raise RuntimeError("Unbound fused query conversion probe")
     if wgmma:
         if set(wgmma) != {str(batch) for batch in WGMMA_INNER}:
             raise RuntimeError("Missing WGMMA decode specializations")
@@ -297,6 +313,7 @@ def verify_compilation(compiled: dict, *, require_wgmma: bool = False) -> None:
                 or record["partial"].get("symbol") != "glm_packed_partial_wgmma_kernel"
                 or not record["partial"].get("parameters")
                 or not record["partial"].get("dynamic_shared")
+                or record.get("query_conversion") != "fused"
             ):
                 raise RuntimeError(f"Unbound WGMMA decode launch geometry: {batch=}")
             for kind in ("partial", "combine"):

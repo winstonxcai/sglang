@@ -2583,6 +2583,12 @@ def test_glm_decode_trace_distinguishes_identical_native_symbols():
     assert stages["partial_attention"]["symbol"] == stages["combine"]["symbol"]
     with pytest.raises(RuntimeError, match="three CUDA kernels"):
         glm.decode_trace_stages(events[:-1], 2)
+    fused = [event for event in events if event["name"] != "copy"]
+    stages = glm.decode_trace_stages(fused, 2, fused_query=True)
+    assert list(stages) == ["partial_attention", "combine"]
+    assert [stage["us_per_call"] for stage in stages.values()] == [8, 5]
+    with pytest.raises(RuntimeError, match="two CUDA kernels"):
+        glm.decode_trace_stages(events, 2, fused_query=True)
 
 
 def test_glm_upstream_direct_split_policy_bounds_partial_traffic():

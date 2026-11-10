@@ -1322,6 +1322,28 @@ def _check_decode_combine_graph(groups, columns, variant, record_property):
 if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
     from sglang.benchmark.remnant.glm_upstream import WGMMA_INNER, wgmma_geometry
 
+    def test_wgmma_query_conversion_bytes():
+        from sglang.benchmark.remnant.glm_artifacts import (
+            verify_decode_library,
+            wgmma_query_probe,
+        )
+
+        manifest = json.loads(
+            Path(os.environ["REMNANT_BUILD_MANIFEST_PATH"]).read_text()
+        )
+        probe = wgmma_query_probe()
+        verify_decode_library(
+            probe, manifest["upstream_compile"]["query_conversion_probe"]
+        )
+        raw = (
+            torch.arange(1 << 16, dtype=torch.int32, device="cuda")
+            .to(torch.int16)
+            .view(torch.bfloat16)
+            .reshape(8, 16, 512)
+        )
+        expected = raw.to(torch.float8_e4m3fn).view(torch.uint8)
+        torch.testing.assert_close(probe(raw), expected, atol=0, rtol=0)
+
     def _wgmma_variant(batch):
         manifest = json.loads(
             Path(os.environ["REMNANT_BUILD_MANIFEST_PATH"]).read_text()
@@ -1368,7 +1390,7 @@ if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
         def check_result(buffers, q, active, group):
             selected = active[(active >= 0) & (active < slots)]
             kv = dense[selected]
-            score = (q[0, 0].float() @ kv.T) * ATTENTION_SCALE
+            score = (q[0, 0].to(dtype).float() @ kv.T) * ATTENTION_SCALE
             expected = torch.softmax(score, dim=-1) @ kv
             expected_lse = torch.logsumexp(score, dim=-1) / math.log(2)
             torch.testing.assert_close(
@@ -1383,8 +1405,8 @@ if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
         try:
             with torch.cuda.stream(stream):
                 buffers = dict(
-                    q_fp8=torch.zeros(
-                        (1, 1, heads, dim), dtype=torch.uint8, device="cuda"
+                    q_bf16=torch.zeros(
+                        (1, 1, heads, dim), dtype=torch.bfloat16, device="cuda"
                     ),
                     kv_fp8=values.cuda(),
                     bitmap=torch.from_numpy(words).cuda(),
@@ -1407,14 +1429,14 @@ if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
                 for tail in range(4):
                     q = torch.from_numpy(
                         rng.normal(0, 0.15, (1, 1, heads, dim)).astype(np.float32)
-                    ).to(dtype)
+                    ).to(torch.bfloat16)
                     indices = np.full((1, 1, 1, 2112), -1, dtype=np.int32)
                     active = indices[0, 0, 0, :count]
                     active[:-3] = np.resize((*locations, 256, -1, slots), count - 3)
                     if tail == 0 and count > geometry["tile_rows"]:
                         active[:geometry["tile_rows"]] = -1
                     active[count - 3:count - 3 + tail] = locations[:tail]
-                    buffers["q_fp8"].copy_(q.view(torch.uint8))
+                    buffers["q_bf16"].copy_(q)
                     buffers["indices"].copy_(torch.from_numpy(indices))
                     graph.replay()
                     stream.synchronize()

@@ -117,6 +117,44 @@ def packed_loader_probe():
     return probe
 
 
+def wgmma_query_probe():
+    """Expose the staged codes for all 65,536 BF16 bit patterns."""
+    import tilelang
+    import tilelang.language as T
+
+    from sglang.kernels.ops.attention.dsa.tilelang_kernel import _glm_wgmma_query_source
+
+    source = _glm_wgmma_query_source()
+
+    @tilelang.jit(out_idx=[-1])
+    def probe():
+        @T.prim_func
+        def main(
+            raw: T.Tensor([8, 16, 512], T.bfloat16),
+            out: T.Tensor([8, 16, 512], T.uint8),
+        ):
+            with T.Kernel(8, threads=128) as query:
+                T.import_source(source)
+                staged = T.alloc_shared([16, 512], T.uint8)
+                T.annotate_layout(
+                    {staged: tilelang.layout.make_full_bank_swizzled_layout(staged)}
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "int32",
+                        "remnant_glm_stage_wgmma_query",
+                        T.access_ptr(raw[query, 0, 0], "r", extent=16 * 512),
+                        T.access_ptr(staged, "w"),
+                    )
+                )
+                T.sync_threads()
+                T.copy(staged, out[query, :, :])
+
+        return main.with_attr("global_symbol", "glm_packed_query_bytes")
+
+    return probe()
+
+
 def compile_sm90_variant(case: tuple[int, int, int]) -> list[PartialVariant]:
     """One independent head/split pair, owned by a CPU compiler process."""
     from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
@@ -334,7 +372,7 @@ def dynamic_shared_bytes(host_source: str) -> int:
 
 
 def partial_parameters(
-    source: str, symbol: str, *, packed: bool
+    source: str, symbol: str, *, packed: bool, query_parameter: str = "q_fp8"
 ) -> list[CudaParameter]:
     """Bind the generated CUDA arguments used by the exact-CTA graph probe."""
     match = re.search(r"\b" + re.escape(symbol) + r"\(([^)]*)\)\s*\{", source)
@@ -355,7 +393,7 @@ def partial_parameters(
         "kv_fp8",
         "partial_lse",
         "partial_o",
-        "q_fp8",
+        query_parameter,
         "num_pages",
         "seq_len",
     ]

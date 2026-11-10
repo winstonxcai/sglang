@@ -1513,6 +1513,13 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main.with_attr("global_symbol", "glm_packed_partial") if packed else main
 
 
+def _glm_wgmma_query_source() -> str:
+    return (
+        Path(__file__).resolve().parents[3]
+        / "jit/include/sgl_kernel/glm_wgmma_query.cuh"
+    ).read_text()
+
+
 @tilelang.jit(
     out_idx=[-2, -1],
     pass_configs={
@@ -1535,11 +1542,11 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
     source = "\n".join(
         (include / header).read_text()
         for header in ("glm_packed_decode.cuh", "glm_wgmma_pv.cuh")
-    )
+    ) + "\n" + _glm_wgmma_query_source()
 
     @T.prim_func
     def main(
-        q_fp8: T.Tensor([1, seq_len, heads, dim], fp8),
+        q_bf16: T.Tensor([1, seq_len, heads, dim], T.bfloat16),
         kv_fp8: T.Tensor([1, num_pages, 1, 256], fp8),
         bitmap: T.Tensor([num_pages, 8], T.uint64),
         indices: T.Tensor([1, seq_len, 1, topk], T.int32),
@@ -1563,6 +1570,7 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
 
             T.annotate_layout(
                 {
+                    q: tilelang.layout.make_full_bank_swizzled_layout(q),
                     kv: tilelang.layout.make_full_bank_swizzled_layout(kv),
                     p: tilelang.layout.make_half_bank_swizzled_layout(p),
                     # The register source maps hardware rows r and r+8 to
@@ -1583,7 +1591,14 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                     ),
                 }
             )
-            T.copy(q_fp8[0, query, :, :], q)
+            T.evaluate(
+                T.call_extern(
+                    "int32",
+                    "remnant_glm_stage_wgmma_query",
+                    T.access_ptr(q_bf16[0, query, 0, 0], "r", extent=heads * dim),
+                    T.access_ptr(q, "w"),
+                )
+            )
             T.fill(numerator, 0)
             T.fill(maximum, -(2**30))
             T.fill(denominator, 0)

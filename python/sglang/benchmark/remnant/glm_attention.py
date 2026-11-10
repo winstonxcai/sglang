@@ -513,6 +513,7 @@ class Fixture:
                 combine = glm_packed_decode_combine(case.heads, DIM, groups, columns)
                 verify_decode_library(combine, variant["combine"])
                 self.wgmma_kernels = partial, combine
+                self.identity["direct_query_conversion"] = "fused"
             else:
                 tile_rows = 32
                 inner = self.packed_decode_inner = H200_PACKED_DECODE_INNER[case.queries]
@@ -580,7 +581,7 @@ class Fixture:
         if self.wgmma_kernels is not None:
             partial, combine = self.wgmma_kernels
             return combine(*partial(
-                self.q.to(torch.float8_e4m3fn).unsqueeze(0),
+                self.q.unsqueeze(0),
                 cache.values.view(torch.float8_e4m3fn)[None, :, None, :],
                 cache.bitmaps,
                 self.ids[bank].unsqueeze(0),
@@ -786,6 +787,7 @@ def runtime_hashes(root: Path) -> dict[str, str]:
         "kernels/ops/attention/dsa/tilelang_kernel.py",
         "kernels/jit/include/sgl_kernel/glm_packed_decode.cuh",
         "kernels/jit/include/sgl_kernel/glm_wgmma_pv.cuh",
+        "kernels/jit/include/sgl_kernel/glm_wgmma_query.cuh",
         "srt/remnant/glm.py",
         "srt/remnant/glm_pool.py",
         "srt/remnant/reference.py",
@@ -1005,6 +1007,7 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             )
             variants = set(compiled.get("decode_combine", {}))
             expected_columns = None
+            expected_query_conversion = None
             if variants:
                 config = _cpu_contract("glm_config")
                 tuned = {f"{g}x{c}" for g, c in config.H200_PACKED_DECODE_COMBINE}
@@ -1019,9 +1022,13 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             if wgmma and definition.queries > 1:
                 geometry["direct"] = upstream_contract.wgmma_geometry(definition.queries)
                 expected_columns = 512
+                expected_query_conversion = wgmma[str(definition.queries)].get(
+                    "query_conversion"
+                )
             if (
                 fixture.get("changing_input_replay") != "passed"
                 or fixture.get("direct_combine_columns") != expected_columns
+                or fixture.get("direct_query_conversion") != expected_query_conversion
                 or fixture.get("path_geometry") != geometry
                 or "H200" not in payload.get("source", {}).get("device", "")
             ):
@@ -1194,7 +1201,9 @@ def upstream_decode_score(
     }
 
 
-def decode_trace_stages(events: list[dict], banks: int) -> dict:
+def decode_trace_stages(
+    events: list[dict], banks: int, *, fused_query: bool = False
+) -> dict:
     """Attribute one complete replay by launch order, even for identical symbols."""
     kernels = sorted(
         (
@@ -1204,20 +1213,23 @@ def decode_trace_stages(events: list[dict], banks: int) -> dict:
         ),
         key=lambda event: event["ts"],
     )
+    stage_names = ("partial_attention", "combine")
+    if not fused_query:
+        stage_names = ("query_conversion", *stage_names)
+    launches_per_bank = len(stage_names)
     if (
         banks < 1
-        or len(kernels) != 3 * banks
+        or len(kernels) != launches_per_bank * banks
         or len({(event["pid"], event["tid"]) for event in kernels}) != 1
         or any(
             not math.isfinite(event["dur"]) or event["dur"] <= 0 for event in kernels
         )
     ):
-        raise RuntimeError("Expected three CUDA kernels per bank on one graph stream")
+        count = "two" if fused_query else "three"
+        raise RuntimeError(f"Expected {count} CUDA kernels per bank on one graph stream")
     stages = {}
-    for position, name in enumerate(
-        ("query_conversion", "partial_attention", "combine")
-    ):
-        launches = kernels[position::3]
+    for position, name in enumerate(stage_names):
+        launches = kernels[position::launches_per_bank]
         symbols = {event["name"] for event in launches}
         if len(symbols) != 1:
             raise RuntimeError(f"Inconsistent {name} kernel across graph banks")
@@ -1271,7 +1283,9 @@ def profile_upstream_decode(
                     trace = trace_dir / f"{case.name}-{mode}.json"
                     profiler.export_chrome_trace(str(trace))
                     stages = decode_trace_stages(
-                        json.loads(trace.read_text())["traceEvents"], fixture.banks
+                        json.loads(trace.read_text())["traceEvents"],
+                        fixture.banks,
+                        fused_query=mode == "direct" and case.queries > 1,
                     )
                     if mode == "direct" and case.queries > 1 and (
                         stages["partial_attention"]["symbol"]
