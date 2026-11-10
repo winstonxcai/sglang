@@ -1464,7 +1464,7 @@ if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
         variant = _wgmma_variant(batch)
         _check_decode_combine_graph(
             variant["geometry"]["partial_groups"],
-            512,
+            variant["combine_columns"],
             variant["combine"],
             record_property,
         )

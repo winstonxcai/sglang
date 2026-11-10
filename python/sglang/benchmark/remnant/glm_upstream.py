@@ -30,6 +30,7 @@ FILES = {
 SOURCE_ENV = "REMNANT_GLM_UPSTREAM_SOURCE"
 IMAGE_SOURCE = "/opt/remnant-glm-upstream-v0522"
 WGMMA_INNER = {8: 1, 16: 2, 24: 3, 32: 4, 64: 8}
+WGMMA_BATCH8_COMBINE_WIDTHS = (128, 256, 512)
 WGMMA_CANDIDATE = "wgmma-tile64-batches-8-64"
 WGMMA_TARGET_RATIO = 0.5
 
@@ -39,6 +40,10 @@ def wgmma_geometry(batch: int) -> dict[str, int]:
     return dict(
         tile_rows=64, inner_iter=inner, partial_groups=(33 + inner - 1) // inner
     )
+
+
+def wgmma_combine_columns(batch: int) -> int:
+    return 256 if batch == 8 else 512
 
 
 def identity() -> dict:
@@ -180,11 +185,22 @@ def precompile() -> dict:
             block_I=32,
             threads=128,
         )
+    batch8_combines = {
+        str(columns): glm_packed_decode_combine(
+            16, 512, wgmma_geometry(8)["partial_groups"], columns
+        )
+        for columns in WGMMA_BATCH8_COMBINE_WIDTHS
+    }
     wgmma = {}
     for batch, inner in WGMMA_INNER.items():
         groups = wgmma_geometry(batch)["partial_groups"]
+        columns = wgmma_combine_columns(batch)
         partial = glm_packed_wgmma_partial(inner, 256**-0.5)
-        combine = glm_packed_decode_combine(16, 512, groups, 512)
+        combine = (
+            batch8_combines[str(columns)]
+            if batch == 8
+            else glm_packed_decode_combine(16, 512, groups, columns)
+        )
         wgmma[str(batch)] = partial, combine
     query_probe = wgmma_query_probe()
     compiled = dict(
@@ -199,6 +215,10 @@ def precompile() -> dict:
     )
     bind_partial_launch_metadata(compiled)
     artifacts = compiled["cache_files"]
+    compiled["batch8_combines"] = {
+        columns: bind_decode_library(combine, artifacts)
+        for columns, combine in batch8_combines.items()
+    }
     compiled["query_conversion_probe"] = bind_decode_library(query_probe, artifacts)
     compiled["decode_wgmma"] = {}
     for batch, (partial_kernel, combine) in wgmma.items():
@@ -253,6 +273,7 @@ def precompile() -> dict:
                 dynamic_shared=dynamic_shared,
             ),
             combine=bind_decode_library(combine, artifacts),
+            combine_columns=wgmma_combine_columns(int(batch)),
             geometry=wgmma_geometry(int(batch)),
             qgmma_sites=qgmma,
             cta_barrier_sites=barriers,
@@ -304,6 +325,20 @@ def verify_compilation(compiled: dict, *, require_wgmma: bool = False) -> None:
         for artifact in ("cubin", "library")
     ):
         raise RuntimeError("Unbound fused query conversion probe")
+    if require_wgmma:
+        sweep = compiled.get("batch8_combines", {})
+        if (
+            set(sweep) != {str(width) for width in WGMMA_BATCH8_COMBINE_WIDTHS}
+            or sweep[str(wgmma_combine_columns(8))] != wgmma.get("8", {}).get("combine")
+        ):
+            raise RuntimeError("Incomplete batch-8 combine specializations")
+        for variant in sweep.values():
+            if any(
+                not variant.get(f"{kind}_sha256")
+                or artifacts.get(variant.get(f"{kind}_path")) != variant[f"{kind}_sha256"]
+                for kind in ("cubin", "library")
+            ):
+                raise RuntimeError("Unbound batch-8 combine specialization")
     if wgmma:
         if set(wgmma) != {str(batch) for batch in WGMMA_INNER}:
             raise RuntimeError("Missing WGMMA decode specializations")
@@ -314,6 +349,7 @@ def verify_compilation(compiled: dict, *, require_wgmma: bool = False) -> None:
                 or not record["partial"].get("parameters")
                 or not record["partial"].get("dynamic_shared")
                 or record.get("query_conversion") != "fused"
+                or record.get("combine_columns") != wgmma_combine_columns(int(batch))
             ):
                 raise RuntimeError(f"Unbound WGMMA decode launch geometry: {batch=}")
             for kind in ("partial", "combine"):

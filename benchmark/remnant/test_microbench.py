@@ -2416,6 +2416,30 @@ def test_glm_upstream_compile_artifacts_are_bound(tmp_path):
             variants["64"]["partial"]["library_sha256"] = "wrong"
         with pytest.raises(RuntimeError, match="WGMMA"):
             upstream.verify_compilation(broken)
+    for batch, record in candidate["decode_wgmma"].items():
+        record.update(
+            geometry=upstream.wgmma_geometry(int(batch)),
+            combine_columns=upstream.wgmma_combine_columns(int(batch)),
+            query_conversion="fused",
+        )
+        record["partial"].update(
+            symbol="glm_packed_partial_wgmma_kernel",
+            parameters=["q_bf16"],
+            dynamic_shared=65536,
+        )
+    candidate["query_conversion_probe"] = dict(wgmma)
+    candidate["batch8_combines"] = {
+        str(width): dict(wgmma) for width in upstream.WGMMA_BATCH8_COMBINE_WIDTHS
+    }
+    upstream.verify_compilation(candidate, require_wgmma=True)
+    broken = copy.deepcopy(candidate)
+    broken["batch8_combines"].pop("128")
+    with pytest.raises(RuntimeError, match="Incomplete batch-8"):
+        upstream.verify_compilation(broken, require_wgmma=True)
+    broken = copy.deepcopy(candidate)
+    broken["batch8_combines"]["128"]["library_sha256"] = "wrong"
+    with pytest.raises(RuntimeError, match="Unbound batch-8"):
+        upstream.verify_compilation(broken, require_wgmma=True)
     for change in ("missing", "source", "binary", "missing_binding"):
         candidate = copy.deepcopy(compiled)
         if change == "missing":
@@ -2665,3 +2689,86 @@ def test_glm_upstream_wgmma_timing_requires_candidate_geometry_and_score():
             score["meets_target"] = not score["meets_target"]
         with pytest.raises(RuntimeError, match=field):
             glm.validate_timing(bad)
+
+
+def test_glm_upstream_profile_requires_complete_matched_combine_sweep():
+    import copy
+
+    _, modes, matrix = glm.experiment(glm.UPSTREAM_SUITE, "decode")
+    timing = glm._cpu_contract("timing")
+    compiled = {
+        "decode_wgmma": {"8": {"combine_columns": 256}},
+        "batch8_combines": {"128": {}, "256": {}, "512": {}},
+    }
+    profile = dict(
+        protocol=glm.UPSTREAM_PROFILE_PROTOCOL,
+        direct_candidate=upstream.WGMMA_CANDIDATE,
+        source={"compiled_build": {"upstream_compile": compiled}},
+        status="passed",
+        cases=[],
+        batch8_combine_sweep={},
+    )
+    for case, paired in zip(matrix, _glm_upstream_payload()["cases"]):
+        if case.tail:
+            continue
+        row = dict(
+            name=case.name,
+            fixture=paired["fixture"],
+            paths={},
+        )
+        for mode in modes:
+            fused = mode == "direct" and case.queries > 1
+            stages = glm.DECODE_TRACE_STAGES[1:] if fused else glm.DECODE_TRACE_STAGES
+            row["paths"][mode] = {
+                "trace": f"{case.name}-{mode}.json",
+                "stages": {
+                    stage: {
+                        "us_per_call": 1.0,
+                        "symbol": "glm_packed_partial_wgmma_kernel" if fused else stage,
+                    }
+                    for stage in stages
+                },
+            }
+        profile["cases"].append(row)
+        if case.queries == 8:
+            paired["round_orders"] = timing.round_orders(
+                modes, glm.ROUNDS, glm.case_seed(case), balanced=True
+            )
+            row["paired"] = paired
+            row["fixture"]["direct_combine_columns"] = 256
+            profile["batch8_combine_sweep"][case.name] = {
+                str(width): {**row, "fixture": {**row["fixture"], "direct_combine_columns": width}}
+                for width in (128, 512)
+            }
+    glm.validate_decode_profile(profile)
+    for change, error in (
+        ("missing_case", "Incomplete GLM upstream"),
+        ("missing_width", "Incomplete batch-8"),
+        ("input", "Invalid batch-8"),
+        ("trace", "Invalid GLM profile trace"),
+        ("orders", "Invalid batch-8"),
+        ("calls", "Invalid GLM sample normalization"),
+        ("samples", "Missing/invalid GLM rounds"),
+        ("ratios", "Invalid GLM paired ratios"),
+    ):
+        broken = copy.deepcopy(profile)
+        widths = next(iter(broken["batch8_combine_sweep"].values()))
+        trial = widths["128"]
+        if change == "missing_case":
+            broken["cases"].pop()
+        elif change == "missing_width":
+            widths.pop("128")
+        elif change == "input":
+            trial["fixture"]["common_inputs_sha256"] = "1" * 64
+        elif change == "trace":
+            trial["paths"]["direct"]["stages"].pop("combine")
+        elif change == "orders":
+            trial["paired"]["round_orders"] = []
+        elif change == "calls":
+            trial["paired"]["calls_per_sample"] = 101
+        elif change == "samples":
+            trial["paired"]["paths"]["direct"]["samples"] = [0.0] * glm.ROUNDS
+        else:
+            trial["paired"]["paired_ratios"]["direct_over_upstream"]["samples"][0] = 0.1
+        with pytest.raises(RuntimeError, match=error):
+            glm.validate_decode_profile(broken)

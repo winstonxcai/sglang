@@ -27,6 +27,7 @@ DECODE_PROTOCOL = "remnant-glm-decode-v1"
 PREFILL_PROTOCOL = "remnant-glm-prefill-v1"
 PREFILL_SMALL_PROTOCOL = "remnant-glm-prefill-small-v1"
 UPSTREAM_PROTOCOL = "remnant-glm-upstream-decode-v1"
+UPSTREAM_PROFILE_PROTOCOL = "remnant-glm-upstream-decode-profile-v2"
 UPSTREAM_SUITE = "glm-upstream-decode"
 PROTOCOLS = {
     "all": PROTOCOL,
@@ -39,6 +40,7 @@ SEED = 20261024
 HISTORY, PAGE, DIM, KEEP, COLUMNS, GROUPS = 131072, 256, 512, 256, 2112, 512
 SCALE, ATOL, RTOL = 256**-0.5, 0.02, 0.02
 ROUNDS = 30
+DECODE_TRACE_STAGES = ("query_conversion", "partial_attention", "combine")
 
 
 @dataclass(frozen=True)
@@ -504,6 +506,7 @@ class Fixture:
             columns = 128 if case.queries == 1 else 512
             if wgmma is not None and case.queries > 1:
                 variant = wgmma[str(case.queries)]
+                columns = variant["combine_columns"]
                 geometry = wgmma_geometry(case.queries)
                 inner = geometry["inner_iter"]
                 tile_rows = geometry["tile_rows"]
@@ -949,11 +952,46 @@ def _summary_function() -> Callable[[list[float]], dict]:
     return _cpu_contract("timing").summary
 
 
+def _validate_paired_timing(case: dict, modes: tuple[str, str], banks: int) -> None:
+    name = case["name"]
+    baseline = modes[0]
+    orders = case["round_orders"]
+    if (
+        len(orders) != ROUNDS
+        or orders.count([baseline, "direct"]) != ROUNDS // 2
+        or orders.count(["direct", baseline]) != ROUNDS // 2
+    ):
+        raise RuntimeError(f"Unbalanced GLM timing {name}")
+    if (
+        case["execution"] != "cuda_graph"
+        or case["calls_per_sample"] != case["cycles_per_sample"] * banks
+        or case["calls_per_sample"] < 100
+    ):
+        raise RuntimeError(f"Invalid GLM sample normalization {name}")
+    for mode, path in case["paths"].items():
+        if len(path["samples"]) != ROUNDS or any(
+            not math.isfinite(x) or x <= 0 for x in path["samples"]
+        ):
+            raise RuntimeError(f"Missing/invalid GLM rounds {name}")
+        if path != _summary_function()(path["samples"]):
+            raise RuntimeError(f"Invalid GLM derived statistics {name}/{mode}")
+    paired = case["paired_ratios"][f"direct_over_{baseline}"]
+    ratios = [
+        d / n
+        for d, n in zip(
+            case["paths"]["direct"]["samples"], case["paths"][baseline]["samples"]
+        )
+    ]
+    if paired["samples"] != ratios:
+        raise RuntimeError(f"Invalid GLM paired ratios {name}")
+    if paired != _summary_function()(ratios):
+        raise RuntimeError(f"Invalid GLM derived paired statistics {name}")
+
+
 def validate_timing(payload: dict, *, prefix: bool = False) -> None:
     phase = payload.get("phase", "all")
     protocol, modes, expected = experiment(payload.get("suite", "glm-attention"), phase)
     baseline = modes[0]
-    ratio_name = f"direct_over_{baseline}"
     wgmma = {}
     upstream_contract = None
     if protocol == UPSTREAM_PROTOCOL:
@@ -1021,7 +1059,9 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
                 expected_columns = 128 if definition.queries == 1 else 512
             if wgmma and definition.queries > 1:
                 geometry["direct"] = upstream_contract.wgmma_geometry(definition.queries)
-                expected_columns = 512
+                expected_columns = wgmma[str(definition.queries)].get(
+                    "combine_columns", 512
+                )
                 expected_query_conversion = wgmma[str(definition.queries)].get(
                     "query_conversion"
                 )
@@ -1067,38 +1107,7 @@ def validate_timing(payload: dict, *, prefix: bool = False) -> None:
             or fixture["projected_bytes"] >= fixture["memory_limit_bytes"]
         ):
             raise RuntimeError(f"Invalid GLM memory/cache policy {case['name']}")
-        orders = case["round_orders"]
-        if (
-            len(orders) != ROUNDS
-            or orders.count([baseline, "direct"]) != ROUNDS // 2
-            or orders.count(["direct", baseline]) != ROUNDS // 2
-        ):
-            raise RuntimeError(f"Unbalanced GLM timing {case['name']}")
-        if (
-            case["execution"] != "cuda_graph"
-            or case["calls_per_sample"] != case["cycles_per_sample"] * banks
-            or case["calls_per_sample"] < 100
-        ):
-            raise RuntimeError(f"Invalid GLM sample normalization {case['name']}")
-        for mode, path in case["paths"].items():
-            if len(path["samples"]) != ROUNDS or any(
-                not math.isfinite(x) or x <= 0 for x in path["samples"]
-            ):
-                raise RuntimeError(f"Missing/invalid GLM rounds {case['name']}")
-            if path != _summary_function()(path["samples"]):
-                raise RuntimeError(
-                    f"Invalid GLM derived statistics {case['name']}/{mode}"
-                )
-        ratios = case["paired_ratios"][ratio_name]["samples"]
-        if ratios != [
-            d / n
-            for d, n in zip(
-                case["paths"]["direct"]["samples"], case["paths"][baseline]["samples"]
-            )
-        ]:
-            raise RuntimeError(f"Invalid GLM paired ratios {case['name']}")
-        if case["paired_ratios"][ratio_name] != _summary_function()(ratios):
-            raise RuntimeError(f"Invalid GLM derived paired statistics {case['name']}")
+        _validate_paired_timing(case, modes, banks)
     if phase == "decode" and (not prefix or "summary" in payload):
         if payload.get("summary") != weighted_overhead(
             payload["cases"], baseline=baseline
@@ -1213,9 +1222,7 @@ def decode_trace_stages(
         ),
         key=lambda event: event["ts"],
     )
-    stage_names = ("partial_attention", "combine")
-    if not fused_query:
-        stage_names = ("query_conversion", *stage_names)
+    stage_names = DECODE_TRACE_STAGES[1:] if fused_query else DECODE_TRACE_STAGES
     launches_per_bank = len(stage_names)
     if (
         banks < 1
@@ -1247,64 +1254,178 @@ def profile_upstream_decode(
     import torch
     from sglang.benchmark.remnant.glm_upstream import WGMMA_CANDIDATE
 
-    selected = [
-        case for case in matrix if case.queries in (1, 8, 32, 64) and case.tail == 0
-    ]
-    wgmma = source["compiled_build"]["upstream_compile"]["decode_wgmma"]
+    selected = [case for case in matrix if case.tail == 0]
+    compiled = source["compiled_build"]["upstream_compile"]
+    wgmma = compiled["decode_wgmma"]
     payload = dict(
-        protocol="remnant-glm-upstream-decode-profile-v1",
+        protocol=UPSTREAM_PROFILE_PROTOCOL,
         direct_candidate=WGMMA_CANDIDATE,
         source=source,
         status="running",
         cases=[],
+        batch8_combine_sweep={},
     )
     record_path = base.with_suffix(".json")
     trace_dir = base.with_suffix(".traces")
     trace_dir.mkdir()
+
+    def checkpoint() -> None:
+        temporary = record_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n")
+        temporary.replace(record_path)
+
+    def collect(case: Case, variants: dict, suffix: str = "") -> dict:
+        fixture = Fixture(
+            case, deadline, gpu_family="H200", upstream=True, wgmma=variants
+        )
+        record = dict(name=case.name, fixture=fixture.identity, paths={})
+        if case.queries == 8:
+            record["paired"] = fixture.time()
+        else:
+            fixture.capture()
+            fixture.validate()
+        for mode in fixture.modes:
+            fixture.check()
+            graph = fixture.graphs[mode]
+            graph.replay()
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as profiler:
+                graph.replay()
+                torch.cuda.synchronize()
+            trace = trace_dir / f"{case.name}{suffix}-{mode}.json"
+            profiler.export_chrome_trace(str(trace))
+            fused_query = (
+                mode == "direct"
+                and fixture.identity.get("direct_query_conversion") == "fused"
+            )
+            stages = decode_trace_stages(
+                json.loads(trace.read_text())["traceEvents"],
+                fixture.banks,
+                fused_query=fused_query,
+            )
+            if fused_query and (
+                stages["partial_attention"]["symbol"] != "glm_packed_partial_wgmma_kernel"
+            ):
+                raise RuntimeError(f"{case.name}: trace did not run the WGMMA partial")
+            record["paths"][mode] = {
+                "trace": str(trace.relative_to(base.parent)),
+                "stages": stages,
+            }
+        del graph, fixture
+        gc.collect()
+        torch.cuda.empty_cache()
+        return record
+
     try:
         with torch.inference_mode():
             for case in selected:
-                fixture = Fixture(
-                    case, deadline, gpu_family="H200", upstream=True, wgmma=wgmma
-                )
-                fixture.capture()
-                record = dict(name=case.name, fixture=fixture.identity, paths={})
-                payload["cases"].append(record)
-                for mode in fixture.modes:
-                    fixture.check()
-                    graph = fixture.graphs[mode]
-                    graph.replay()
-                    torch.cuda.synchronize()
-                    with torch.profiler.profile(
-                        activities=[torch.profiler.ProfilerActivity.CUDA]
-                    ) as profiler:
-                        graph.replay()
-                        torch.cuda.synchronize()
-                    trace = trace_dir / f"{case.name}-{mode}.json"
-                    profiler.export_chrome_trace(str(trace))
-                    stages = decode_trace_stages(
-                        json.loads(trace.read_text())["traceEvents"],
-                        fixture.banks,
-                        fused_query=mode == "direct" and case.queries > 1,
-                    )
-                    if mode == "direct" and case.queries > 1 and (
-                        stages["partial_attention"]["symbol"]
-                        != "glm_packed_partial_wgmma_kernel"
-                    ):
-                        raise RuntimeError(f"{case.name}: trace did not run the WGMMA partial")
-                    record["paths"][mode] = {
-                        "trace": str(trace.relative_to(base.parent)),
-                        "stages": stages,
-                    }
-                del graph, fixture
-                gc.collect()
-                torch.cuda.empty_cache()
+                if case.queries != 8:
+                    payload["cases"].append(collect(case, wgmma))
+                    checkpoint()
+                    continue
+                primary = wgmma["8"]
+                alternatives = {}
+                payload["batch8_combine_sweep"][case.name] = alternatives
+                combines = compiled["batch8_combines"]
+                # Counterbalance order across cache policies. Pair each width
+                # with a freshly timed upstream control on the same fixture.
+                for width in sorted(combines, key=int, reverse=case.policy == "rotating"):
+                    if int(width) == primary["combine_columns"]:
+                        payload["cases"].append(collect(case, wgmma))
+                    else:
+                        variants = {
+                            **wgmma,
+                            "8": {
+                                **primary,
+                                "combine": combines[width],
+                                "combine_columns": int(width),
+                            },
+                        }
+                        alternatives[width] = collect(case, variants, f"-c{width}")
+                    checkpoint()
         payload["status"] = "passed"
+        validate_decode_profile(payload)
     except BaseException as error:
         payload.update(status="incomplete", error=repr(error))
         raise
     finally:
-        record_path.write_text(json.dumps(payload, indent=2) + "\n")
+        checkpoint()
+
+
+def _validate_profile_trace(case: Case, result: dict, modes: tuple[str, str]) -> None:
+    if (
+        result["name"] != case.name
+        or set(result["paths"]) != set(modes)
+        or result["fixture"]["changing_input_replay"] != "passed"
+    ):
+        raise RuntimeError(f"Incomplete GLM profile case: {case.name}")
+    for mode, trace in result["paths"].items():
+        fused = mode == "direct" and case.queries > 1
+        expected = DECODE_TRACE_STAGES[1:] if fused else DECODE_TRACE_STAGES
+        stages = trace.get("stages", {})
+        if (
+            not trace.get("trace")
+            or set(stages) != set(expected)
+            or any(
+                not stage.get("symbol")
+                or not math.isfinite(stage["us_per_call"])
+                or stage["us_per_call"] <= 0
+                for stage in stages.values()
+            )
+            or (fused and stages["partial_attention"]["symbol"]
+                != "glm_packed_partial_wgmma_kernel")
+        ):
+            raise RuntimeError(f"Invalid GLM profile trace: {case.name}/{mode}")
+
+
+def validate_decode_profile(payload: dict) -> None:
+    """Require the 12 zero-tail profiles and all matched batch-8 pairs."""
+    _, modes, matrix = experiment(UPSTREAM_SUITE, "decode")
+    expected = [case for case in matrix if case.tail == 0]
+    rows = payload["cases"]
+    sweeps = payload["batch8_combine_sweep"]
+    contract = _cpu_contract("glm_upstream")
+    compiled = payload["source"]["compiled_build"]["upstream_compile"]
+    primary = str(compiled["decode_wgmma"]["8"]["combine_columns"])
+    widths = {str(width) for width in contract.WGMMA_BATCH8_COMBINE_WIDTHS}
+    if (
+        payload.get("protocol") != UPSTREAM_PROFILE_PROTOCOL
+        or payload.get("status") != "passed"
+        or payload.get("direct_candidate") != contract.WGMMA_CANDIDATE
+        or primary not in widths
+        or set(compiled["batch8_combines"]) != widths
+        or [row["name"] for row in rows] != [case.name for case in expected]
+        or set(sweeps) != {case.name for case in expected if case.queries == 8}
+    ):
+        raise RuntimeError("Incomplete GLM upstream decode profile")
+    for case, row in zip(expected, rows):
+        _validate_profile_trace(case, row, modes)
+        if case.queries != 8:
+            continue
+        alternatives = sweeps[case.name]
+        if set(alternatives) != widths - {primary}:
+            raise RuntimeError(f"Incomplete batch-8 combine sweep: {case.name}")
+        orders = _cpu_contract("timing").round_orders(
+            modes, ROUNDS, case_seed(case), balanced=True
+        )
+        for width, result in {primary: row, **alternatives}.items():
+            _validate_profile_trace(case, result, modes)
+            fixture = result["fixture"]
+            paired = result["paired"]
+            if (
+                fixture["direct_combine_columns"] != int(width)
+                or fixture["common_inputs_sha256"]
+                != row["fixture"]["common_inputs_sha256"]
+                or fixture["banks"] != row["fixture"]["banks"]
+                or set(paired["paths"]) != set(modes)
+                or paired["round_orders"] != orders
+            ):
+                raise RuntimeError(f"Invalid batch-8 combine comparison: {case.name}/{width}")
+            _validate_paired_timing(
+                {**paired, "name": f"{case.name}/{width}"}, modes, fixture["banks"]
+            )
 
 
 def main() -> None:
