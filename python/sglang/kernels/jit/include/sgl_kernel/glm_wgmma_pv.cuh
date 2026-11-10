@@ -83,3 +83,33 @@ __device__ __forceinline__ int remnant_glm_wgmma_pv_registers(
   }
   return 0;
 }
+
+// Match the TileLang numerator fragment. Each lane owns four heads and
+// two adjacent features in each 64-feature panel. Write each BF16 pair
+// together so one store covers the full four bytes owned by the lane.
+__device__ __forceinline__ int remnant_glm_write_wgmma_output(
+    const float* numerator, const float* scale, void* output_raw) {
+  auto* output = static_cast<uint32_t*>(output_raw);
+  const int feature_pair = threadIdx.x / 4;
+  const int first_head = 2 * (threadIdx.x % 4);
+#pragma unroll
+  for (int panel = 0; panel < 8; ++panel) {
+#pragma unroll
+    for (int head_group = 0; head_group < 2; ++head_group) {
+#pragma unroll
+      for (int head_in_pair = 0; head_in_pair < 2; ++head_in_pair) {
+        const int head = first_head + 8 * head_group + head_in_pair;
+        const int index = 8 * panel + 4 * head_group + head_in_pair;
+        const float weight = scale[2 * head_group + head_in_pair];
+        const float even = numerator[index] * weight;
+        const float odd = numerator[index + 2] * weight;
+        uint32_t pair;
+        // The first PTX input occupies the high half of the packed word.
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;"
+            : "=r"(pair) : "f"(odd), "f"(even));
+        output[head * 256 + panel * 32 + feature_pair] = pair;
+      }
+    }
+  }
+  return 0;
+}

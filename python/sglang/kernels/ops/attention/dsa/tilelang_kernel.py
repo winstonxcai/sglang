@@ -1678,15 +1678,25 @@ def glm_packed_wgmma_partial(inner_iter: int, sm_scale: float):
                 alpha[head] = T.if_then_else(
                     denominator[head] > 0, 1.0 / (denominator[head] * 448.0), 0.0
                 )
-                partial_lse[0, query, group, head] = T.if_then_else(
-                    denominator[head] > 0,
-                    T.log2(denominator[head]) + maximum[head] * log2_scale,
-                    -(2**30),
+                # The first four lanes cover all 16 LSE values. All lanes
+                # compute the scales for their own output columns.
+                if T.get_thread_binding() < 4:
+                    partial_lse[0, query, group, head] = T.if_then_else(
+                        denominator[head] > 0,
+                        T.log2(denominator[head]) + maximum[head] * log2_scale,
+                        -(2**30),
+                    )
+            T.evaluate(
+                T.call_extern(
+                    "int32",
+                    "remnant_glm_write_wgmma_output",
+                    T.access_ptr(numerator[0, 0], "r", extent=dim * heads // 128),
+                    T.access_ptr(alpha[0], "r", extent=4),
+                    T.access_ptr(
+                        partial_o[0, query, group, 0, 0], "w", extent=heads * dim
+                    ),
                 )
-            for column, head in T.Parallel(dim, heads):
-                partial_o[0, query, group, head, column] = (
-                    numerator[column, head] * alpha[head]
-                )
+            )
 
     return main.with_attr("global_symbol", "glm_packed_partial_wgmma")
 
