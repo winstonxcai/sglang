@@ -1426,6 +1426,21 @@ if os.environ.get("REMNANT_GLM_UPSTREAM_DECODE") == "1":
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
                     kernel(buffers, slots=slots, stream=stream)
+                # One selected row and zero Q make the partial exactly that
+                # row at every head. This checks the BF16 store order directly.
+                buffers["indices"][0, 0, 0, 0] = locations[0]
+                graph.replay()
+                stream.synchronize()
+                torch.testing.assert_close(
+                    buffers["partial_o"][0, 0, 0].cpu(),
+                    dense[locations[0]].to(torch.bfloat16).expand(heads, -1),
+                    atol=0, rtol=0,
+                )
+                torch.testing.assert_close(
+                    buffers["partial_lse"][0, 0, 0].cpu(),
+                    torch.zeros(heads),
+                    atol=0, rtol=0,
+                )
                 for tail in range(4):
                     q = torch.from_numpy(
                         rng.normal(0, 0.15, (1, 1, heads, dim)).astype(np.float32)
